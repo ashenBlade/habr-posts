@@ -15,13 +15,27 @@
 
 ## Что такое `enum class`
 
-Изучая Kotlin, мне понравился тип `enum class`. 
+В Kotlin существует тип `enum class`. 
 По факту, это тот же `enum`, но с несколькими возможностями:
 1. Переопределение общих методов (`toString`, `getHashCode`)
 2. Реализация специфичных для конкретного значения функций
 3. Поддержка корректности типов на уровне компилятора
 
-> Пример реализации на kotlin
+```kotlin
+enum class Role {
+    Admin {
+        override fun toString(): string {
+            return "Sysadmin"
+        }
+    },
+    User {
+        fun calculateSomething(value: Int): Double {
+            return value / 0.5 + 1
+        }
+    },
+    Moderator
+}
+```
 
 
 # Возможная реализация на C#
@@ -31,8 +45,8 @@
 ```csharp
 public abstract class Role
 {
-    public static AdminRole Admin = AdminRole.Instance; 
-    public static Role User = UserRole.Instance;
+    public static AdminRole Admin = AdminRole.Instance;
+    public static UserRole User = UserRole.Instance;
     public static ModeratorRole Moderator = ModeratorRole.Instance;
 
     public class AdminRole : Role
@@ -41,18 +55,28 @@ public abstract class Role
 
         private AdminRole()
         { }
+
+        public override string ToString()
+        {
+            return "Sysadmin";
+        }
     }
 
     public class UserRole : Role
     {
         public static readonly UserRole Instance = new();
-        private UserRole() {  } 
+        private UserRole() { }
+
+        public double CalculateSomething(int value)
+        {
+            return value / 0.5 + 1;
+        }
     }
 
     public class ModeratorRole : Role
     {
-        public static readonly ModeratorRole Instance = new ();
-        private ModeratorRole() {  }
+        public static readonly ModeratorRole Instance = new();
+        private ModeratorRole() { }
     }
 }
 ```
@@ -63,7 +87,6 @@ public abstract class Role
 Можно заметить, что большая часть кода — _шаблонная_. 
 Это прекрасная возможность для использования генераторов исходного кода.
 
-> Комментарий по поводу Smart Enum библиотеки
 
 Я давно хотел применить их на практике, поэтому первый проект, который я решил реализовать — 
 генератор `enum class`'ов по `enum` из C#. 
@@ -249,6 +272,8 @@ builder.AppendFormat("{2} abstract partial class {0}: "
 
 После такого разбиения, проект с генератором стал состоять из единственного класса - самого генератора.
 
+> Разница в подключении проектов таким образом
+
 ## Добавляем вспомогательные проекты (JsonConverter)
 
 Библиотека мало кого может заинтересовать, если для ее использования нужно много стараться.
@@ -260,18 +285,19 @@ builder.AppendFormat("{2} abstract partial class {0}: "
 То есть нам ничего не мешает создать _новый генератор_, 
 но уже _для сгенерированного класса_.
 
-Идея для нового проекта долго не искалась - json (де)сериализатор для созданного класса.
+Идея для нового проекта долго не искалась - json (де)сериализатор.
 
 `.csproj` для нового проекта не отличалась от основного генератора, только не содержит ссылки на сборку с атрибутами.
 
 Основная проблема — нахождение всех необходимых перечислений. 
-Я предположил, что, скорее всего, перечисление будет использоваться в проекте с доменными сущностями, 
+Я предположил, что, скорее всего, `enum` будет использоваться в проекте с доменными сущностями, 
 а сериализация — это уже деятельность на границе с внешним миром.
-Значит, требовать подключения этого генератора к тому же самому проекту — не правильно.
+Значит, требовать подключения этого генератора к тому же самому проекту — неправильно.
 
 С решением этой проблемы мне помог [этот ответ на вопрос](https://stackoverflow.com/a/74163439/14109140) на Stack Overflow.
 
 Всё решается использованием провайдера компиляции. 
+Он позволяет получить ссылки на ссылающиеся сборки, а после на типы внутри них.
 При запуске компиляции:
 
 1. Получаем все сборки
@@ -487,4 +513,184 @@ foreach (var assemblySymbol in compilation.SourceModule.ReferencedAssemblySymbol
 ```
 
 ## Тесты
+
+Одно из самых важных мест - тестирование. 
+С генераторами можно проводить несколько видов тестирования. 
+
+
+**Интеграционное тестирование**
+
+Под этим тестированием я понимаю проверку работы уже сгенерированного кода.
+
+Для меня это основной метод тестирования:
+> Не важно как красиво я сделал интерфейс моего проекта с бизнес логикой - 
+> если генерируется неправильный код, то работа не сделана
+
+С точки зрения _написания_ тестов — это один из самых простых способов. 
+Мы пишем буквально только юнит тесты, разница только в том, что тесты на сгенерированный код.
+
+Типовой тест класс выглядит так:
+```csharp
+public class ToStringTests
+{
+    // Объявляем класс для генерации
+    [EnumClass]
+    public enum PunctuationMark
+    {
+        [EnumMemberInfo(StringValue = ".")]
+        Dot,
+        [EnumMemberInfo(StringValue = ",")]
+        Comma,
+        [EnumMemberInfo(StringValue = "!")]
+        Exclamation,
+        [EnumMemberInfo(StringValue = "?")]
+        Question,
+    }
+    
+    // Ожидаемое поведение
+    public static IEnumerable<object> PunctuationMarkWithString => new[]
+    {
+        new object[] {EnumClass.PunctuationMark.Dot, "."},
+        new object[] {EnumClass.PunctuationMark.Comma, ","},
+        new object[] {EnumClass.PunctuationMark.Exclamation, "!"},
+        new object[] {EnumClass.PunctuationMark.Question, "?"},
+    };
+    
+    // Пишем тест
+    [Theory]
+    [MemberData(nameof(PunctuationMarkWithString))]
+    public void ToString__WithStringValueAttribute__ShouldReturnSpecifiedValue(EnumClass.PunctuationMark mark, string expected)
+    {
+        var actual = mark.ToString();
+        Assert.Equal(expected, actual);
+    }
+}
+```
+
+> P.S. Не всегда подобное тестирование проще, например, если создается стаб для запросов, то
+> интеграционное будет сложнее.
+
+**Юнит тестирование**
+
+Юнит тестирование в данном контексте может означать 2 вещи:
+- Тестирование бизнес-логики
+- Тестирование работы генератора
+
+Один из полезных побочных эффектов разделения одной сборки на 2 - можно отдельно протестировать бизнес логику.
+
+В таких тестах самое сложное - подготовка: 
+- Написать _строки_ с исходным кодом
+- Подключить зависимости до необходимых сборок
+- Указать необходимые настройки компиляции
+
+Хорошо, что код подготовки также шаблонен и его можно вынести в отдельные функции. 
+Как например:
+```csharp
+private Compilation Compile(params string[] sourceCodes)
+{
+    var compilation = CSharpCompilation.Create("Test", 
+        // Создаем синтаксические деревья из переденных строк исходного кода
+        syntaxTrees: sourceCodes.Select(x => CSharpSyntaxTree.ParseText(x)),
+        // Добавляем ссылки на зависимые сборки
+        references: new[]
+        {
+            MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+            MetadataReference.CreateFromFile(typeof(EnumClassAttribute).Assembly.Location),
+            MetadataReference.CreateFromFile(typeof(EnumInfo).Assembly.Location),
+            MetadataReference.CreateFromFile(Assembly.GetCallingAssembly().Location),
+            MetadataReference.CreateFromFile(typeof(string).Assembly.Location),
+            MetadataReference.CreateFromFile(Assembly.Load(new AssemblyName("System.Runtime")).Location),
+            MetadataReference.CreateFromFile(Assembly.Load(new AssemblyName("netstandard")).Location),
+        }, 
+        // Компилируем как библиотеку, а не исполняемый файл
+        options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+    
+    // Натравливаем генератор на полученную компиляцию
+    CSharpGeneratorDriver.Create(new EnumClassIncrementalGenerator())
+                         .RunGeneratorsAndUpdateCompilation(compilation, out var resultCompilation, out var diagnostics);
+    
+    // Возвращаем обновленный код
+    return resultCompilation;
+}
+```
+
+После из этой компиляции я получаю всю необходимую информацию о перечислениях.
+Например
+```csharp
+[Fact]
+public void GetAllEnumsFromCompilation__WithSingleMarkedEnum__ShouldReturnListWithSingleElement()
+{
+    // Пишем исходный код
+    var sampleEnumCode = @"using EnumClass.Attributes;
+
+namespace Test;
+
+[EnumClass]
+public enum SampleEnum
+{
+    One = 1,
+    Two = 2,
+    Three = 3
+}";
+    // Компилируем его
+    var compilation = Compile(sampleEnumCode);
+    
+    // Получаем все необходимые перечисления
+    var enums = EnumInfoFactory.GetAllEnumInfosFromCompilation(resultCompilation, new SourceProductionContext())!;
+    
+    // Проверяем корректность
+    Assert.Single(enums);
+}
+```
+
+Генераторы также могут уведомлять пользователя об исключительных ситуациях или неожиданном поведении.
+Для взаимодействия с пользователями используются сообщения диагностики.
+
+Такое тоже можно проверить - в результате вызова `.RunGeneratorsAndUpdateCompilation(compilation, out var resultCompilation, out ImmutableArray<Diagnostic> diagnostics)` 
+вторым `out` параметром мы получаем список всех диагностик, которые случились за время компиляции.
+
+Если вы объявляете свои собственные сообщения, то можно проверять их.
+Я пока проверяю успешную компиляцию - отсутствие ошибок во время копиляции:
+```csharp
+[Fact]
+public void WithSingleMember__ShouldGenerateWithoutErrors()
+{
+    // Здесь компиляция и запуск генератора...
+    
+    Assert.Empty(diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error));
+}
+```
+
+**Снапшот тестирование**
+
+Снапшот тестирование - это тестирование сравнением с образцом. 
+Чаще встречается в UI тестировании, но познакомился с ним при работе с генераторами.
+
+> Ссылка на вики или типа того
+
+Для снапшот тестирования в C# есть библиотека [`Verify`](https://github.com/VerifyTests/Verify)
+
+> Как подключить в проекты с тестами
+
+Лично мой опыт их использования — негативный.
+После запуска тестов много изменений в файлах, которые нужно проверить:
+- Переменное количество членов перечисления
+- Добавление новой функциональности
+- Изменение названий некоторых переменных
+
+Скорее всего это связано со спецификой моей бизнес-логики.
+Но после нескольких запусков тестов, 
+где после каждого я по несколько минут сидел и принимал изменения,
+решил от них отказаться.
+
 ## Выводы
+
+Генераторы исходного кода — мощная вещь. 
+Давно хотел их попробовать.
+
+Главная трудность, с которой я столкнулся, — малое количество примеров и документации.
+Надеюсь в будущем это изменится и вокруг генераторов появится более развитая экосистема.
+
+## Полезные ссылки
+
+
