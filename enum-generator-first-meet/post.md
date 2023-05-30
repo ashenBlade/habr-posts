@@ -21,40 +21,78 @@
 2. Реализация специфичных для конкретного значения функций
 3. Поддержка корректности типов на уровне компилятора
 
+Представим, что у нас есть такой `enum class`
+
 ```kotlin
-enum class Role {
+interface IWorker {
+    fun doWork()
+}
+
+enum class Role: IWorker {
     Admin {
-        override fun toString(): string {
+        override fun toString(): String {
             return "Sysadmin"
+        }
+
+        override fun doWork() {
+            println("Интенсивно работаю")
         }
     },
     User {
-        fun calculateSomething(value: Int): Double {
-            return value / 0.5 + 1
+        override fun doWork() {
+            println("Ставлю лайки")
         }
     },
-    Moderator
+    Moderator {
+        override fun doWork() {
+            println("Пишем больше постов")
+        }
+    }
 }
+```
+
+Вот как можно было бы его использовать
+```kotlin
+val role = getRole()
+
+println(
+    when (role) {
+        Role.Admin -> "Адыхаю"
+        Role.User -> {
+            role.doWork()
+            "Работа закончена"
+        }
+        Role.Moderator -> "Работы пока нет"
+    }
+)
 ```
 
 
 # Возможная реализация на C#
 
-Как можно было бы реализовать на c#
+Как можно было бы реализовать на C#
 
 ```csharp
-public abstract class Role
+public interface IWorker
 {
-    public static AdminRole Admin = AdminRole.Instance;
-    public static UserRole User = UserRole.Instance;
-    public static ModeratorRole Moderator = ModeratorRole.Instance;
+    void DoWork();
+}
+
+
+public abstract class Role : IWorker
+{
+    public static AdminRole Admin = new();
+    public static UserRole User = new();
+    public static ModeratorRole Moderator = new();
+
+    public abstract void DoWork();
 
     public class AdminRole : Role
     {
-        public static readonly AdminRole Instance = new();
-
-        private AdminRole()
-        { }
+        public override void DoWork()
+        {
+            Console.WriteLine("Интенсивно работаю");
+        }
 
         public override string ToString()
         {
@@ -64,20 +102,36 @@ public abstract class Role
 
     public class UserRole : Role
     {
-        public static readonly UserRole Instance = new();
-        private UserRole() { }
-
-        public double CalculateSomething(int value)
+        public override void DoWork()
         {
-            return value / 0.5 + 1;
+            Console.WriteLine("Ставлю лайки");
         }
     }
 
     public class ModeratorRole : Role
     {
-        public static readonly ModeratorRole Instance = new();
-        private ModeratorRole() { }
+        public override void DoWork()
+        {
+            Console.WriteLine("Пишем больше постов");
+        }
     }
+}
+```
+
+И использование было бы соответствующим:
+```csharp
+var role = GetRole();
+Console.WriteLine(role switch
+{
+    Role.AdminRole admin => "Адыхаю",
+    Role.UserRole user => DoWorkUser(user),
+    Role.ModeratorRole moderator => "Работы пока нет"
+});
+
+string DoWorkUser(Role.UserRole userRole)
+{
+    userRole.DoWork();
+    return "Работа закончена";
 }
 ```
 
@@ -219,10 +273,6 @@ foreach (var syntax in enums)
 }
 ```
 
-> Сделать спойлером
-
-Более детальную разницу между Синтаксисом, Символами и Семантической моделью можно найти в [заметках компилятора](https://github.com/bodziosamolot/sourceGenerators/blob/main/notes.md#semantic-model)
-
 **Сгенерировать из этих значений `enum class`**
 
 Генерировать код можно 2 способами: добавлять файлы с исходным кодом и добавлять синтаксические деревья напрямую.
@@ -233,7 +283,7 @@ foreach (var syntax in enums)
 Для генерации я использую старый добрый `StringBuilder`. 
 Весь код генерируется простым добавлением форматированного кода.
 
-Например, вот так добавляю определение нового класса
+Например, вот добавление определения класса
 ```csharp
 builder.AppendFormat("{2} abstract partial class {0}: "
                    + "IEquatable<{0}>, IEquatable<{1}>, "
@@ -242,6 +292,84 @@ builder.AppendFormat("{2} abstract partial class {0}: "
                    enumInfo.Accessibility.Keyword);
 ```
 
+**Исправленный генератором пример**
+
+Изначально мы написали `enum class` своими руками, но _красиво_ это не получилось.
+Теперь попробуем сделать эту работу через генератор.
+
+```csharp
+public interface IWorker
+{
+    void DoWork();
+}
+
+[EnumClass]
+public enum Role
+{
+    [EnumMemberInfo(StringValue = "Sysadmin")]
+    Admin,
+    User,
+    Moderator
+}
+
+namespace EnumClass
+{
+    public partial class Role: IWorker
+    {
+        public abstract void DoWork();
+
+        public partial class AdminEnumValue
+        {
+            public override void DoWork()
+            {
+                Console.WriteLine("Интенсивно работаю");
+            }
+
+            public string GetGreeting() => "Привет, я админ";
+        }
+
+        public partial class UserEnumValue
+        {
+            public override void DoWork()
+            {
+                Console.WriteLine("Ставлю лайки");
+            }
+        }
+
+        public partial class ModeratorEnumValue
+        {
+            public override void DoWork()
+            {
+                Console.WriteLine("Пишем больше постов");
+            }
+        }
+    }
+}
+```
+
+Работа с ним ведется так
+```csharp
+var role = GetRole();
+
+Console.WriteLine(
+    role.Switch(
+        admin => admin.GetGreeting(),
+        user =>
+        {
+            user.DoWork();
+            return "Работа закончена";
+        },
+        moderator => "Работы пока нет")
+    );
+```
+
+Лаконично и красиво!
+
+О другой функциональности можно узнать заглянув в проект: 
+[примеры](https://github.com/ashenBlade/EnumClass/tree/master/samples), 
+[README](https://github.com/ashenBlade/EnumClass/blob/master/README.md), 
+[тесты](https://github.com/ashenBlade/EnumClass/tree/master/tests)
+
 ## Дробление на несколько проектов
 
 Изначально вся разработка велась в единственном проекте — там и генератор, и бизнес логика, и все все все.
@@ -249,11 +377,11 @@ builder.AppendFormat("{2} abstract partial class {0}: "
 
 Поэтому я принял решение разбить 1 проект на 2: генератор и бизнес-логика.
 Это оказалось не сложнее, чем добавить проект с атрибутами. 
-Разница только в пути добавления сборки в пакет.
+Разница только в способе добавления сборки в пакет.
 
 Проект я разбил на 2:
-- EnumClass.Generator - сам генератор
-- EnumClass.Core - проект с бизнес-логикой
+- [`EnumClass.Generator`](https://github.com/ashenBlade/EnumClass/tree/master/src/EnumClass.Generator) - сам генератор
+- [`EnumClass.Core`](https://github.com/ashenBlade/EnumClass/tree/master/src/EnumClass.Core) - проект с бизнес-логикой
 
 Добавляется проект с бизнес-логикой так
 
@@ -264,7 +392,7 @@ builder.AppendFormat("{2} abstract partial class {0}: "
 </ItemGroup>
 ```
 
-Как можно заметить `PackagePath` поменялся на "analyzers/dotnet/cs". По этому пути находятся все сборки, необходимые для генераторов и сам генератор.
+Как можно заметить `PackagePath` поменялся на `analyzers/dotnet/cs`. По этому пути находятся все сборки, необходимые для генераторов и сам генератор.
 Также, если генератор зависит от какой-то сборки, то при добавлении ссылки необходимо указать `OutputItemType="Analyzer"`. 
 Точно так же, как и для самого генератора.
 
@@ -272,7 +400,25 @@ builder.AppendFormat("{2} abstract partial class {0}: "
 
 После такого разбиения, проект с генератором стал состоять из единственного класса - самого генератора.
 
-> Разница в подключении проектов таким образом
+> Подключение зависимостей
+
+Подключение проекта с генератором тоже стоит упомянуть.
+При подключении NuGet пакета никаких дополнительных действий выполнять не надо.
+Если настроили сборку пакета правильно, то все должно заработать.
+ 
+Другое дело когда проект генератора подключается напрямую:
+1. Проект с генератором должен быть помечен атрибутами `OutputItemType="Analyzer"` и `ReferenceOutputAssembly="false"`
+```xml
+<ProjectReference Include="..\..\src\EnumClass.Generator\EnumClass.Generator.csproj" ReferenceOutputAssembly="false" OutputItemType="Analyzer" />
+```
+2. Проект с бизнес-логикой также должен быть помечен ими
+```xml
+<ProjectReference Include="..\..\src\EnumClass.Core\EnumClass.Core.csproj" ReferenceOutputAssembly="false" OutputItemType="Analyzer" />
+```
+3. Проект с атрибутами должен быть добавлен как обычный проект
+```xml
+<ProjectReference Include="..\..\src\EnumClass.Attributes\EnumClass.Attributes.csproj" />
+```
 
 ## Добавляем вспомогательные проекты (JsonConverter)
 
@@ -297,17 +443,18 @@ builder.AppendFormat("{2} abstract partial class {0}: "
 С решением этой проблемы мне помог [этот ответ на вопрос](https://stackoverflow.com/a/74163439/14109140) на Stack Overflow.
 
 Всё решается использованием провайдера компиляции. 
-Он позволяет получить ссылки на ссылающиеся сборки, а после на типы внутри них.
+Он позволяет получить ссылки на ссылающиеся сборки, а после на типы (символы) внутри них.
+
 При запуске компиляции:
 
 1. Получаем все сборки
 
 ```csharp
-// Получаем все ссылаемые сборки
+// Ссылки
 ImmutableArray<IAssemblySymbol> assemblySymbols = compilation
                                                     .SourceModule
                                                     .ReferencedAssemblySymbols;
-// Получаем текущую сборки
+// Текущая
 IAssemblySymbol currentAssemblySymbol = compilation.Assembly;
 ```
 
@@ -340,7 +487,6 @@ foreach (var member in @namespace.GetTypeMembers())
 {
     foreach (var childOrSelf in GetAllNestedTypesAndSelf(member))
     {
-        // Отфильтровываем только перечисления
         if (childOrSelf.TypeKind is TypeKind.Enum)
         {
             yield return childOrSelf;
@@ -352,7 +498,7 @@ IEnumerable<INamedTypeSymbol> GetAllNestedTypesAndSelf(INamedTypeSymbol namedTyp
 {
     yield return namedTypeSymbol;
     
-    if (namedTypeSymbol.GetTypeMembers() is {Length:>0} namedTypeSymbols)
+    if (namedTypeSymbol.GetTypeMembers() is { Length:>0 } namedTypeSymbols)
     {
         foreach (var member in namedTypeSymbols)
         {
@@ -390,18 +536,18 @@ bool IsMarkedWithEnumClassAttribute(INamedTypeSymbol enumTypeSymbol)
 }
 ```
 
-
+Примеры использования `EnumClass` можно проекта можно найти в папке [`samples`](https://github.com/ashenBlade/EnumClass/tree/master/samples)
 
 ## Кэш
 
-В процессе работы, я столкнулся с единственной, но очень большой, трудностью - кэш:
+В процессе работы, я столкнулся с одной серьёзной проблемой - кэш:
 1. IDE все подсвечивает красным, а `dotnet run` запускается без ошибок
 2. `dotnet run` не запускается, но через IDE можно
 3. Все запускается, но нужная функциональность не добавлялась, сколько бы я не пересобирал проекты
 
 **IDE подсвечивает, но все запускается**
 
-Это проблема кэша самой IDE. Решается инвалидацией кэша.
+Это проблема кэша IDE. Решается инвалидацией кэша.
 
 В Rider это делается через `File->Invalidate Caches...`
 
@@ -409,14 +555,14 @@ bool IsMarkedWithEnumClassAttribute(INamedTypeSymbol enumTypeSymbol)
 
 **`dotnet run` не запускается, но через IDE можно**
 
-На самом деле в проекте содержатся ошибки и он запуститься не может.
-А запускаются уже собранные проекты (старые, в `bin`)
+На самом деле в проекте содержатся ошибки и запуститься он не может.
+Запускаются уже собранные проекты (старые, в `bin`)
 
-**Все запускается, но нужная функциональность не добавляется**
+**Всё запускается, но нужная функциональность не добавляется**
 
 Когда я подключал проекты, то решил попробовать собрать NuGet пакет и подключить его, а не проект.
-Дело в том, что когда подключаешь пакеты из локальных папок, то эти пакеты кэшируются в локальный кэш NuGet,
-то есть копируются.
+Дело в том, что когда подключаешь пакеты из локальных папок (по умолчанию ищутся в `packages` в корне проекта), 
+то эти пакеты кэшируются в локальный кэш NuGet, то есть копируются.
 
 И получается, что запускается только старый проект раз за разом.
 
@@ -496,6 +642,7 @@ bool IsMarkedWithEnumClassAttribute(INamedTypeSymbol enumTypeSymbol)
     return false;
 }
 ```
+
 - Хранение кэша обработанных типов из других сборок
 ```csharp
 var processedAssemblies = new HashSet<IAssemblySymbol>(SymbolEqualityComparer.Default);
@@ -523,8 +670,8 @@ foreach (var assemblySymbol in compilation.SourceModule.ReferencedAssemblySymbol
 Под этим тестированием я понимаю проверку работы уже сгенерированного кода.
 
 Для меня это основной метод тестирования:
-> Не важно как красиво я сделал интерфейс моего проекта с бизнес логикой - 
-> если генерируется неправильный код, то работа не сделана
+> Не важно как красиво я описал интерфейсы - 
+> если генерируется неправильный код, то работа не сделана.
 
 С точки зрения _написания_ тестов — это один из самых простых способов. 
 Мы пишем буквально только юнит тесты, разница только в том, что тесты на сгенерированный код.
@@ -663,34 +810,38 @@ public void WithSingleMember__ShouldGenerateWithoutErrors()
 
 **Снапшот тестирование**
 
-Снапшот тестирование - это тестирование сравнением с образцом. 
-Чаще встречается в UI тестировании, но познакомился с ним при работе с генераторами.
+Snapshot тестирование — это тестирование путём сравнения полученного результата с образцом. 
+Чаще встречается в UI тестировании, но узнал о нём при работе с генераторами.
+Описание этого типа тестирования можно найти [здесь](https://github.com/aqarain/snapshot-testing-guide).
 
-> Ссылка на вики или типа того
+Для снапшот тестирования (не только генераторов) в C# есть библиотека [`Verify`](https://github.com/VerifyTests/Verify)
 
-Для снапшот тестирования в C# есть библиотека [`Verify`](https://github.com/VerifyTests/Verify)
-
-> Как подключить в проекты с тестами
-
-Лично мой опыт их использования — негативный.
+Лично мой опыт такого тестирования — негативный.
 После запуска тестов много изменений в файлах, которые нужно проверить:
 - Переменное количество членов перечисления
 - Добавление новой функциональности
 - Изменение названий некоторых переменных
 
-Скорее всего это связано со спецификой моей бизнес-логики.
-Но после нескольких запусков тестов, 
+После нескольких запусков тестов, 
 где после каждого я по несколько минут сидел и принимал изменения,
 решил от них отказаться.
+
+Скорее всего это связано со спецификой моей бизнес-логики, 
+а для вас подойдёт.
 
 ## Выводы
 
 Генераторы исходного кода — мощная вещь. 
-Давно хотел их попробовать.
+Давно хотел их попробовать и вот появилась мотивация.
 
-Главная трудность, с которой я столкнулся, — малое количество примеров и документации.
+Главная трудность, с которой я столкнулся, — небольшое количество примеров и документации, 
+либо есть, но обсуждаются очень простые случаи. 
 Надеюсь в будущем это изменится и вокруг генераторов появится более развитая экосистема.
 
 ## Полезные ссылки
 
-
+- Основные концепции API генераторов (Syntax Node, Semantic Model, Symbol) - [https://github.com/bodziosamolot/sourceGenerators/blob/main/notes.md](https://github.com/bodziosamolot/sourceGenerators/blob/main/notes.md)
+- Серия статей, покрывающих основные моменты процесса создания генератора, - [https://andrewlock.net/series/creating-a-source-generator/](https://andrewlock.net/series/creating-a-source-generator/)
+- Список проектов с генераторами - [https://github.com/amis92/csharp-source-generators](https://github.com/amis92/csharp-source-generators)
+- Визуализация синтаксического дерева - [https://sharplab.io/](https://sharplab.io/) или плагин для Rider [https://plugins.jetbrains.com/plugin/16902-rossynt](https://plugins.jetbrains.com/plugin/16902-rossynt)
+- Конечно же, мой генератор - [https://github.com/ashenBlade/EnumClass](https://github.com/ashenBlade/EnumClass)
