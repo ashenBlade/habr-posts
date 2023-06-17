@@ -1,0 +1,67 @@
+﻿services:
+  web:
+    image: otel.example.web
+    build:
+      context: .
+      dockerfile: OpenTelemetry.Web/Dockerfile
+    ports:
+      - '8080:5000'
+    environment:
+      ASPNETCORE_URLS: http://+:5000
+    pull_policy: never
+  
+  record.saver.worker:
+    image: otel.example.record.saver.worker
+    build:
+      context: .
+      dockerfile: OpenTelemetry.Consumer/Dockerfile
+    pull_policy: never
+    
+  temperature.api:
+    image: otel.example.temperature.api
+    build:
+      context: .
+      dockerfile: OpenTelemetry.TemperatureApi.Web/Dockerfile
+    pull_policy: never
+    environment:
+      ASPNETCORE_URLS: http://+:5000
+      COMMON__SERVICE_NAME: 'temperature api'
+  
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: postgres
+    ports:
+      - '5432:5432'
+  
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - '16686:16686'
+      - '6831:6831/udp'
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+  
+  zookeeper:
+    image: bitnami/zookeeper
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: 'yes' 
+  
+  kafka: 
+    image: wurstmeister/kafka
+    environment:
+      KAFKA_CREATE_TOPICS: "weather:1:1"
+      ALLOW_PLAINTEXT_LISTENER: 'yes'
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://:9092
+    depends_on: 
+      - zookeeper
+  
+  zipkin:
+    image: openzipkin/zipkin
+    ports:
+      - '9411:9411'
+    environment:
+      STORAGE_TYPE: mem
