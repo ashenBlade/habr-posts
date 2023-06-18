@@ -1,35 +1,65 @@
 # OpenTelemetry .NET
 
-Содержание:
-1. Вступление
-    - Описание OTEL
-    - Мотивация
-2. Сравнение OTEL и DiagnosticSource
-    - Таблица сравнения
-3. Трейсинг с помощью DiagnosticSource
-    - Создание источника
-    - Создание активности
-    - Добавление тега
-    - Добавление события
-    - Изменение статуса
-    - Использование `Tracer`
-4. Подключение библиотеки и настройка в `ASP.NET Core`
-    - Настройка окружения (название приложения, версия, тэги процесса)
-        - Константы
-        - `Detector`
-        - Встроенные детекторы переменных окружения
-    - Добавление инструментаторов
-    - Добавление собственных источников
-    - Несколько экспортеров
-5. Рецепты:
-    - Синхронный запрос от одного сервиса к другому по HTTP
-    - Проброс контекста между различными приложениями - (`PropagationContext`, `Propagators`)
-    - Добавление тегов в существующую `Activity` (`Activity.Current`)
-    - Дробление большого запроса на несколько
+## Вступление
+
+Всем привет. 
+
+При разработке микросервисов важную часть уделяют Observability - способность чувствовать свои сервисы как 3 руку. 
+Одним из компонентов часто выделяют трейсинг запросов. 
+
+За многие года создания микросервисных архитектур накопилось большое число систем, заточенных именно под это.
+Время шло и в итоге после слияния OpenCensus и OpenTracing в 2019 году родился OpenTelemetry.
+
+В этой статье опишу подключение OpenTelemetry в ASP.NET Core проект + некоторые варианты его использования. 
+
+## Что такое OpenTelemetry
+
+Трейсинг запросов является важной частью Observability систем. 
+Микросервисов в частности.
+
+В 2019 году появилась [OpenTelemetry](https://opentelemetry.io/) - спецификация распределенной трассировки.
+Позже она обросла целой экосистемой и теперь состоит из наборов API, SDK и библиотек для различных языков программирования.
+
+Многие продукты и системы уже [имеют поддержку](https://opentelemetry.io/ecosystem/vendors/) OpenTelemetry: AWS, Azure, Google Could, Grafana, Oracle
+
+![Архитектура OpenTelemetry](images/opentelemetry_sdk.jpg)
+
+Архитектуру можно разбить на 3 слоя:
+1. Хост
+2. Коллектор
+3. Вендор
+
+### Хост
+
+Хост - само приложение. 
+
+Состоит из 3 частей:
+- API - определенные в спецификации интерфейсы для сбора метрик и трейсинга
+- SDK - реализация этого API
+- Exporter - компонент занимающийся отправкой полученных данных
+
+Здесь можно провести аналогию с архитектурой логирования в ASP.NET Core:
+1. API - Microsoft.Extensions.Logging
+2. SDK - Serilog, NLog, log4net
+3. Exporter - Console, Serilog, ELK
+
+### Коллектор 
+
+Коллектор - сервис, занимающийся сбором, обработкой и отправкой замеров/трейсов вендору
+
+Может работать как на той же машине, что и приложение (Агент), так и на другой (Коллектор)
+
+### Вендор
+
+Вендор - сервис, хранящий собранные данные
+
+Например, Jaeger (поддерживает OLTP порт) или Zipkin (для него есть [правила трансформации](https://opentelemetry.io/docs/specs/otel/trace/sdk_exporters/zipkin/), которые выполняет коллектор)
 
 ## Сравнение OpenTelemetry и System.Diagnostics
 
-Начиная с .NET 5 были добавлены типы, которые позволяют производить трейсинг работы приложения без необходимости подключения дополнительных библиотек. Речь о `Activity`, `ActivitySource`, `ActivityListener`. Они коррелируют с понятиями определенными в OpenTelemetry
+Начиная с .NET 5 были добавлены типы из пространства `System.Diagnostics`, которые позволяют производить трейсинг работы приложения без необходимости подключения дополнительных библиотек. 
+Речь о `Activity`, `ActivitySource`, `ActivityListener`. 
+Они коррелируют с понятиями определенными в OpenTelemetry
 
 | .NET            | OpenTelemetry | Комментарий                                                 |
 | --------------- | ------------- | ----------------------------------------------------------- |
@@ -98,7 +128,7 @@ span.Stop();
 // span.Dispose(); - вызывает span.Stop(), т.е. одно и то же
 ```
 
-Как полученные `Activity` обрабатываются - лежит на `ActivityListener`, но это ~~уже другая история~~ делает подключеная библиотека.
+Как полученные `Activity` обрабатываются - лежит на `ActivityListener`, но это ~~уже другая история~~ делает подключенная библиотека.
 
 Заметки:
 - Метод `StartActivity` может вернуть `null`, если никто не подписан на событие. *При всех вызовах методов нужно делать проверку на `null`*
@@ -132,7 +162,7 @@ public async Task<IActionResult> ProcessRequest()
 
 ```
 
-### Что такое ActivityKind. Отношения между спанами
+<spoiler title="ActivityKind - отношения между спанами">
 
 `ActivityKind` представляет собой тип отношений между родительским и дочерним спанами. Его аналог в OpenTelemetry - [`SpanKind`](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/api.md#span)
 
@@ -167,30 +197,32 @@ public enum ActivityKind
 }
 ```
 
-Описания значений перечислений уже говорят что и когда использовать. Но для краткости к нему прилагается сранительная таблица
+Описания значений перечислений уже говорят что и когда использовать. Но для краткости к нему прилагается сравнительная таблица
 
-|ActivityKind|Синхронное взаимодействие|Асинхронное взаимодействие|Входящий запрос|Исходящий запрос|
-|-|-|-|-|-|
-|Internal||||||
-|Client|да|||да|
-|Server|да||да||
-|Producer||да||возможно|
-|Consumer||да|возможно||
+| ActivityKind | Синхронное взаимодействие | Асинхронное взаимодействие | Входящий запрос | Исходящий запрос |
+|--------------|---------------------------|----------------------------|-----------------|------------------|
+| Internal     |                           |                            |                 |                  ||
+| Client       | да                        |                            |                 | да               |
+| Server       | да                        |                            | да              |                  |
+| Producer     |                           | да                         |                 | возможно         |
+| Consumer     |                           | да                         | возможно        |                  |
 
-Тип спана указывается в `span.kind` атрибуте
+Тип спана указывается в атрибуте `span.kind`
 
-Например, когда ASP.NET Core принимает входящий запрос, то используется `ActivityKind.Server`
+Например, когда ASP.NET Core принимает запрос, то используется `ActivityKind.Server`
 
-![](images/Запрос%20к%20ASP.NET%20Core.png)
+![Спан входящего запроса к TemperatureApi](images/Запрос%20к%20ASP.NET%20Core.png)
 
-А когда `HttpClient` делает запрос, то `ActivityKind.Client`
+А когда `HttpClient` отправляет запрос, то `ActivityKind.Client`
 
-![](images/Запрос%20от%20HttpClient.png)
+![Спан исходящего запроса из SystemApi](images/Запрос%20от%20HttpClient.png)
+</spoiler>
 
 ## Подключение OpenTelemetry
 
 Теперь разберемся как подключать OpenTelemetry в проект. 
-Все библиотеки OpenTelemetry имеют префикс OpenTelemetry.
+
+Все библиотеки OpenTelemetry имеют префикс OpenTelemetry (этот префикс зарезервирован).
 Для подключения базовой функциональности в ASP.NET Core необходимо подключить:
 ```shell
 dotnet add package OpenTelemetry
@@ -201,62 +233,120 @@ dotnet add package OpenTelemetry.Extensions.Hosting
 
 > Многие библиотеки OpenTelemetry находятся в `prerelease` статусе, поэтому в менеджере пакетов просто так не отобразятся
 
-Следующий этап - включить функциональность OpenTelemetry в ASP.NET Core
+Следующий этап - включить функциональность OpenTelemetry в ASP.NET Core (регистрация в провайдере сервисов)
 
 Это можно сделать методом расширения `AddOpenTelemetry()`
 
-Но он только добавляет SDK в провайдер сервисов. Для дальнейшей настройки необходимо настроить сам трейсинг: `AddOpenTelemetry().WithTracing(...)`
+Но он только добавляет SDK в провайдер сервисов. Трейсинг подключается отдельно: `AddOpenTelemetry().WithTracing(...)`
 
 Этот метод принимает лямбду для настройки трейсинга в приложении:
 - Выставление метаинформации о приложении
 - Подключение экспортеров трейсов
 - Подписка на интересующие события
 
-1. Выставление метаинформации о приложении
+### Выставление информации о приложении
 
-Для представления информации о чем-либо используется класс `Resource`. По факту это просто список пар ключ-значение. Информация о приложении выставляется через него. Точнее через `ResourceBuilder`, для которого в итоге вызывается `Build()` и получается результирующий `Resource`.
+Для представления информации о чем-либо используется класс `Resource`. 
+По факту это просто список пар ключ-значение. 
+Информация о приложении выставляется через него. 
+Точнее через `ResourceBuilder`, для которого в итоге вызывается `Build()` и получается результирующий `Resource`.
 
-Для работы можно использовать 2 варианта:
+Для настройки можно использовать 2 варианта/метода:
 - `SetResourceBuilder(ResourceBuilder builder)` - вручную выставляем нашего `ResourceBuilder` с выставленными значениями 
 - `ConfigureResource(Action<ResourceBuilder> configure)` - лямбда с настройкой стандартного `ResourceBuilder`.
 
 Информацию можно задать несколькими способами:
-- `AddService` - вручную задать название, версию, ID инстанса
-- `AddAttributes` - задать данные приложения в виде перечисления пар ключ-значение
+- `AddService` - вручную задать название, версию, ID экземпляра сервиса
+- `AddAttributes` - выставить информацию приложения в виде перечисления пар ключ-значение
 - `AddDetector` - получить информацию о приложении через переданный детектор (возможно получение детектора из переменных окружения)
-- `AddEnvironmentVariableDetector` - задать информацию о приложении через стандартные переменные окружения: OTEL_RESOURCE_ATTRIBUTES, OTEL_SERVICE_NAME
+- `AddEnvironmentVariableDetector` - задать информацию о приложении через стандартные переменные окружения: `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME`
 
-> Создание детектора
+<spoiler title="Что такое детектор">
 
+При настройке информации о приложении по факту везде используется метод `AddDetector`. Остальное - методы расширения.
 
-> Добавить ссылку на строку 
+Детектор - это реализация интерфейса `IResourceDetector`
 
-Вот пример конфигурирования сервиса температуры:
+```cs
+/// <summary>
+/// An interface for Resource detectors.
+/// </summary>
+public interface IResourceDetector
+{
+    /// <summary>
+    /// Called to get a resource with attributes from detector.
+    /// </summary>
+    /// <returns>An instance of <see cref="Resource"/>.</returns>
+    Resource Detect();
+}
+```
+
+Все добавленные детекторы в итоге возвращают `Resource` при вызове `Detect()` - информацию о приложении.
+
+Например, есть метод расширения `.AddEnvironmentVariableDetector()`, 
+который добавляет детекторы для выставления настроек сервиса из стандартных переменных окружения.
+
+Такие детекторы можно создать самим. 
+В `TemperatureApi` есть `RandomSeedDetector` - детектор, который в информацию о сервисе выставляет сид для `Random`.
+
+```cs
+public class RandomSeedDetector: IResourceDetector
+{
+    private readonly IOptions<RandomOptions> _options;
+
+    public RandomSeedDetector(IOptions<RandomOptions> options)
+    {
+        _options = options;
+    }
+    
+    public Resource Detect()
+    {
+        return new Resource(new KeyValuePair<string, object>[]
+        {
+            new("random.seed", _options.Value.RandomSeed)
+        });
+    }
+}
+```
+
+Как можно увидеть, на вход он принимает `IOptions`. 
+Его можно получить из `IServiceProvider` - есть перегрузка принимающая его для создания нового детектора.
+Именно она и используется в проекте.
 ```cs
 tracing.ConfigureResource(rb =>
 {
+    rb.AddDetector(sp =>
+        new RandomSeedDetector(sp.GetRequiredService<IOptions<RandomOptions>>()));
+});
+```
+
+</spoiler>
+
+Пример конфигурирования `TemperatureApi`:
+```cs
+tracing.ConfigureResource(rb =>
+{
+   var name = typeof(TemperatureController).Assembly.GetName();
    rb.AddService(
-       serviceName: "TemperatureApi",
-       serviceVersion: "1.0.1",
+       serviceName: name.Name!,
+       serviceVersion: name.Version!.ToString(),
        autoGenerateServiceInstanceId: true);
-   rb.AddEnvironmentVariableDetector();
    rb.AddDetector(sp =>
-   {
-        return new RandomSeedDetector(sp.GetRequiredService<IOptions<RandomOptions>>())
-   });
+       new RandomSeedDetector(sp.GetRequiredService<IOptions<RandomOptions>>()));
 })
 ```
 
-Дальше необходимо настроить инструментаторы. 
-Вкратце, инструментатор - это библиотека, которая позволит собирать трейсы из других библиотек без необходимости настраивать это самому.
+### Инструментаторы
+
+Инструментатор - это функциональность/библиотека, которая позволяет делать трейсинг других библиотек без необходимости настраивать это самому.
+
 Примером может служить `HttpClient`.
-
 Для его инструментирования есть библиотека `OpenTelemetry.Instrumentation.Http`. 
-Она за вас проставит необходимые метаданные для проброса контекста при отправке запросов `HttpClient`.
+Она за вас проставит необходимые метаданные для проброса контекста при отправке запросов через `HttpClient`.
 
-Подключить его можно методом расширения
+Подключение - метод расширения
 ```csharp
-tracing.AddHttpClientInstrumentation()
+tracing.AddHttpClientInstrumentation();
 ```
 
 Примеры других инструментаторов:
@@ -266,35 +356,46 @@ tracing.AddHttpClientInstrumentation()
 - `OpenTelemetry.Instrumentation.Runtime`
 - `OpenTelemetry.Instrumentation.StackExchangeRedis`
 
-Дальше необходимо зарегистрировать свои источники событий. Для этого есть метод `AddSource(params string[] names)`. На вход он принимает названия `ActivitySource`. 
+### Источники событий
+
+Источник событий - это созданный нами `ActivitySource`.
+
+Просто так OpenTelemetry не станет их слушать.
+Для регистрации есть метод `AddSource(params string[] names)`. 
+На вход он принимает названия `ActivitySource`. 
 
 Моя практика работы следующая:
-- Создаю статический класс с `ActivitySource` (класс обычно назваю `Tracing`)
-- В этом классе определяю названия активностей приложения (строковые константы)
-- Когда начинается новая активность - обращаюсь к необходимому источнику и константе активности: `using var activity = Tracing.ApplicationActivity.StartActivity(Tracing.SampleOperation);`
+- Создаю статический класс с `ActivitySource` (класс обычно называю `Tracing`) 
+- Когда начинается новая активность - обращаюсь к необходимому источнику и константе активности: `using var activity = Tracing.ApplicationActivity.StartActivity(SampleOperation);`
 
 Поэтому регистрация источников событий в `AddSource` выглядит как перечисление всех названий `ActivitySource` из всех подобных "классов-реестров":
 
 ```csharp
-tracing.AddSource(FirstModule.Tracing.ApplicationActivity.Name, SecondModule.Tracing.AnotherActivity.Name);
+tracing.AddSource(
+    FirstModule.Tracing.ApplicationActivity.Name, 
+    SecondModule.Tracing.AnotherActivity.Name);
 ```
 
-Спаны собираются - хорошо. Но нужно их куда-то отправить. За это отвечают экспортеры.
+### Экспортеры
+
+Спаны собираются - хорошо, но нужно их куда-то отправить. 
+За это отвечают экспортеры.
 
 Хоть это и OpenTelemetry библиотека, но экспортировать можно не только в OTEL формате.
 Также есть поддержка (не только):
-- Jaeger
-- Zipkin
-- Stackdriver
+- Jaeger - [OpenTelemetry.Exporter.Jaeger](https://www.nuget.org/packages/OpenTelemetry.Exporter.Jaeger)
+- Zipkin - [OpenTelemetry.Exporter.Zipkin](https://www.nuget.org/packages/OpenTelemetry.Exporter.Zipkin)
+- Stackdriver - [OpenTelemetry.Exporter.Stackdriver](https://www.nuget.org/packages/OpenTelemetry.Exporter.Stackdriver)
 
-Подключение также тривиально. Например для подключения OpenTelemetry экспортера:
+Подключение OpenTelemetry экспортера:
+
 1. Добавляем пакет с экспортером
 
 ```shell
 dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
 ```
 
-2. Подключаем экспортер вызовом метода
+2. Регистрируем экспортер вызовом метода
 
 ```csharp
 tracing.AddOltpExporter();
@@ -309,7 +410,7 @@ tracing.AddOltpExporter(oltp =>
 });
 ```
 
-Все этапы вместе:
+Собираем воедино:
 ```csharp
 builder.Services
        .AddOpenTelemetry()
@@ -322,15 +423,14 @@ builder.Services
                     })
                    .ConfigureResource(rb =>
                     {
+                        var name = typeof(TemperatureController).Assembly.GetName();
                         rb.AddService(
-                            serviceName: "TemperatureApi",
-                            serviceVersion: "1.0.1",
+                            serviceName: name.Name!,
+                            serviceVersion: name.Version!.ToString(),
                             autoGenerateServiceInstanceId: true);
-                        rb.AddEnvironmentVariableDetector();
                         rb.AddDetector(sp =>
                             new RandomSeedDetector(sp.GetRequiredService<IOptions<RandomOptions>>()));
-                    })
-                   .AddHttpClientInstrumentation();
+                    });
         });
 ```
 
@@ -338,51 +438,64 @@ builder.Services
 
 Для примера я сделал небольшой стенд из 3 сервисов с единственной операцией (запросом):
 - `OpenTelemetry.SystemApi.Web` - принимает запрос от пользователя, делает HTTP запрос к `TemperatureApi` и отправляет полученный объект в очередь кафки. Дальше называется `SystemApi`
-- `OpenTelemetry.TemperatureApi.Web` - простой HTTP API с единственной ручкой `temperature/current`, который возвращет рандомное число (температуру). Дальше называется `TemperatureApi`
-- `OpenTelemetry.RecordSaver.Worker` - фоновый процесс, который читает из кафки сообщения, отправляемые `SystemApi`, и сохраняет их в Postgres с помощью EF Core. Дальше называется `RecordSaver`
+- `OpenTelemetry.TemperatureApi.Web` - простой HTTP API с единственной ручкой `temperature/current`, который возвращает случайное число (температуру). Дальше называется `TemperatureApi`
+- `OpenTelemetry.RecordSaver.Worker` - демон, который читает из кафки сообщения, отправляемые `SystemApi`, и сохраняет их в Postgres с помощью EF Core. Дальше называется `RecordSaver`
 
-Для визуализации использовал Jaeger. Он поддерживает работу с OLTP - 4317 порт
+В качестве вендора использовал Jaeger. 
+Он поддерживает работу с OLTP на 4317 порту (нужно выставить переменную окружения `COLLECTOR_OLTP_ENABLED=true`)
 
 ### Синхронный запрос от одного сервиса к другому
 
-Синхронный запрос в цепочке - от `SystemApi` к Temperature.Api. Он выполняется с помощью `HttpClient`. Для отслеживания запросов в Web добавлен инструментатор HttpClient, а в Temperature.Api - AspNetCore инструментатор.
+Синхронный запрос в цепочке - от `SystemApi` к `TemperatureApi`. 
+Он выполняется с помощью `HttpClient`. 
+Для отслеживания запросов в `SystemApi` добавлен инструментатор `HttpClient`, а в `TemperatureApi` - `ASP.NET Core` инструментатор.
 
-Внутри контроллера `Web` вызывается `ITemperatureService.GetTemeratureAsync()`, который делает HTTP запрос в `Temperature.Api`.
+Внутри контроллера `SystemApi` вызывается `ITemperatureService.GetTemeratureAsync()`, который делает HTTP запрос в `Temperature.Api`.
 
 Эта часть отображена в трейсе:
 
-![Трейс синхронного запроса](images/Снимок%20экрана%20от%202023-06-17%2016-13-43.png)
+![Трейс синхронного запроса](images/Трейс%20синхронного%20запроса.png)
 
-Первая часть принадлежит инструментатору HttpClient на Web, а вторая - инструментатору AspNetCore на Temperature.Api
+Первая часть принадлежит инструментатору `HttpClient` на `SystemApi`, а вторая - инструментатору `AspNetCore` на `TemperatureApi`
 
-### Проброс контекста между различными приложениями/машинами - (`PropagationContext`, `Propagators`)
+### Проброс контекста между различными сервисами
 
-Что делать, если для какого-то варианта взаимодействия нет своего инструментатора? Как в этом случае передавать контекст?
+Что делать, если для какого-то варианта взаимодействия нет своего инструментатора? 
+Как в этом случае передавать контекст?
 
-В этих случаях нужно самим его передавать.
-
-Для этого предназначен `Propagators API`.
-Он предоставляет фреймворк для передачи контекста.
-Транспортный слой передачи определяет сам пользователь - можно передавать где захочешь.
+Для проброса контекста предназначен `Propagators API`.
+Он предоставляет мини-фреймворк для передачи контекста.
+Транспортный слой выбирает сам пользователь - можно передавать где захочешь.
 
 Передающая сторона:
-1. Получает инстанс `Propagator`. На данный момент есть только `TextMapPropagator`, который использует строковое отображение, но планируется добавление варианта передачи по байтам.
 
-2. Вызывает метод `Inject<T>(PropagationContext context, T carrier, Action<T,string,string> setter)`. `T carrier` - это тип используемого хранилища, а `Action<T,string,string> setter` - функция для добавления данных в хранилище.
+1. Получает экземпляр `Propagator`. 
+
+> На данный момент есть только `TextMapPropagator`, который использует строковое отображение, но планируется добавление байтового варианта 
+
+2. Вызывает метод `Inject<T>(PropagationContext context, T carrier, Action<T,string,string> setter)`
+
+>`T carrier` - это тип используемого хранилища, а `Action<T,string,string> setter` - функция для добавления данных в хранилище.
    
-3. Делает необходимый запрос
+3. Делает запрос
 
 Получающая сторона:
-1. Получает инстанс `Propagator`
-2. Получает хранилище из запроса
-3. Вызывает `Extract<T>(PropagationContext context, T carrier, Func<T,string,IEnumerable<string>> getter)`. `getter` используется уже для получения данных из хранилища
-4. При создании новой активности использует полученные данные:
+
+1. Получает экземпляр `Propagator`
+2. Получает хранилище, использовавшееся в запросе
+3. Вызывает `Extract<T>(PropagationContext context, T carrier, Func<T,string,IEnumerable<string>> getter)`
+
+> `getter` используется уже для получения данных из хранилища
+
+4. Использует полученные данные при создании новой `Activity`:
    - Установка `Baggage`
-   - Выставление родительнского контекста
+   - Выставление родительского контекста
    - Добавление ссылок
 
 Хватит теории, давайте практику.
-К сожалению (или счастью), для кафки я не нашел инструментатора. Поэтому написал свои декораторы, которые пробрасывают контекст.
+
+К сожалению (или счастью), для кафки я не нашел инструментатора. 
+Поэтому написал свои декораторы, которые пробрасывают контекст.
 
 Продьюсер:
 ```csharp
@@ -501,42 +614,41 @@ private Activity? StartActivity(ConsumeResult<Null, string> result)
 
 Если мы попробуем положить в `Baggage` какие-нибудь данные, то получим на обратной стороне.
 Для приложений из стенда можно указать специальные переменные окружения:
-- `TRACING_SEND_RANDOM_BAGGAGE=true` для Web, чтобы посылал случайные данные
-- `TRACING_LOG_BAGGAGE=true` для RecordSaver.Worker, чтобы логировал получаемый Baggage
+- `TRACING_SEND_RANDOM_BAGGAGE=true` для `SystemApi`, чтобы генерировал и посылал случайные данные
+- `TRACING_LOG_BAGGAGE=true` для `RecordSaver`, чтобы логировал получаемый `Baggage`
 
-Логи продьюсера:
-![](images/Логирование%20Baggage%20продьюсером.png)
+Логи `SystemApi`:
+![Перечисление отправляемого Baggage](images/Логирование%20Baggage%20продьюсером.png)
 
-Логи консьюмера:
-![](images/Логирование%20Baggage%20консьюмером.png)
+Логи `RecordSaver`:
+![Перечисление полученного Baggage](images/Логирование%20Baggage%20консьюмером.png)
 
-> Замечание: функции `getter` и `setter` у `Propagator` не должны выкидывать исключения
+> Функции `getter` и `setter` у `Propagator` не должны выкидывать исключения
 
 ### Добавление тегов в текущую `Activity`
 
-Если в текущую `Activity` необходимо добавить информацию. Например, атрибуты или событие, то возникает вопрос как к ее получить.
+Если в текущую `Activity` необходимо добавить информацию. 
+Например, атрибуты или событие, то возникает вопрос как к ее получить.
 
 Ответ прост - статическое свойство `Activity.Current`. Оно вернет текущий `Activity`, если он есть, иначе `null`.
 
 > Для хранения `Activity`, используется статическое поле типа `AsyncLocal<Activity>`. Поэтому обращение к свойству из различных асинхронных функций вернет текущий `Activity`
-```csharp
-private static readonly AsyncLocal<Activity?> s_current = new AsyncLocal<Activity?>();
-public static Activity? Current
-{
-    get { return s_current.Value; }
-    set
-    {
-        if (ValidateSetCurrent(value))
-        {
-            SetCurrent(value);
-        }
-    }
-}
-```
+> ```csharp
+> private static readonly AsyncLocal<Activity?> s_current = new AsyncLocal<Activity?>();
+> public static Activity? Current
+> {
+>     get { return s_current.Value; }
+>     set
+>     {
+>         if (ValidateSetCurrent(value))
+>         {
+>             SetCurrent(value);
+>         }
+>     }
+> }
+> ```
 
-Например, мы хотим сделать декоратор для какого-то сервиса, который будет добавлять событие при возникновении какого-нибудь исключения
-
-Для примера, сделал декоратор для `ITemperatureService`, который добавляет событие ошибки парсинга JSON
+Например, мы хотим сделать декоратор для какого-то сервиса, который будет добавлять событие при возникновении исключения
 
 ```csharp
 public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
@@ -565,7 +677,8 @@ public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
 
 ### Дробление большого запроса на несколько меньших
 
-Батч операции могут оптимизировать работу системы, но иногда один большой батч не может вместиться в запрос, поэтому надо дробить на несколько меньше. 
+Батч операции могут оптимизировать работу системы, но иногда вся информация не может вместиться в единственный запрос, поэтому надо дробить на несколько меньше. 
+
 В примере я использую того же самого `IProducer<TKey, TValue>` с декоратором, описанным ранее.
 
 Добавил новую ручку `System/state/batch`, которая делает буквально то же самое, но отправляет несколько запросов параллельно через `Task.WhenAll()`
@@ -590,22 +703,29 @@ token)));
 
 Зависимости между спанами корректно обрабатываются
 
-![](images/Параллельные%20запросы%20батчи.png)
+![Спаны параллельных запросов](images/Параллельные%20запросы%20батчи.png)
 
-> Замечание: если внути `.Select()` использовать отображение на другие асинхронные функции с собственной логикой (`.Select(async m => {await ...; await ...;})`) то все будет работать так же корректно
+> Если внутри `.Select()` использовать отображение на другие асинхронные функции с собственной логикой (`.Select(async m => {await ...; await ...;})`) то все будет работать так же корректно
 
 ### Сторонние сервисы
 
-Представим, что мы работает с кафкой. Как известно из одного топика могут читать несколько групп потребителей. Одна - занимается непосредственной бизнес-логикой. Другие - делают вспомогательную работу: синхронизация баз данных, аудит событий, составление отчетов, взаимодействия с другими сервисами экосистемы.
+Представим, что мы работаем с кафкой.
+Как известно, из одного топика могут читать несколько групп потребителей. 
+Пусть одна занимается непосредственной бизнес-логикой, а другие выполняют вспомогательную работу: синхронизация баз данных, аудит событий, составление отчетов, взаимодействия с другими сервисами экосистемы.
 
-Как нам знать, что прочитанное сообщение относится к другому трейсу/спану? Самый простой вариант - добавить контекст как родительский. Но в этом случае трейс замусорится лишними операциями.
+Как нам знать, что прочитанное сообщение относится к другому трейсу/спану? 
+Самый простой вариант - пометить полученный контекст как родительский. 
+Но в этом случае трейс замусорится лишними операциями.
 
-Для таких ситуаций в OpenTelemetry определен `Link`. По факту, это просто метаинформация, сообщающая о корреляции/связи с другим спаном.
+Для таких ситуаций в OpenTelemetry определен [`Link`](https://opentelemetry.io/docs/concepts/signals/traces/#span-links). 
+По факту, это просто метаинформация, сообщающая о корреляции/связи с другим спаном.
 
 В .NET представляется типом `ActivityLink`. 
 Эти ссылки должны быть добавлены во время создания `Activity`.
 
-Сервис `RecordSaver` принимает на вход переменную окружения `TRACING_USE_LINK=true`. Если она выставлена, то во время создания `Activity` будет использоваться не родительский контекст, а ссылка
+Сервис `RecordSaver` принимает на вход переменную окружения `TRACING_USE_LINK=true`. 
+Если она выставлена, то во время создания `Activity` будет использоваться не родительский контекст, а ссылка
+
 ```csharp
 ActivityLink[]? links = null;
 ActivityContext parentContext = default;
@@ -631,19 +751,20 @@ var span = Tracing.ConsumerActivitySource.StartActivity(
 
 Если сделать запрос из `SystemApi`, то получим следующие результаты:
 
-1. Создалось 2 разных трейса: `SystemApi` + `TemperatureApi` и `RecordSaver`
+1. Создались 2 разных трейса: `SystemApi` + `TemperatureApi` и `RecordSaver`
 
-![](images/Ссылки%20вместо%20контекста.Web.png)
+![Запись трейса SystemApi и TemperatureApi](images/Ссылки%20вместо%20контекста.Web.png)
 
-![](images/Ссылки%20вместо%20контекста.RecordSaver.png)
+![Запись трейса RecordSaver](images/Ссылки%20вместо%20контекста.RecordSaver.png)
 
-1. В родительский спан `RecordSaver` добавлена ссылка на спан продьюсера
+2. В родительский спан `RecordSaver` добавлена ссылка на спан продьюсера
 
-![](images/Трейс%20в%20RecordSaver.png)
+![Ссылка из RecordSaver на спан в SystemApi](images/Трейс%20в%20RecordSaver.png)
 
-![](images/Трейс%20в%20Web.png)
+![Ссылаемый из RecordSaver спан](images/Трейс%20в%20Web.png)
 
-Теперь часть работы на `RecordSaver` выполняется независимо - генерируется свой собственный `Trace Id`. Поэтому отследить такие запросы будет сложнее.
+Теперь `RecordSaver` "независим" - генерируется свой собственный `Trace Id`. 
+Отследить такие запросы, как можно догадаться, сложнее.
 
 ### Обработка ошибок
 
@@ -660,26 +781,33 @@ var tags = new ActivityTagsCollection(new KeyValuePair<string, object?>[]
 });
 activity.AddEvent(new ActivityEvent("exception", tags: tags));
 ```
-- Воспользоваться методом расширения из библиотеки (сервис `TemperatureApi`)
+- Воспользоваться методом расширения из OpenTelemetry (сервис `TemperatureApi`)
 ```csharp
 activity.RecordException(e);
 ```
 
-Метод вызванный сверху идентичен работе метода расширения. Буквально делает то же самое.
+Первый вариант идентичен работе метода расширения. 
+Буквально делает то же самое.
 
-Названия атрибутов для события искючения определены в [спецификации](https://github.com/open-telemetry/semantic-conventions/blob/main/semantic_conventions/trace/trace-exception.yaml).
+Названия атрибутов для события исключения определены в [спецификации](https://github.com/open-telemetry/semantic-conventions/blob/main/semantic_conventions/trace/trace-exception.yaml).
 
 В проекте `TemperatureApi` добавил переменную окружения `THROW_EXCEPTION=true`. Если она выставлена, то эндпоинт генерирует исключение.
 
 В результате получается такой трейс:
 
-![](images/Трейс%20исключений.png)
+![Визуализация ошибки в трейсе](images/Трейс%20исключений.png)
 
 > P.S. в трейсе `TemperatureApi` нет `exception.stacktrace`, так как объект исключения сначала создался, и только после добавления события вызван `throw`
 
-1. Добавить ссылки на 
- - Спеку в гитхабе [ссылка](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/api.md#span)
- - Свою репу с примерами
+---
 
+Думаю, эти варианты использования могут покрыть большую часть возникающих задач.
 
-2. Завести новый репозиторий для примера проекта + причесать его
+Кроме трейсинга, OpenTelemetry предоставляет аналогичную функциональность и для сбора метрик. 
+Причем, также используется `System.Diagnostics` с нативными .NET'овскими типами.
+Но это уже за рамками этой статьи.
+
+Полезные ссылки: 
+ - Спецификация OpenTelemetry - [ссылка](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/api.md#span)
+ - Стенд из примера - [ссылка]()
+ - Репозиторий OpenTelemetry для .NET - [ссылка](https://github.com/open-telemetry/opentelemetry-dotnet)
