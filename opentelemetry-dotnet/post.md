@@ -1,6 +1,4 @@
-# OpenTelemetry .NET
-
-## Вступление
+# Вступление
 
 Всем привет. 
 
@@ -12,7 +10,7 @@
 
 В этой статье опишу подключение OpenTelemetry в ASP.NET Core проект + некоторые варианты его использования. 
 
-## Что такое OpenTelemetry
+# Что такое OpenTelemetry
 
 Трейсинг запросов является важной частью Observability систем. 
 Микросервисов в частности.
@@ -29,7 +27,7 @@
 2. Коллектор
 3. Вендор
 
-### Хост
+## Хост
 
 Хост - само приложение. 
 
@@ -43,19 +41,19 @@
 2. SDK - Serilog, NLog, log4net
 3. Exporter - Console, Serilog, ELK
 
-### Коллектор 
+## Коллектор 
 
 Коллектор - сервис, занимающийся сбором, обработкой и отправкой замеров/трейсов вендору
 
 Может работать как на той же машине, что и приложение (Агент), так и на другой (Коллектор)
 
-### Вендор
+## Вендор
 
 Вендор - сервис, хранящий собранные данные
 
 Например, Jaeger (поддерживает OLTP порт) или Zipkin (для него есть [правила трансформации](https://opentelemetry.io/docs/specs/otel/trace/sdk_exporters/zipkin/), которые выполняет коллектор)
 
-## Сравнение OpenTelemetry и System.Diagnostics
+# Сравнение OpenTelemetry и System.Diagnostics
 
 Начиная с .NET 5 были добавлены типы из пространства `System.Diagnostics`, которые позволяют производить трейсинг работы приложения без необходимости подключения дополнительных библиотек. 
 Речь о `Activity`, `ActivitySource`, `ActivityListener`. 
@@ -80,16 +78,14 @@
 
 Но все же, создатели библиотеки рекомендуют пользоваться `System.Diagnostics` вместо `Tracing shim`. Дальше буду использовать `System.Diagnostics`
 
-[Таблица сравнений](https://gist.github.com/lmolkova/6cd1f61f70dd45c0c61255сравнение039695cce8)
-
-## Трейсинг в System.Diagnostics
+# Трейсинг в System.Diagnostics
 
 Для трейсинга в .NET используется Activity API, предоставляемый `System.Diagnostics`.
 
 Алгоритм работы с ним следующий:
 
 1. Определяем источник событий: `ActivitySource`
-```csharp
+```cs
 private static readonly AssemblyName CurrentAssembly = typeof(Tracing).Assembly.GetName();
 private static string Version => CurrentAssembly.Version!.ToString();
 private static string AssemblyName => CurrentAssembly.Name!;
@@ -97,7 +93,7 @@ public static readonly ActivitySource ConsumerActivitySource = new(AssemblyName,
 ```
 
 2. В интересуемой операции создаем начинаем отслеживание новой активности
-```csharp
+```cs
 public const string KafkaMessageProcessing = "Обработка сообщения из кафки";
 
 public Activity StartActivity()
@@ -109,7 +105,7 @@ public Activity StartActivity()
 ```
 
 3. Добавляем метаданные
-```csharp
+```cs
 // https://github.com/open-telemetry/semantic-conventions/blob/main/semantic_conventions/trace/general.yaml
 activity?.SetTag("thread.id", Environment.CurrentManagedThreadId);
 activity?.SetTag("thread.name", Thread.CurrentThread.Name);
@@ -123,7 +119,7 @@ void SetLineNumber(Activity? a, [CallerLineNumber] int lineNumber = 0)
 ```
 
 4. Заканчиваем событие
-```csharp
+```cs
 span.Stop();
 // span.Dispose(); - вызывает span.Stop(), т.е. одно и то же
 ```
@@ -142,7 +138,7 @@ span.Stop();
   - [`rpc.system`](https://github.com/open-telemetry/semantic-conventions/blob/main/specification/trace/semantic_conventions/rpc.md#common-attributes) - тип используемого RPC запроса (`grpc`, `dotnet_wcf`, `java_rmi`)
 
 Вот пример полного пути выполнения:
-```csharp
+```cs
 public async Task<IActionResult> ProcessRequest()
 {
     using var activity = MyActivitySource.StartActivity(ActivityName);
@@ -166,7 +162,7 @@ public async Task<IActionResult> ProcessRequest()
 
 `ActivityKind` представляет собой тип отношений между родительским и дочерним спанами. Его аналог в OpenTelemetry - [`SpanKind`](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/api.md#span)
 
-```csharp
+```cs
 public enum ActivityKind
 {
     /// <summary>
@@ -218,7 +214,7 @@ public enum ActivityKind
 ![Спан исходящего запроса из SystemApi](images/Запрос%20от%20HttpClient.png)
 </spoiler>
 
-## Подключение OpenTelemetry
+# Подключение OpenTelemetry
 
 Теперь разберемся как подключать OpenTelemetry в проект. 
 
@@ -244,7 +240,7 @@ dotnet add package OpenTelemetry.Extensions.Hosting
 - Подключение экспортеров трейсов
 - Подписка на интересующие события
 
-### Выставление информации о приложении
+## Выставление информации о приложении
 
 Для представления информации о чем-либо используется класс `Resource`. 
 По факту это просто список пар ключ-значение. 
@@ -336,7 +332,7 @@ tracing.ConfigureResource(rb =>
 })
 ```
 
-### Инструментаторы
+## Инструментаторы
 
 Инструментатор - это функциональность/библиотека, которая позволяет делать трейсинг других библиотек без необходимости настраивать это самому.
 
@@ -345,7 +341,7 @@ tracing.ConfigureResource(rb =>
 Она за вас проставит необходимые метаданные для проброса контекста при отправке запросов через `HttpClient`.
 
 Подключение - метод расширения
-```csharp
+```cs
 tracing.AddHttpClientInstrumentation();
 ```
 
@@ -356,7 +352,7 @@ tracing.AddHttpClientInstrumentation();
 - `OpenTelemetry.Instrumentation.Runtime`
 - `OpenTelemetry.Instrumentation.StackExchangeRedis`
 
-### Источники событий
+## Источники событий
 
 Источник событий - это созданный нами `ActivitySource`.
 
@@ -370,13 +366,13 @@ tracing.AddHttpClientInstrumentation();
 
 Поэтому регистрация источников событий в `AddSource` выглядит как перечисление всех названий `ActivitySource` из всех подобных "классов-реестров":
 
-```csharp
+```cs
 tracing.AddSource(
     FirstModule.Tracing.ApplicationActivity.Name, 
     SecondModule.Tracing.AnotherActivity.Name);
 ```
 
-### Экспортеры
+## Экспортеры
 
 Спаны собираются - хорошо, но нужно их куда-то отправить. 
 За это отвечают экспортеры.
@@ -397,13 +393,13 @@ dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
 
 2. Регистрируем экспортер вызовом метода
 
-```csharp
+```cs
 tracing.AddOltpExporter();
 ```
 
 3. Настраиваем экспортера
 
-```csharp
+```cs
 tracing.AddOltpExporter(oltp => 
 {
     oltp.Endpoint = new Uri("http://oltp:4317");
@@ -411,7 +407,7 @@ tracing.AddOltpExporter(oltp =>
 ```
 
 Собираем воедино:
-```csharp
+```cs
 builder.Services
        .AddOpenTelemetry()
        .WithTracing(tracing =>
@@ -434,7 +430,7 @@ builder.Services
         });
 ```
 
-## Рецепты
+# Рецепты
 
 Для примера я сделал небольшой стенд из 3 сервисов с единственной операцией (запросом):
 - `OpenTelemetry.SystemApi.Web` - принимает запрос от пользователя, делает HTTP запрос к `TemperatureApi` и отправляет полученный объект в очередь кафки. Дальше называется `SystemApi`
@@ -444,7 +440,7 @@ builder.Services
 В качестве вендора использовал Jaeger. 
 Он поддерживает работу с OLTP на 4317 порту (нужно выставить переменную окружения `COLLECTOR_OLTP_ENABLED=true`)
 
-### Синхронный запрос от одного сервиса к другому
+## Синхронный запрос от одного сервиса к другому
 
 Синхронный запрос в цепочке - от `SystemApi` к `TemperatureApi`. 
 Он выполняется с помощью `HttpClient`. 
@@ -458,7 +454,7 @@ builder.Services
 
 Первая часть принадлежит инструментатору `HttpClient` на `SystemApi`, а вторая - инструментатору `AspNetCore` на `TemperatureApi`
 
-### Проброс контекста между различными сервисами
+## Проброс контекста между различными сервисами
 
 Что делать, если для какого-то варианта взаимодействия нет своего инструментатора? 
 Как в этом случае передавать контекст?
@@ -498,7 +494,7 @@ builder.Services
 Поэтому написал свои декораторы, которые пробрасывают контекст.
 
 Продьюсер:
-```csharp
+```cs
 public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
 {
     private readonly IProducer<TKey, TValue> _producer;
@@ -579,7 +575,7 @@ public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
 ```
 
 Консьюмер:
-```csharp
+```cs
 private static IEnumerable<string> GetValuesFromHeadersSafe(Headers headers, string key)
     => headers.Where(x => x.Key == key)
                 .Select(b =>
@@ -625,7 +621,7 @@ private Activity? StartActivity(ConsumeResult<Null, string> result)
 
 > Функции `getter` и `setter` у `Propagator` не должны выкидывать исключения
 
-### Добавление тегов в текущую `Activity`
+## Добавление тегов в текущую `Activity`
 
 Если в текущую `Activity` необходимо добавить информацию. 
 Например, атрибуты или событие, то возникает вопрос как к ее получить.
@@ -633,7 +629,7 @@ private Activity? StartActivity(ConsumeResult<Null, string> result)
 Ответ прост - статическое свойство `Activity.Current`. Оно вернет текущий `Activity`, если он есть, иначе `null`.
 
 > Для хранения `Activity`, используется статическое поле типа `AsyncLocal<Activity>`. Поэтому обращение к свойству из различных асинхронных функций вернет текущий `Activity`
-> ```csharp
+> ```cs
 > private static readonly AsyncLocal<Activity?> s_current = new AsyncLocal<Activity?>();
 > public static Activity? Current
 > {
@@ -650,7 +646,7 @@ private Activity? StartActivity(ConsumeResult<Null, string> result)
 
 Например, мы хотим сделать декоратор для какого-то сервиса, который будет добавлять событие при возникновении исключения
 
-```csharp
+```cs
 public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
 {
     private readonly ITemperatureService _service;
@@ -675,7 +671,7 @@ public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
 }
 ```
 
-### Дробление большого запроса на несколько меньших
+## Дробление большого запроса на несколько меньших
 
 Батч операции могут оптимизировать работу системы, но иногда вся информация не может вместиться в единственный запрос, поэтому надо дробить на несколько меньше. 
 
@@ -683,7 +679,7 @@ public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
 
 Добавил новую ручку `System/state/batch`, которая делает буквально то же самое, но отправляет несколько запросов параллельно через `Task.WhenAll()`
 
-```csharp
+```cs
 var measurements = Enumerable.Range(0, amount)
                              .Select(_ => new WeatherForecast()
                              {
@@ -707,7 +703,7 @@ token)));
 
 > Если внутри `.Select()` использовать отображение на другие асинхронные функции с собственной логикой (`.Select(async m => {await ...; await ...;})`) то все будет работать так же корректно
 
-### Сторонние сервисы
+## Сторонние сервисы
 
 Представим, что мы работаем с кафкой.
 Как известно, из одного топика могут читать несколько групп потребителей. 
@@ -726,7 +722,7 @@ token)));
 Сервис `RecordSaver` принимает на вход переменную окружения `TRACING_USE_LINK=true`. 
 Если она выставлена, то во время создания `Activity` будет использоваться не родительский контекст, а ссылка
 
-```csharp
+```cs
 ActivityLink[]? links = null;
 ActivityContext parentContext = default;
 
@@ -772,7 +768,7 @@ var span = Tracing.ConsumerActivitySource.StartActivity(
 
 Записать исключения можно 2 способами:
 - Вручную сделать запись события об ошибке (сервис `SystemApi`)
-```csharp
+```cs
 var tags = new ActivityTagsCollection(new KeyValuePair<string, object?>[]
 {
     new("exception.type", exception.GetType().Name), 
@@ -782,7 +778,7 @@ var tags = new ActivityTagsCollection(new KeyValuePair<string, object?>[]
 activity.AddEvent(new ActivityEvent("exception", tags: tags));
 ```
 - Воспользоваться методом расширения из OpenTelemetry (сервис `TemperatureApi`)
-```csharp
+```cs
 activity.RecordException(e);
 ```
 
