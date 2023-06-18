@@ -21,7 +21,7 @@
       dockerfile: OpenTelemetry.RecordSaver.Worker/Dockerfile
     pull_policy: never
     environment:
-      TRACING_USE_LINK: 'false'
+      TRACING_USE_LINK: 'true'
       TRACING_LOG_BAGGAGE: 'true'
     depends_on: 
       - kafka

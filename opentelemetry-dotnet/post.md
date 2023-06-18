@@ -505,6 +505,44 @@ token)));
 
 Для обработки таких ситуаций в OpenTelemetry ввели `Link`. По факту, это просто метаинформация о корреляции с другим трейсом/спаном.
 
-В .NET его можно представить в виде
+В .NET представляется типом `ActivityLink`. 
 
+Эти ссылки должны быть добавлены во время создания `Activity`.
 
+Сервис `RecordSaver.Worker` принимает на вход переменную окружения `TRACING_USE_LINK=true`. Если она выставлена, то во время создания `Activity` будет использоваться не родительский контекст, а ссылка
+```csharp
+ActivityLink[]? links = null;
+ActivityContext parentContext = default;
+
+if (useLink)
+{
+    links = new ActivityLink[]
+    {
+        new(propagationContext.ActivityContext)
+    };
+}
+else
+{
+    parentContext = propagationContext.ActivityContext;
+}
+
+var span = Tracing.ConsumerActivitySource.StartActivity(
+    Tracing.KafkaMessageProcessing, 
+    kind: ActivityKind.Consumer,
+    parentContext: parentContext,
+    links: links);
+```
+
+Если сделать запрос из `Web`, то получим следующие результаты:
+
+1. Создалось 2 разных трейса: `Web` + `Temperature.Api` и `RecordSaver.Worker`
+
+![](images/Ссылки%20вместо%20контекста.Web.png)
+
+![](images/Ссылки%20вместо%20контекста.RecordSaver.png)
+
+2. В родительский спан `RecordSaver.Worker` добавлена ссылка на спан продьюсера
+
+![](images/Трейс%20в%20RecordSaver.png)
+
+![](images/Трейс%20в%20Web.png)
