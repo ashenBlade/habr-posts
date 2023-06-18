@@ -79,7 +79,6 @@ public class SystemController : ControllerBase
                 Value = JsonSerializer.Serialize(m)
             },
             token)));
-        ActivityKind
         return Ok(measurements.Select(m => new
         {
             IsHealthy = m.TemperatureC <= 20,

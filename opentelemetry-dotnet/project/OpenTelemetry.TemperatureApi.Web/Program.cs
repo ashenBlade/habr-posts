@@ -25,7 +25,7 @@ builder.Services
             tracing.AddAspNetCoreInstrumentation()
                    .AddOtlpExporter(oltp =>
                     {
-                        oltp.Endpoint = new Uri("http://jaeger:4317");
+                        oltp.Endpoint = new Uri("http://oltp:4317");
                     })
                     
                     // .AddZipkinExporter(zipkin =>

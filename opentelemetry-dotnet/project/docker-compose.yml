@@ -1,6 +1,6 @@
 ﻿services:
-  system.api.web:
-    image: otel.example.system.api.web
+  system.api:
+    image: otel.example.system.api
     build:
       context: .
       dockerfile: OpenTelemetry.SystemApi.Web/Dockerfile
@@ -49,6 +49,9 @@
   
   jaeger:
     image: jaegertracing/all-in-one:latest
+    extra_hosts: 
+      - jaeger
+      - oltp
     ports:
       - '16686:16686'
     environment:
