@@ -3,10 +3,10 @@ using System.Globalization;
 using System.Resources;
 using System.Text.Json;
 using Microsoft.VisualBasic.CompilerServices;
+using OpenTelemetry.System.Web.TemperatureService;
 using OpenTelemetry.Trace;
-using OpenTelemetry.Web.TemperatureService;
 
-namespace OpenTelemetry.Web.Decorators;
+namespace OpenTelemetry.System.Web.Decorators;
 
 public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
 {
@@ -23,14 +23,17 @@ public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
         {
             return await _service.GetTemperatureAsync(token);
         }
-        catch (JsonException e) when (Activity.Current is {} activity)
+        catch (JsonException e) when (Activity.Current is { } activity)
         {
             var @event = new ActivityEvent("Ошибка парсинга JSON",
-                tags: new ActivityTagsCollection(new KeyValuePair<string, object?>[]
-                {
-                    new("json.error.path", e.Path)
-                }));
+                tags: new ActivityTagsCollection(new KeyValuePair<string, object?>[] {new("json.error.path", e.Path)}));
             activity.AddEvent(@event);
+            throw;
+        }
+        catch (Exception e) when (Activity.Current is { } activity)
+        {
+            activity.RecordException(e);
+            activity.SetStatus(ActivityStatusCode.Error);
             throw;
         }
     }

@@ -61,6 +61,10 @@ builder.Services
 builder.Services
        .AddSingleton(sp => new Random(sp.GetRequiredService<IOptions<RandomOptions>>().Value.RandomSeed));
 
+builder.Services
+       .AddOptions<ApplicationOptions>()
+       .Bind(builder.Configuration);
+
 var app = builder.Build();
 
 app.UseSwagger();

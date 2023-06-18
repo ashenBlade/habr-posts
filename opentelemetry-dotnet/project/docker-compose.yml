@@ -1,9 +1,9 @@
 ﻿services:
-  web:
-    image: otel.example.web
+  system.api.web:
+    image: otel.example.system.api.web
     build:
       context: .
-      dockerfile: OpenTelemetry.Web/Dockerfile
+      dockerfile: OpenTelemetry.SystemApi.Web/Dockerfile
     ports:
       - '8080:5000'
     environment:
@@ -36,6 +36,7 @@
     environment:
       ASPNETCORE_URLS: http://+:5000
       RANDOM_SEED: 42
+      THROW_EXCEPTION: 'false'
   
   postgres:
     image: postgres:15-alpine

@@ -60,36 +60,128 @@
 
 1. Определяем источник событий: `ActivitySource`
 ```csharp
-// TODO
+private static readonly AssemblyName CurrentAssembly = typeof(Tracing).Assembly.GetName();
+private static string Version => CurrentAssembly.Version!.ToString();
+private static string AssemblyName => CurrentAssembly.Name!;
+public static readonly ActivitySource ConsumerActivitySource = new(AssemblyName, Version);
 ```
 
 2. В интересуемой операции создаем начинаем отслеживание новой активности
 ```csharp
-// TODO
+public const string KafkaMessageProcessing = "Обработка сообщения из кафки";
+
+public Activity StartActivity()
+{
+    var activity = ConsumerActivitySource.StartActivity(KafkaMessageProcessing);
+    // ...
+    return activity;
+}
 ```
 
 3. Добавляем метаданные
 ```csharp
-// TODO
+// https://github.com/open-telemetry/semantic-conventions/blob/main/semantic_conventions/trace/general.yaml
+activity?.SetTag("thread.id", Environment.CurrentManagedThreadId);
+activity?.SetTag("thread.name", Thread.CurrentThread.Name);
+activity?.SetTag("enduser.id", Thread.CurrentPrincipal?.Identity?.Name);
+SetLineNumber(activity);
+
+void SetLineNumber(Activity? a, [CallerLineNumber] int lineNumber = 0)
+{
+    a?.SetTag("code.lineno", lineNumber);
+}
 ```
 
 4. Заканчиваем событие
 ```csharp
-// TODO
+span.Stop();
+// span.Dispose(); - вызывает span.Stop(), т.е. одно и то же
 ```
 
-Как полученная информация обрабатывается - лежит на `ActivityListener`, но это ~~уже другая история~~ делает подключеная библиотека.
+Как полученные `Activity` обрабатываются - лежит на `ActivityListener`, но это ~~уже другая история~~ делает подключеная библиотека.
 
-Лайфхаки/замечания:
+Заметки:
 - Метод `StartActivity` может вернуть `null`, если никто не подписан на событие. *При всех вызовах методов нужно делать проверку на `null`*
 - `Activity` реализует `IDisposable`. *Можно не вызывать `Stop` вручную, а использовать `using`*
 - `Activity` позволяет делать записи о пользовательских событиях: `activity.AddEvent(new ActivityEvent("Что-то случилось"))`. Дополнительно в библиотеке есть метод расширения для записи исключений: `activity.RecordException(ex)`
-- Раз мы можем кидать/записывать исключения, то надо уметь отслеживать место, где исключение было брошено. Для этого можно выставить статус спана: `activity.SetStatus(ActivityStatusCode.Error, ex.Message)`. Под капотом, `activity.RecordException(ex)` работает через этот метод. (Кроме `Error` есть `Ok` и `Unset`)
+- Раз мы можем кидать/записывать исключения, то надо уметь отслеживать место, где исключение было брошено. Для этого можно выставить статус спана: `activity.SetStatus(ActivityStatusCode.Error, ex.Message)`. Под капотом, `activity.RecordException(ex)` работает через этот метод. (Кроме `Error` есть `Ok` и `Unset`, но не видел варианта их использования)
 - У каждой активности есть `Baggage` - коллекция ассоциированных с операцией данных. Разница в том, что `Baggage` может использоваться логикой приложения и передается между контекстами (сериализуется), а `Tag` - это просто метаданные для расследования инцидентов. Доступ ведется через одноименное свойство: `activity.Baggage`
 
 Вот пример полного пути выполнения:
 ```csharp
+public async Task<IActionResult> ProduceDataBatchAsync(int amount = 100, CancellationToken token = default)
+{
+    using var activity = WebActivitySource.StartActivity(Tracing.StateRequest);
+    var userId = HttpContext.User.FindFirstValue(ClaimTypes.NameIdentifier);
+    activity?.SetTag("enduser.id", userId);
+    try
+    {
+        // Бизнес-логика
+    }
+    catch (Exception ex) when (activity is not null)
+    {
+        activity.RecordException(ex);
+        activity.SetStatus(ActivityStatusCode.Error);
+        throw;
+    }
+}
+
 ```
+
+### Что такое ActivityKind. Отношения между спанами
+
+`ActivityKind` представляет собой тип отношений между родительским и дочерним спанами. Его аналог в OpenTelemetry - [`SpanKind`](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/api.md#span)
+
+```csharp
+public enum ActivityKind
+{
+    /// <summary>
+    /// Default value.
+    /// Indicates that the Activity represents an internal operation within an application, as opposed to an operations with remote parents or children.
+    /// </summary>
+    Internal = 0,
+
+    /// <summary>
+    /// Server activity represents request incoming from external component.
+    /// </summary>
+    Server = 1,
+
+    /// <summary>
+    /// Client activity represents outgoing request to the external component.
+    /// </summary>
+    Client = 2,
+
+    /// <summary>
+    /// Producer activity represents output provided to external components.
+    /// </summary>
+    Producer = 3,
+
+    /// <summary>
+    /// Consumer activity represents output received from an external component.
+    /// </summary>
+    Consumer = 4,
+}
+```
+
+Описания значений перечислений уже говорят что и когда использовать. Но для краткости к нему прилагается сранительная таблица
+
+|ActivityKind|Синхронное взаимодействие|Асинхронное взаимодействие|Входящий запрос|Исходящий запрос|
+|-|-|-|-|-|
+|Internal||||||
+|Client|да|||да|
+|Server|да||да||
+|Producer||да||возможно|
+|Consumer||да|возможно||
+
+Тип спана указывается в `span.kind` атрибуте
+
+Например, когда ASP.NET Core принимает входящий запрос, то используется `ActivityKind.Server`
+
+![](images/Запрос%20к%20ASP.NET%20Core.png)
+
+А когда `HttpClient` делает запрос, то `ActivityKind.Client`
+
+![](images/Запрос%20от%20HttpClient.png)
 
 ## Подключение OpenTelemetry
 
@@ -241,15 +333,15 @@ builder.Services
 ## Рецепты
 
 Для примера я сделал небольшой стенд из 3 сервисов с единственной операцией (запросом):
-- OpenTelemetry.Web - принимает запрос от пользователя, делает HTTP запрос к OpenTelemetry.Temperature.Api и отправляет полученный объект в очередь кафки
-- OpenTelemetry.Temperature.Api - простой HTTP API с единственной ручкой `temperature/current`, который возвращет рандомное число (температуру)
-- OpenTelemetry.RecordSaver.Worker - фоновый процесс, который читает из кафки сообщения, отправляемые OpenTelemetry.Web, и сохраняет их в Postgres с помощью EF Core.
+- `OpenTelemetry.SystemApi.Web` - принимает запрос от пользователя, делает HTTP запрос к `TemperatureApi` и отправляет полученный объект в очередь кафки. Дальше называется `SystemApi`
+- `OpenTelemetry.TemperatureApi.Web` - простой HTTP API с единственной ручкой `temperature/current`, который возвращет рандомное число (температуру). Дальше называется `TemperatureApi`
+- `OpenTelemetry.RecordSaver.Worker` - фоновый процесс, который читает из кафки сообщения, отправляемые `SystemApi`, и сохраняет их в Postgres с помощью EF Core. Дальше называется `RecordSaver`
 
-Для визуализации использовал Jaeger.
+Для визуализации использовал Jaeger. Он поддерживает работу с OLTP - 4317 порт
 
 1. Синхронный запрос от одного сервиса к другому
 
-Синхронный запрос в цепочке - от Web к Temperature.Api. Он выполняется с помощью `HttpClient`. Для отслеживания запросов в Web добавлен инструментатор HttpClient, а в Temperature.Api - AspNetCore инструментатор.
+Синхронный запрос в цепочке - от `SystemApi` к Temperature.Api. Он выполняется с помощью `HttpClient`. Для отслеживания запросов в Web добавлен инструментатор HttpClient, а в Temperature.Api - AspNetCore инструментатор.
 
 Внутри контроллера `Web` вызывается `ITemperatureService.GetTemeratureAsync()`, который делает HTTP запрос в `Temperature.Api`.
 
@@ -259,7 +351,7 @@ builder.Services
 
 Первая часть принадлежит инструментатору HttpClient на Web, а вторая - инструментатору AspNetCore на Temperature.Api
 
-2. Проброс контекста между различными приложениями - (`PropagationContext`, `Propagators`)
+1. Проброс контекста между различными приложениями - (`PropagationContext`, `Propagators`)
 
 Что делать, если для какого-то варианта взаимодействия нет своего инструментатора? Как в этом случае передавать контекст?
 
@@ -546,3 +638,46 @@ var span = Tracing.ConsumerActivitySource.StartActivity(
 ![](images/Трейс%20в%20RecordSaver.png)
 
 ![](images/Трейс%20в%20Web.png)
+
+Теперь часть работы на `RecordSaver.Worker` выполняется независимо - генерируется свой собственный `Trace Id`. Поэтому отследить такие запросы будет сложнее.
+
+
+1. Обработка ошибок
+
+В процессе работы могут возникнуть исключения. Отменить их невозможно, но можно записать факт их возникновения. 
+Обработать их можно 2 способами:
+- Вручную сделать запись об ошибке (сервис `Web`)
+```csharp
+var tags = new ActivityTagsCollection(new KeyValuePair<string, object?>[]
+{
+    new("exception.type", exception.GetType().Name), 
+    new("exception.message", exception.Message),
+    new("exception.stacktrace", exception.StackTrace)
+});
+activity.AddEvent(new ActivityEvent("exception", tags: tags));
+```
+- Воспользоваться методом расширения из библиотеки (сервис `TemperatureApi.Web`)
+```csharp
+activity.RecordException(e);
+```
+
+Метод вызванный сверху идентичен работе метода расширения. Буквально делает то же самое.
+
+Названия атрибутов для события искючения определены в [спецификации](https://github.com/open-telemetry/semantic-conventions/blob/main/semantic_conventions/trace/trace-exception.yaml).
+
+В проекте `TemperatureApi` добавил переменную окружения `THROW_EXCEPTION=true`. Если она выставлена, то эндпоинт генерирует исключение.
+
+В результате получается такой трейс:
+
+![](images/Трейс%20исключений.png)
+
+> P.S. в трейсе `TemperatureApi` нет `exception.stacktrace`, так как объект исключения сначала создался, и только после добавления события вызван `throw`
+
+1. Добавить ссылки на 
+ - Спеку в гитхабе [ссылка](https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/trace/api.md#span)
+ - Свою репу с примерами
+
+2. Добавить информацию о правилах наименования атрибутов, [семанитическое наименование](https://github.com/open-telemetry/semantic-conventions/tree/main)
+
+
+5. Завести новый репозиторий для примера проекта + причесать его

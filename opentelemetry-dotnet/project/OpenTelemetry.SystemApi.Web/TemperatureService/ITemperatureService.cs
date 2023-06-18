@@ -1,4 +1,4 @@
-namespace OpenTelemetry.Web.TemperatureService;
+namespace OpenTelemetry.System.Web.TemperatureService;
 
 public interface ITemperatureService
 {

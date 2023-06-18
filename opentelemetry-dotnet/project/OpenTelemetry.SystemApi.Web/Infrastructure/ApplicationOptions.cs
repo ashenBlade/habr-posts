@@ -1,4 +1,4 @@
-namespace OpenTelemetry.Web.Infrastructure;
+namespace OpenTelemetry.System.Web.Infrastructure;
 
 public class ApplicationOptions
 {

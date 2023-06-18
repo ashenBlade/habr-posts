@@ -5,6 +5,7 @@
         <Nullable>enable</Nullable>
         <ImplicitUsings>enable</ImplicitUsings>
         <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
+        <RootNamespace>OpenTelemetry.System.Web</RootNamespace>
     </PropertyGroup>
 
     <ItemGroup>

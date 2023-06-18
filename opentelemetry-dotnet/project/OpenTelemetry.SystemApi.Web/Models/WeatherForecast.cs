@@ -1,4 +1,4 @@
-namespace OpenTelemetry.Web.Models;
+namespace OpenTelemetry.System.Web.Models;
 
 public class WeatherForecast
 {

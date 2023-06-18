@@ -4,10 +4,10 @@ using Bogus;
 using Confluent.Kafka;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Context.Propagation;
+using OpenTelemetry.System.Web.Infrastructure;
 using OpenTelemetry.Trace;
-using OpenTelemetry.Web.Infrastructure;
 
-namespace OpenTelemetry.Web.Decorators;
+namespace OpenTelemetry.System.Web.Decorators;
 
 public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
 {
@@ -80,7 +80,7 @@ public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
             activity?.SetTag("kafka.offset", result.Offset.Value);
             return result;
         }
-        catch (Exception e)
+        catch (Exception e) when (activity is not null)
         {
             activity.RecordException(e);
             activity.SetStatus(Status.Error);

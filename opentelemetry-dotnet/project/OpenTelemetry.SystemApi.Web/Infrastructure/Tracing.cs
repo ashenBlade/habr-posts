@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Reflection;
 
-namespace OpenTelemetry.Web.Infrastructure;
+namespace OpenTelemetry.System.Web.Infrastructure;
 
 public static class Tracing
 {

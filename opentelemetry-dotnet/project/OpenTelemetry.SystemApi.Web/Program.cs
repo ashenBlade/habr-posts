@@ -6,9 +6,9 @@ using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
-using OpenTelemetry.Web.Decorators;
-using OpenTelemetry.Web.Infrastructure;
-using OpenTelemetry.Web.TemperatureService;
+using OpenTelemetry.System.Web.Decorators;
+using OpenTelemetry.System.Web.Infrastructure;
+using OpenTelemetry.System.Web.TemperatureService;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -55,7 +55,7 @@ builder.Services
                     //      jaeger.ExportProcessorType = ExportProcessorType.Batch;
                     //  })
 
-                   .ConfigureResource(r => r.AddService("OpenTelemetry.Web"))
+                   .ConfigureResource(r => r.AddService("OpenTelemetry.SystemApi.Web"))
                    .AddSource(Tracing.WebActivitySource.Name);
         });
 

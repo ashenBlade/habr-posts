@@ -1,6 +1,6 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OpenTelemetry.Web", "OpenTelemetry.Web\OpenTelemetry.Web.csproj", "{7507FE56-2AA7-47B7-A9DE-13C5AB187AB8}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OpenTelemetry.SystemApi.Web", "OpenTelemetry.SystemApi.Web\OpenTelemetry.SystemApi.Web.csproj", "{7507FE56-2AA7-47B7-A9DE-13C5AB187AB8}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{BC3B7704-BECB-4C05-A870-A83FD62E4502}"
 	ProjectSection(SolutionItems) = preProject

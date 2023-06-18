@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Confluent.Kafka;
 using Microsoft.EntityFrameworkCore;
@@ -105,7 +106,7 @@ public class KafkaConsumer : BackgroundService
             parentContext = propagationContext.ActivityContext;
         }
 
-        var span = Tracing.ConsumerActivitySource.StartActivity(
+        var activity = Tracing.ConsumerActivitySource.StartActivity(
             Tracing.KafkaMessageProcessing, 
             kind: ActivityKind.Consumer,
             parentContext: parentContext,
@@ -118,6 +119,18 @@ public class KafkaConsumer : BackgroundService
         {
             _logger.LogInformation("Полученный Baggage: {Baggage}", baggage.GetBaggage());
         }
-        return span;
+
+        // https://github.com/open-telemetry/semantic-conventions/blob/main/semantic_conventions/trace/general.yaml
+        activity?.SetTag("thread.id", Environment.CurrentManagedThreadId);
+        activity?.SetTag("thread.name", Thread.CurrentThread.Name);
+        activity?.SetTag("enduser.id", Thread.CurrentPrincipal?.Identity?.Name);
+        SetLineNumber(activity);
+        
+        return activity;
+
+        void SetLineNumber(Activity? a, [CallerLineNumber] int lineNumber = 0)
+        {
+            a?.SetTag("code.lineno", lineNumber);
+        }
     }
 }
