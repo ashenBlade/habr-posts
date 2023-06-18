@@ -28,7 +28,7 @@ public class SystemController : ControllerBase
         _temperatureService = temperatureService;
     }
 
-    [HttpGet("state")]
+    [HttpPost("state")]
     public async Task<IActionResult> ProduceData(CancellationToken token)
     {
         // ReSharper disable once ExplicitCallerInfoArgument
@@ -54,5 +54,35 @@ public class SystemController : ControllerBase
             IsHealthy = measurement.TemperatureC <= 20,
             Description = measurement.Summary
         });
+    }
+
+    [HttpPost("state/batch")]
+    public async Task<IActionResult> ProduceDataBatchAsync(int amount = 100, CancellationToken token = default)
+    {
+        // ReSharper disable once ExplicitCallerInfoArgument
+        using var activity = Tracing.WebActivitySource.StartActivity(Tracing.StateRequest, ActivityKind.Server);
+        var temp = await _temperatureService.GetTemperatureAsync(token);
+
+        var measurements = Enumerable.Range(0, amount)
+                                     .Select(_ => new WeatherForecast()
+                                      {
+                                          Id = Guid.NewGuid(),
+                                          Date = DateTime.Now,
+                                          Summary = Faker.Random.Words(5),
+                                          TemperatureC = temp
+                                      })
+                                     .ToArray();
+
+        await Task.WhenAll(measurements.Select(m => _producer.ProduceAsync("weather", new Message<Null, string>()
+            {
+                Value = JsonSerializer.Serialize(m)
+            },
+            token)));
+        
+        return Ok(measurements.Select(m => new
+        {
+            IsHealthy = m.TemperatureC <= 20,
+            Description = m.Summary
+        }));
     }
 }

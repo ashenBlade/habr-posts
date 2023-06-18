@@ -1,8 +1,10 @@
 using System.Diagnostics;
+using System.Reflection;
 using Microsoft.Extensions.Options;
 using OpenTelemetry;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Resources;
+using OpenTelemetry.TemperatureApi.Web.Controllers;
 using OpenTelemetry.TemperatureApi.Web.Infrastructure;
 using OpenTelemetry.TemperatureApi.Web.Options;
 using OpenTelemetry.Trace;
@@ -41,16 +43,23 @@ builder.Services
                    
                    .ConfigureResource(rb =>
                     {
+                        var name = typeof(TemperatureController).Assembly.GetName();
                         rb.AddService(
-                            serviceName: "TemperatureApi",
-                            serviceVersion: "1.0.1",
+                            serviceName: name.Name!,
+                            serviceVersion: name.Version!.ToString(),
                             autoGenerateServiceInstanceId: true);
                         rb.AddEnvironmentVariableDetector();
                         rb.AddDetector(sp =>
                             new RandomSeedDetector(sp.GetRequiredService<IOptions<RandomOptions>>()));
-                    })
-                   .AddHttpClientInstrumentation();
+                    });
         });
+
+builder.Services
+       .AddOptions<RandomOptions>()
+       .Bind(builder.Configuration);
+
+builder.Services
+       .AddSingleton(sp => new Random(sp.GetRequiredService<IOptions<RandomOptions>>().Value.RandomSeed));
 
 var app = builder.Build();
 

@@ -8,15 +8,25 @@
       - '8080:5000'
     environment:
       ASPNETCORE_URLS: http://+:5000
+      TRACING_SEND_RANDOM_BAGGAGE: 'true'
     pull_policy: never
+    depends_on: 
+      - kafka
+      - temperature.api
   
   record.saver.worker:
     image: otel.example.record.saver.worker
     build:
       context: .
-      dockerfile: OpenTelemetry.Consumer/Dockerfile
+      dockerfile: OpenTelemetry.RecordSaver.Worker/Dockerfile
     pull_policy: never
-    
+    environment:
+      TRACING_USE_LINK: 'false'
+      TRACING_LOG_BAGGAGE: 'true'
+    depends_on: 
+      - kafka
+      - postgres
+  
   temperature.api:
     image: otel.example.temperature.api
     build:
@@ -25,7 +35,7 @@
     pull_policy: never
     environment:
       ASPNETCORE_URLS: http://+:5000
-      COMMON__SERVICE_NAME: 'temperature api'
+      RANDOM_SEED: 42
   
   postgres:
     image: postgres:15-alpine
@@ -40,7 +50,6 @@
     image: jaegertracing/all-in-one:latest
     ports:
       - '16686:16686'
-      - '6831:6831/udp'
     environment:
       COLLECTOR_OTLP_ENABLED: 'true'
   

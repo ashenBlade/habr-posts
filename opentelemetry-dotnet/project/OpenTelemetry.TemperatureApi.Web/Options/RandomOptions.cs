@@ -2,6 +2,6 @@ namespace OpenTelemetry.TemperatureApi.Web.Options;
 
 public class RandomOptions
 {
-    [ConfigurationKeyName("SEED")]
+    [ConfigurationKeyName("RANDOM_SEED")]
     public int RandomSeed { get; set; } = 42;
 }

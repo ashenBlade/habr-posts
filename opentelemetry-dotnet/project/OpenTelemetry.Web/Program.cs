@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using Confluent.Kafka;
+using Microsoft.Extensions.Options;
 using OpenTelemetry;
 using OpenTelemetry.Exporter;
 using OpenTelemetry.Metrics;
@@ -15,14 +17,16 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-builder.Services.AddSingleton<IProducer<Null, string>>(_ =>
+builder.Services.AddSingleton<IProducer<Null, string>>(sp =>
 {
     var producer = new ProducerBuilder<Null, string>(new ProducerConfig()
         {
             BootstrapServers = "kafka:9092",
         })
        .Build();
-    producer = new TracingProducerDecorator<Null, string>( producer );
+    producer = new TracingProducerDecorator<Null, string>( producer, 
+        sp.GetRequiredService<IOptions<ApplicationOptions>>(),
+        sp.GetRequiredService<ILogger<TracingProducerDecorator<Null, string>>>());
     return producer;
 });
 
@@ -35,8 +39,6 @@ builder.Services
                    .AddOtlpExporter(oltp =>
                     {
                         oltp.Endpoint = new Uri("http://jaeger:4317");
-                        oltp.Protocol = OtlpExportProtocol.Grpc;
-                        oltp.ExportProcessorType = ExportProcessorType.Batch;
                     })
 
                     // .AddZipkinExporter(zipkin =>
@@ -57,7 +59,9 @@ builder.Services
                    .AddSource(Tracing.WebActivitySource.Name);
         });
 
-builder.Services.AddSingleton(TracerProvider.Default.GetTracer(Tracing.WebActivitySource.Name));
+builder.Services
+       .AddOptions<ApplicationOptions>()
+       .Bind(builder.Configuration);
 
 const string temperatureHttpClientName = "TemperatureHttpClient";
 
@@ -71,7 +75,7 @@ builder.Services.AddScoped<ITemperatureService>(sp =>
     var client = sp.GetRequiredService<IHttpClientFactory>()
                    .CreateClient(temperatureHttpClientName);
     var temperatureService = new HttpClientTemperatureService(client, sp.GetRequiredService<ILogger<HttpClientTemperatureService>>());
-    return new SomeTemperatureServiceDecorator( temperatureService );
+    return new JsonExceptionEventRecorderServiceDecorator( temperatureService );
 });
 
 var app = builder.Build();

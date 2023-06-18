@@ -5,7 +5,7 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
 var host = Host.CreateDefaultBuilder(args)
-               .ConfigureServices(services =>
+               .ConfigureServices((context, services) =>
                 {
                     services.AddHostedService<KafkaConsumer>();
                     services
@@ -40,6 +40,8 @@ var host = Host.CreateDefaultBuilder(args)
                     {
                         db.UseNpgsql("Host=postgres;Database=postgres;User Id=postgres;Password=postgres");
                     });
+                    services.AddOptions<ApplicationOptions>()
+                            .Bind(context.Configuration);
                 })
                .Build();
 

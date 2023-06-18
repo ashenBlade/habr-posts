@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Text;
+using Bogus;
 using Confluent.Kafka;
+using Microsoft.Extensions.Options;
 using OpenTelemetry.Context.Propagation;
 using OpenTelemetry.Trace;
 using OpenTelemetry.Web.Infrastructure;
@@ -9,11 +11,16 @@ namespace OpenTelemetry.Web.Decorators;
 
 public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
 {
+    private static readonly Faker Faker = new Faker("ru");
     private readonly IProducer<TKey, TValue> _producer;
+    private readonly IOptions<ApplicationOptions> _options;
+    private readonly ILogger<TracingProducerDecorator<TKey, TValue>> _logger;
 
-    public TracingProducerDecorator(IProducer<TKey, TValue> producer)
+    public TracingProducerDecorator(IProducer<TKey, TValue> producer, IOptions<ApplicationOptions> options, ILogger<TracingProducerDecorator<TKey, TValue>> logger)
     {
         _producer = producer;
+        _options = options;
+        _logger = logger;
     }
 
     public void Dispose()
@@ -42,8 +49,20 @@ public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
         var activity = Tracing.WebActivitySource.StartActivity(ProducingActivity, ActivityKind.Producer);
         if (activity is not null)
         {
+            if (_options.Value.SendRandomBaggage)
+            {
+                var pairs = Enumerable.Range(0, 3)
+                                      .Select(_ =>
+                                           new KeyValuePair<string, string>(Faker.Random.Word(), Faker.Random.Word()))
+                                      .ToArray();
+                _logger.LogInformation("Выставляю Baggage для запроса: {Baggage}", pairs);
+                foreach (var (key, value) in pairs)
+                {
+                    Baggage.SetBaggage(key, value);
+                }
+            }
+            
             var propagationContext = new PropagationContext(activity.Context, Baggage.Current);
-        
             Propagators.DefaultTextMapPropagator.Inject(propagationContext, message.Headers ??= new Headers(),
                 (headers, key, value) => headers.Add(key, Encoding.UTF8.GetBytes(value)));
         }
@@ -80,7 +99,6 @@ public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
             span?.SetTag("kafka.topic", result.Topic);
             span?.SetTag("kafka.partition", result.Partition.Value);
             span?.SetTag("kafka.offset", result.Offset.Value);
-            
             return result;
         }
         catch (Exception e)
@@ -93,30 +111,89 @@ public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
 
     public void Produce(string topic, Message<TKey, TValue> message, Action<DeliveryReport<TKey, TValue>> deliveryHandler = null!)
     {
-        using var span = StartActiveSpan(message);
+        // ReSharper disable AccessToDisposedClosure
+        var span = StartActiveSpan(message);
         try
         {
-            _producer.Produce(topic, message, deliveryHandler);
+            _producer.Produce(topic, message, (r) =>
+            {
+                try
+                {
+                    if (span is not null)
+                    {
+                        if (r.Error.IsError)
+                        {
+                            span.SetStatus(ActivityStatusCode.Error, $"Ошибка кафки: {r.Error.Reason}");
+                        }
+                        else
+                        {
+                            span.SetTag("kafka.topic", r.Topic);
+                            span.SetTag("kafka.partition", r.Partition.Value);
+                            span.SetTag("kafka.offset", r.Offset.Value);
+                        }
+                        span.Dispose();
+                    }
+                }
+                catch (ObjectDisposedException)
+                { }
+                deliveryHandler(r);
+            });
         }
         catch (Exception e)
         {
-            span.RecordException(e);
-            span.SetStatus(Status.Error);
+            if (span is not null)
+            {
+                try
+                {
+                    span.RecordException(e);
+                    span.SetStatus(Status.Error);
+                    span.Dispose();
+                }
+                catch (ObjectDisposedException)
+                { }
+            }
             throw;
         }
     }
 
     public void Produce(TopicPartition topicPartition, Message<TKey, TValue> message, Action<DeliveryReport<TKey, TValue>> deliveryHandler = null)
     {
-        using var span = StartActiveSpan(message);
+        // ReSharper disable AccessToDisposedClosure
+        var span = StartActiveSpan(message);
         try
         {
-            _producer.Produce(topicPartition, message, deliveryHandler);
+            _producer.Produce(topicPartition, message, (r) =>
+            {
+                try
+                {
+                    if (span is not null)
+                    {
+                        if (r.Error.IsError)
+                        {
+                            span.SetStatus(ActivityStatusCode.Error, $"Ошибка кафки: {r.Error.Reason}");
+                        }
+                        else
+                        {
+                            span.SetTag("kafka.topic", r.Topic);
+                            span.SetTag("kafka.partition", r.Partition.Value);
+                            span.SetTag("kafka.offset", r.Offset.Value);
+                        }
+                        span.Dispose();
+                    }
+                }
+                catch (ObjectDisposedException)
+                { }
+                deliveryHandler(r);
+            });
         }
         catch (Exception e)
         {
-            span.RecordException(e);
-            span.SetStatus(Status.Error);
+            if (span is not null)
+            {
+                span.RecordException(e);
+                span.SetStatus(Status.Error);
+                span.Dispose();
+            }
             throw;
         }
     }

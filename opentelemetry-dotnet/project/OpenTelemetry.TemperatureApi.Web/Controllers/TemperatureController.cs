@@ -8,21 +8,24 @@ namespace OpenTelemetry.TemperatureApi.Web.Controllers;
 [Route("temperature")]
 public class TemperatureController : ControllerBase
 {
-    private static readonly Faker Faker = new Faker("ru");
     private readonly ILogger<TemperatureController> _logger;
+    private readonly Random _random;
 
-    public TemperatureController(ILogger<TemperatureController> logger)
+    public TemperatureController(ILogger<TemperatureController> logger, Random random)
     {
         _logger = logger;
+        _random = random;
     }
 
     [HttpGet("current")]
     public IActionResult Get()
     {
-        Activity.Current?.SetStatus(ActivityStatusCode.Error);
         _logger.LogInformation("Запрос на получение текущей температуры");
-        var temp = Faker.Random.Int(-30, 30) + Faker.Random.Double();
+        var temp = _random.Next(-30, 30) + _random.NextDouble();
         _logger.LogInformation("Текущая температура: {Temp}", temp);
-        return Ok(new {Temperature = temp});
+        return Ok(new
+        {
+            Temperature = temp
+        });
     }
 }
