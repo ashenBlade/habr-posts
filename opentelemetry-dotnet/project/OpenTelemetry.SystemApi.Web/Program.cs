@@ -46,20 +46,25 @@ builder.Services
                 });
             }
 
-            if (options.JaegerEndpoint is {} jaegerEndpoint)
+            if (options.JaegerAgentEndpoint is {} jaegerEndpoint)
             {
                 tracing.AddJaegerExporter(jaeger =>
                 {
-                    jaeger.Endpoint = jaegerEndpoint;
+                    jaeger.AgentPort = jaegerEndpoint.Port;
+                    jaeger.AgentHost = jaegerEndpoint.Host;
                 });
             }
             
             tracing.AddAspNetCoreInstrumentation()
                    .AddHttpClientInstrumentation()
-
-                   .ConfigureResource(r => r.AddService("OpenTelemetry.SystemApi.Web"))
+                   .ConfigureResource(r =>
+                    {
+                        var assemblyName = typeof(Program).Assembly.GetName();
+                        var name = assemblyName.Name!;
+                        var version = assemblyName.Version?.ToString()!;
+                        r.AddService(serviceName: name, serviceVersion: version);
+                    })
                    .AddSource(Tracing.WebActivitySource.Name);
-            
         });
 
 builder.Services
@@ -68,9 +73,9 @@ builder.Services
 
 const string temperatureHttpClientName = "TemperatureHttpClient";
 
-builder.Services.AddHttpClient(temperatureHttpClientName, client =>
+builder.Services.AddHttpClient(temperatureHttpClientName, (sp, client) =>
 {
-    client.BaseAddress = new Uri("http://temperature.api:5000");
+    client.BaseAddress = sp.GetRequiredService<IOptions<ApplicationOptions>>().Value.TemperatureApiAddress;
 });
 
 builder.Services.AddScoped<ITemperatureService>(sp =>

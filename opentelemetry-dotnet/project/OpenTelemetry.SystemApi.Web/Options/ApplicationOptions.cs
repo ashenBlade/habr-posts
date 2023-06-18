@@ -14,4 +14,8 @@ public class ApplicationOptions
     [ConfigurationKeyName("KAFKA_QUEUE")]
     [Required]
     public string KafkaQueue { get; set; } = null!;
+
+    [ConfigurationKeyName("TEMPERATURE_API_ADDRESS")]
+    [Required]
+    public Uri TemperatureApiAddress { get; set; } = null!;
 }

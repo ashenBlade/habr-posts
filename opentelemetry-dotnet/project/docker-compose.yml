@@ -7,14 +7,16 @@
     ports:
       - '8080:5000'
     environment:
-      ASPNETCORE_URLS: http://+:5000
       TRACING_SEND_RANDOM_BAGGAGE: 'true'
       
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_QUEUE: weather
       TRACING_OLTP_ENDPOINT: http://oltp:4317
 #      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
-#      TRACING_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+#      TRACING_JAEGER_AGENT_ENDPOINT: tcp://jaeger:6831
+      
+      TEMPERATURE_API_ADDRESS: http://temperature.api:5000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_QUEUE: weather
+      ASPNETCORE_URLS: http://+:5000
       
     pull_policy: never
     depends_on: 
@@ -28,14 +30,16 @@
       dockerfile: OpenTelemetry.RecordSaver.Worker/Dockerfile
     pull_policy: never
     environment:
-      TRACING_USE_LINK: 'true'
-      TRACING_LOG_BAGGAGE: 'true'
+      TRACING_USE_LINK: 'false'
+      TRACING_LOG_BAGGAGE: 'false'
       
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_QUEUE: weather
       TRACING_OLTP_ENDPOINT: http://oltp:4317
 #      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
-#      TRACING_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+#      TRACING_JAEGER_AGENT_ENDPOINT: tcp://jaeger:6831
+      
+      POSTGRES_CONNECTION_STRING: Host=postgres;Database=postgres;User Id=postgres;Password=postgres
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_QUEUE: weather
     depends_on: 
       - kafka
       - postgres
@@ -47,13 +51,15 @@
       dockerfile: OpenTelemetry.TemperatureApi.Web/Dockerfile
     pull_policy: never
     environment:
-      ASPNETCORE_URLS: http://+:5000
       RANDOM_SEED: 42
       THROW_EXCEPTION: 'false'
+      
       TRACING_OLTP_ENDPOINT: http://oltp:4317
 #      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
-#      TRACING_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+#      TRACING_JAEGER_AGENT_ENDPOINT: tcp://jaeger:6831
   
+      ASPNETCORE_URLS: http://+:5000
+      
   postgres:
     image: postgres:15-alpine
     environment:
@@ -65,13 +71,15 @@
   
   jaeger:
     image: jaegertracing/all-in-one:latest
-    extra_hosts: 
-      - jaeger
-      - oltp
     ports:
       - '16686:16686'
     environment:
       COLLECTOR_OTLP_ENABLED: 'true'
+    networks:
+      default:
+        aliases:
+          - jaeger
+          - oltp
   
   zookeeper:
     image: bitnami/zookeeper

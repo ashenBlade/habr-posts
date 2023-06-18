@@ -18,4 +18,7 @@ public class ApplicationOptions
     [Required]
     public string KafkaQueue { get; set; } = null!;
 
+    [ConfigurationKeyName("POSTGRES_CONNECTION_STRING")]
+    [Required]
+    public string ConnectionString { get; set; } = null!;
 }

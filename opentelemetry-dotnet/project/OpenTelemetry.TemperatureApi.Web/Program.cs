@@ -39,11 +39,12 @@ builder.Services
                 });
             }
 
-            if (options.JaegerEndpoint is {} jaegerEndpoint)
+            if (options.JaegerAgentEndpoint is {} jaegerEndpoint)
             {
                 tracing.AddJaegerExporter(jaeger =>
                 {
-                    jaeger.Endpoint = jaegerEndpoint;
+                    jaeger.AgentPort = jaegerEndpoint.Port;
+                    jaeger.AgentHost = jaegerEndpoint.Host;
                 });
             }
             tracing.AddAspNetCoreInstrumentation()

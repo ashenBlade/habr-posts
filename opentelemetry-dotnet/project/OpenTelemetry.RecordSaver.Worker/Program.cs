@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using OpenTelemetry.RecordSaver.Worker;
 using OpenTelemetry.RecordSaver.Worker.Database;
 using OpenTelemetry.RecordSaver.Worker.HostedServices;
@@ -32,11 +33,12 @@ var host = Host.CreateDefaultBuilder(args)
                                 });
                             }
 
-                            if (options.JaegerEndpoint is {} jaegerEndpoint)
+                            if (options.JaegerAgentEndpoint is {} jaegerEndpoint)
                             {
                                 tracing.AddJaegerExporter(jaeger =>
                                 {
-                                    jaeger.Endpoint = jaegerEndpoint;
+                                    jaeger.AgentPort = jaegerEndpoint.Port;
+                                    jaeger.AgentHost = jaegerEndpoint.Host;
                                 });
                             }
                             tracing.AddAspNetCoreInstrumentation()
@@ -44,15 +46,16 @@ var host = Host.CreateDefaultBuilder(args)
                                    .ConfigureResource(r =>
                                     {
                                         var assemblyName = typeof(KafkaConsumerBackgroundService).Assembly.GetName();
-                                        var name = assemblyName.FullName;
+                                        var name = assemblyName.Name!;
                                         var version = assemblyName.Version?.ToString()!;
                                         r.AddService(serviceName: name, serviceVersion: version);
                                     })
                                    .AddSource(Tracing.ConsumerActivitySource.Name);
                         });
-                    services.AddDbContextFactory<ApplicationDbContext>(db =>
+                    services.AddDbContextFactory<ApplicationDbContext>((sp, db) =>
                     {
-                        db.UseNpgsql("Host=postgres;Database=postgres;User Id=postgres;Password=postgres");
+                        var options = sp.GetRequiredService<IOptions<ApplicationOptions>>().Value;
+                        db.UseNpgsql(options.ConnectionString);
                     });
                     services.AddOptions<ApplicationOptions>()
                             .Bind(context.Configuration)

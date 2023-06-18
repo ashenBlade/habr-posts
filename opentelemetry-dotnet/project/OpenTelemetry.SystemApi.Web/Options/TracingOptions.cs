@@ -8,6 +8,6 @@ public class TracingOptions
     [ConfigurationKeyName("TRACING_ZIPKIN_ENDPOINT")]
     public Uri? ZipkinEndpoint { get; set; }
 
-    [ConfigurationKeyName("TRACING_JAEGER_ENDPOINT")]
-    public Uri? JaegerEndpoint { get; set; }
+    [ConfigurationKeyName("TRACING_JAEGER_AGENT_ENDPOINT")]
+    public Uri? JaegerAgentEndpoint { get; set; }
 }
