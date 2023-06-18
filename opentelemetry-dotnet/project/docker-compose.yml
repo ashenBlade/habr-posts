@@ -1,0 +1,104 @@
+﻿services:
+  system.api:
+    image: otel.example.system.api
+    build:
+      context: .
+      dockerfile: OpenTelemetry.SystemApi.Web/Dockerfile
+    ports:
+      - '8080:5000'
+    environment:
+      TRACING_SEND_RANDOM_BAGGAGE: 'true'
+      
+      TRACING_OLTP_ENDPOINT: http://oltp:4317
+#      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+#      TRACING_JAEGER_AGENT_ENDPOINT: tcp://jaeger:6831
+      
+      TEMPERATURE_API_ADDRESS: http://temperature.api:5000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_QUEUE: weather
+      ASPNETCORE_URLS: http://+:5000
+      
+    pull_policy: never
+    depends_on: 
+      - kafka
+      - temperature.api
+  
+  record.saver.worker:
+    image: otel.example.record.saver.worker
+    build:
+      context: .
+      dockerfile: OpenTelemetry.RecordSaver.Worker/Dockerfile
+    pull_policy: never
+    environment:
+      TRACING_USE_LINK: 'false'
+      TRACING_LOG_BAGGAGE: 'false'
+      
+      TRACING_OLTP_ENDPOINT: http://oltp:4317
+#      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+#      TRACING_JAEGER_AGENT_ENDPOINT: tcp://jaeger:6831
+      
+      POSTGRES_CONNECTION_STRING: Host=postgres;Database=postgres;User Id=postgres;Password=postgres
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_QUEUE: weather
+    depends_on: 
+      - kafka
+      - postgres
+  
+  temperature.api:
+    image: otel.example.temperature.api
+    build:
+      context: .
+      dockerfile: OpenTelemetry.TemperatureApi.Web/Dockerfile
+    pull_policy: never
+    environment:
+      RANDOM_SEED: 42
+      THROW_EXCEPTION: 'false'
+      
+      TRACING_OLTP_ENDPOINT: http://oltp:4317
+#      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+#      TRACING_JAEGER_AGENT_ENDPOINT: tcp://jaeger:6831
+  
+      ASPNETCORE_URLS: http://+:5000
+      
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: postgres
+    ports:
+      - '5432:5432'
+  
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - '16686:16686'
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    networks:
+      default:
+        aliases:
+          - jaeger
+          - oltp
+  
+  zookeeper:
+    image: bitnami/zookeeper
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: 'yes' 
+  
+  kafka: 
+    image: wurstmeister/kafka
+    environment:
+      KAFKA_CREATE_TOPICS: "weather:1:1"
+      ALLOW_PLAINTEXT_LISTENER: 'yes'
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://:9092
+    depends_on: 
+      - zookeeper
+  
+  zipkin:
+    image: openzipkin/zipkin
+    ports:
+      - '9411:9411'
+    environment:
+      STORAGE_TYPE: mem
