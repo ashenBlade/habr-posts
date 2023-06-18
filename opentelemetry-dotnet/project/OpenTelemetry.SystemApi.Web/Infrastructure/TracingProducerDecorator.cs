@@ -2,24 +2,24 @@ using System.Diagnostics;
 using System.Text;
 using Bogus;
 using Confluent.Kafka;
-using Microsoft.Extensions.Options;
 using OpenTelemetry.Context.Propagation;
-using OpenTelemetry.System.Web.Infrastructure;
 using OpenTelemetry.Trace;
 
-namespace OpenTelemetry.System.Web.Decorators;
+namespace OpenTelemetry.System.Web.Infrastructure;
 
 public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
 {
-    private static readonly Faker Faker = new Faker("ru");
+    // ReSharper disable once StaticMemberInGenericType
+    private static readonly Faker Faker = new("ru");
+    
     private readonly IProducer<TKey, TValue> _producer;
-    private readonly IOptions<ApplicationOptions> _options;
+    private readonly bool _sendRandomBaggage;
     private readonly ILogger<TracingProducerDecorator<TKey, TValue>> _logger;
 
-    public TracingProducerDecorator(IProducer<TKey, TValue> producer, IOptions<ApplicationOptions> options, ILogger<TracingProducerDecorator<TKey, TValue>> logger)
+    public TracingProducerDecorator(IProducer<TKey, TValue> producer, bool sendRandomBaggage, ILogger<TracingProducerDecorator<TKey, TValue>> logger)
     {
         _producer = producer;
-        _options = options;
+        _sendRandomBaggage = sendRandomBaggage;
         _logger = logger;
     }
 
@@ -42,20 +42,21 @@ public class TracingProducerDecorator<TKey, TValue>: IProducer<TKey, TValue>
 
     public string Name => _producer.Name;
 
-    private const string ProducingActivity = "Kafka.Producer.Produce";
+    private const string ProducingActivity = "Отправка сообщения в кафку";
 
     private Activity? StartActiveSpan(Message<TKey, TValue> message)
     {
+        // ReSharper disable once ExplicitCallerInfoArgument
         var activity = Tracing.WebActivitySource.StartActivity(ProducingActivity, ActivityKind.Producer);
         if (activity is not null)
         {
-            if (_options.Value.SendRandomBaggage)
+            if (_sendRandomBaggage)
             {
                 var pairs = Enumerable.Range(0, 3)
                                       .Select(_ =>
                                            new KeyValuePair<string, string>(Faker.Random.Word(), Faker.Random.Word()))
                                       .ToArray();
-                _logger.LogInformation("Выставляю Baggage для запроса: {Baggage}", pairs);
+                _logger.LogInformation("В Baggage добавлены: {Baggage}", pairs);
                 foreach (var (key, value) in pairs)
                 {
                     Baggage.SetBaggage(key, value);

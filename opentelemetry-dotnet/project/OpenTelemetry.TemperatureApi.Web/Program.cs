@@ -22,25 +22,31 @@ builder.Services
        .AddOpenTelemetry()
        .WithTracing(tracing =>
         {
+            var options = builder.Configuration.Get<TracingOptions>();
+            if (options.OltpEndpoint is {} oltpEndpoint)
+            {
+                tracing.AddOtlpExporter(oltp =>
+                {
+                    oltp.Endpoint = oltpEndpoint;
+                });
+            }
+
+            if (options.ZipkinEndpoint is {} zipkinEndpoint)
+            {
+                tracing.AddZipkinExporter(zipkin =>
+                {
+                    zipkin.Endpoint = zipkinEndpoint;
+                });
+            }
+
+            if (options.JaegerEndpoint is {} jaegerEndpoint)
+            {
+                tracing.AddJaegerExporter(jaeger =>
+                {
+                    jaeger.Endpoint = jaegerEndpoint;
+                });
+            }
             tracing.AddAspNetCoreInstrumentation()
-                   .AddOtlpExporter(oltp =>
-                    {
-                        oltp.Endpoint = new Uri("http://oltp:4317");
-                    })
-                    
-                    // .AddZipkinExporter(zipkin =>
-                    //  {
-                    //      zipkin.Endpoint = new Uri("http://zipkin:9411/api/v2/spans");
-                    //      zipkin.ExportProcessorType = ExportProcessorType.Batch;
-                    //  })
-                    
-                    // .AddJaegerExporter(jaeger =>
-                    //  {
-                    //      jaeger.AgentHost = "jaeger";
-                    //      jaeger.AgentPort = 6831;
-                    //      jaeger.Protocol = JaegerExportProtocol.UdpCompactThrift;
-                    //  })
-                   
                    .ConfigureResource(rb =>
                     {
                         var name = typeof(TemperatureController).Assembly.GetName();
@@ -48,7 +54,6 @@ builder.Services
                             serviceName: name.Name!,
                             serviceVersion: name.Version!.ToString(),
                             autoGenerateServiceInstanceId: true);
-                        rb.AddEnvironmentVariableDetector();
                         rb.AddDetector(sp =>
                             new RandomSeedDetector(sp.GetRequiredService<IOptions<RandomOptions>>()));
                     });
@@ -63,6 +68,10 @@ builder.Services
 
 builder.Services
        .AddOptions<ApplicationOptions>()
+       .Bind(builder.Configuration)
+       .ValidateDataAnnotations();
+
+builder.Services.AddOptions<TracingOptions>()
        .Bind(builder.Configuration);
 
 var app = builder.Build();

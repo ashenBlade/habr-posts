@@ -6,17 +6,21 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using OpenTelemetry.Context.Propagation;
 using OpenTelemetry.RecordSaver.Worker.Database;
+using OpenTelemetry.RecordSaver.Worker.Infrastructure;
+using OpenTelemetry.RecordSaver.Worker.Options;
 using OpenTelemetry.Trace;
 
-namespace OpenTelemetry.RecordSaver.Worker;
+namespace OpenTelemetry.RecordSaver.Worker.HostedServices;
 
-public class KafkaConsumer : BackgroundService
+public class KafkaConsumerBackgroundService : BackgroundService
 {
-    private readonly ILogger<KafkaConsumer> _logger;
+    private readonly ILogger<KafkaConsumerBackgroundService> _logger;
     private readonly IDbContextFactory<ApplicationDbContext> _dbContextFactory;
     private readonly IOptions<ApplicationOptions> _options;
 
-    public KafkaConsumer(ILogger<KafkaConsumer> logger, IDbContextFactory<ApplicationDbContext> dbContextFactory, IOptions<ApplicationOptions> options)
+    public KafkaConsumerBackgroundService(ILogger<KafkaConsumerBackgroundService> logger, 
+                                          IDbContextFactory<ApplicationDbContext> dbContextFactory, 
+                                          IOptions<ApplicationOptions> options)
     {
         _logger = logger;
         _dbContextFactory = dbContextFactory;
@@ -30,12 +34,12 @@ public class KafkaConsumer : BackgroundService
         
         using var consumer = new ConsumerBuilder<Null, string>(new ConsumerConfig()
             {
-                BootstrapServers = "kafka:9092",
+                BootstrapServers = _options.Value.BootstrapServers,
                 GroupId = "Consumer"
             })
            .Build();
         _logger.LogInformation("Подписываюсь на очередь");
-        consumer.Subscribe("weather");
+        consumer.Subscribe(_options.Value.KafkaQueue);
         _logger.LogInformation("Начинаю работу");
         while (!stoppingToken.IsCancellationRequested)
         {

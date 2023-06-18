@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Reflection;
 
-namespace OpenTelemetry.RecordSaver.Worker;
+namespace OpenTelemetry.RecordSaver.Worker.Infrastructure;
 
 public static class Tracing
 {

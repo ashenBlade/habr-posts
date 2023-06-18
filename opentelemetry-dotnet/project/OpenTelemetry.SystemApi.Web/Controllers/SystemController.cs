@@ -6,9 +6,11 @@ using Bogus;
 using Confluent.Kafka;
 using Grpc.Core;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using OpenTelemetry.Context.Propagation;
 using OpenTelemetry.System.Web.Infrastructure;
 using OpenTelemetry.System.Web.Models;
+using OpenTelemetry.System.Web.Options;
 using OpenTelemetry.System.Web.TemperatureService;
 using OpenTelemetry.Trace;
 using Status = OpenTelemetry.Trace.Status;
@@ -19,12 +21,14 @@ namespace OpenTelemetry.System.Web.Controllers;
 [Route("[controller]")]
 public class SystemController : ControllerBase
 {
+    private readonly IOptions<ApplicationOptions> _options;
     private readonly IProducer<Null, string> _producer;
     private readonly ITemperatureService _temperatureService;
     public static readonly Faker Faker = new Faker("ru");
 
-    public SystemController(IProducer<Null, string> producer, ITemperatureService temperatureService)
+    public SystemController(IOptions<ApplicationOptions> options, IProducer<Null, string> producer, ITemperatureService temperatureService)
     {
+        _options = options;
         _producer = producer;
         _temperatureService = temperatureService;
     }
@@ -74,7 +78,8 @@ public class SystemController : ControllerBase
                                       })
                                      .ToArray();
 
-        await Task.WhenAll(measurements.Select(m => _producer.ProduceAsync("weather", new Message<Null, string>()
+        await Task.WhenAll(measurements.Select(m => _producer.ProduceAsync(_options.Value.KafkaQueue,
+            new Message<Null, string>()
             {
                 Value = JsonSerializer.Serialize(m)
             },

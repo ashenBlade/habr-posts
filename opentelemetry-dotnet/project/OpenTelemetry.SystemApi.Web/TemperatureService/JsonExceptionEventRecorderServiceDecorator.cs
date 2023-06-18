@@ -1,12 +1,8 @@
 using System.Diagnostics;
-using System.Globalization;
-using System.Resources;
 using System.Text.Json;
-using Microsoft.VisualBasic.CompilerServices;
-using OpenTelemetry.System.Web.TemperatureService;
 using OpenTelemetry.Trace;
 
-namespace OpenTelemetry.System.Web.Decorators;
+namespace OpenTelemetry.System.Web.TemperatureService;
 
 public class JsonExceptionEventRecorderServiceDecorator: ITemperatureService
 {

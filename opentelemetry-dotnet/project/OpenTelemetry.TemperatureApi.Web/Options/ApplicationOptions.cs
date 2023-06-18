@@ -1,3 +1,5 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace OpenTelemetry.TemperatureApi.Web.Options;
 
 public class ApplicationOptions

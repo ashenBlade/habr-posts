@@ -9,6 +9,13 @@
     environment:
       ASPNETCORE_URLS: http://+:5000
       TRACING_SEND_RANDOM_BAGGAGE: 'true'
+      
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_QUEUE: weather
+      TRACING_OLTP_ENDPOINT: http://oltp:4317
+#      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+#      TRACING_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+      
     pull_policy: never
     depends_on: 
       - kafka
@@ -23,6 +30,12 @@
     environment:
       TRACING_USE_LINK: 'true'
       TRACING_LOG_BAGGAGE: 'true'
+      
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_QUEUE: weather
+      TRACING_OLTP_ENDPOINT: http://oltp:4317
+#      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+#      TRACING_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
     depends_on: 
       - kafka
       - postgres
@@ -37,6 +50,9 @@
       ASPNETCORE_URLS: http://+:5000
       RANDOM_SEED: 42
       THROW_EXCEPTION: 'false'
+      TRACING_OLTP_ENDPOINT: http://oltp:4317
+#      TRACING_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+#      TRACING_JAEGER_ENDPOINT: http://jaeger:14268/api/traces
   
   postgres:
     image: postgres:15-alpine
