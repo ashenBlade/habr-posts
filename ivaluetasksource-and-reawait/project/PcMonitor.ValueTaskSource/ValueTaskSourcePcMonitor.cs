@@ -19,7 +19,8 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
     public ValueTaskSourcePcMonitor(TimeSpan scrapTimeout)
     {
         _scrapTimeout = scrapTimeout;
-        _pool = new DefaultObjectPool<PcStatisticsValueTaskSource>(new DefaultPooledObjectPolicy<PcStatisticsValueTaskSource>(), 10);
+        _policy = new ConcurrentBagObjectPolicy<PcStatisticsValueTaskSource>(() => new());
+        _pool = new DefaultObjectPool<PcStatisticsValueTaskSource>(_policy, 10);
         _updateTimer = new Timer(OnTimeout, this, Timeout.Infinite, Timeout.Infinite);
     }
 
@@ -42,6 +43,8 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
     }
 
     private static readonly TimeSpan Delta = TimeSpan.FromMilliseconds(10);
+    private readonly ConcurrentBagObjectPolicy<PcStatisticsValueTaskSource> _policy;
+
     internal bool IsMeasurementActual(TimeSpan savedCacheTimestampTicks)
     {
         if (!_started)
@@ -103,6 +106,7 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
     {
         Stop();
         _started = false;
+        _policy.Dispose();
         _updateTimer.Dispose();
     }
 }

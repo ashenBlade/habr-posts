@@ -5,7 +5,7 @@ using PcMonitor.Core;
 
 namespace PcMonitor.ValueTaskSource;
 
-internal class PcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>
+internal class PcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
 {
     private ObjectPool<PcStatisticsValueTaskSource>? _pool;
     private ValueTaskSourcePcMonitor? _monitor;
@@ -89,5 +89,11 @@ internal class PcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>
     public PcStatisticsValueTaskSource()
     {
         _timer = new Timer(OnTimerTimeout, this, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    public void Dispose()
+    {
+        _monitor?.Dispose();
+        _timer.Dispose();
     }
 }
