@@ -6,6 +6,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PcMonitor.Core", "PcMonitor
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PcMonitor.ValueTaskSource", "PcMonitor.ValueTaskSource\PcMonitor.ValueTaskSource.csproj", "{334F461D-B03F-422A-97A8-5B1C46896C2F}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PcMonitor.Benchmarks", "PcMonitor.Benchmarks\PcMonitor.Benchmarks.csproj", "{14B8A2DF-A7AC-42F5-9610-392718E84A3A}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -24,5 +26,9 @@ Global
 		{334F461D-B03F-422A-97A8-5B1C46896C2F}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{334F461D-B03F-422A-97A8-5B1C46896C2F}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{334F461D-B03F-422A-97A8-5B1C46896C2F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{14B8A2DF-A7AC-42F5-9610-392718E84A3A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{14B8A2DF-A7AC-42F5-9610-392718E84A3A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{14B8A2DF-A7AC-42F5-9610-392718E84A3A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{14B8A2DF-A7AC-42F5-9610-392718E84A3A}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

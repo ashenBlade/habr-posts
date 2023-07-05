@@ -1,7 +1,8 @@
 ﻿using System.Diagnostics;
+using System.Net.Sockets;
 using PcMonitor.ValueTaskSource;
 
-using var monitor = new ValueTaskSourcePcMonitor(TimeSpan.FromMilliseconds(500));
+using var monitor = new ValueTaskSourcePcMonitor(TimeSpan.FromMilliseconds(100));
 monitor.Start();
 
 using var cts = new CancellationTokenSource();
@@ -19,7 +20,7 @@ Console.CancelKeyPress += (_, eventArgs) =>
     }
 };
 
-await Task.Delay(Random.Shared.Next(250));
+await Task.Delay(250);
 var watch = new Stopwatch();
 while (!cts.Token.IsCancellationRequested)
 {
@@ -30,5 +31,6 @@ while (!cts.Token.IsCancellationRequested)
     Console.WriteLine($"Температура CPU: {statistics.CpuTemperature}");
     Console.WriteLine($"Вызов занял: {elapsed}");
     Console.WriteLine();
+    
     watch.Reset();
 }

@@ -8,8 +8,11 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\PcMonitor.Core\PcMonitor.Core.csproj" />
       <ProjectReference Include="..\PcMonitor.ValueTaskSource\PcMonitor.ValueTaskSource.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="BenchmarkDotNet" Version="0.13.5" />
     </ItemGroup>
 
 </Project>

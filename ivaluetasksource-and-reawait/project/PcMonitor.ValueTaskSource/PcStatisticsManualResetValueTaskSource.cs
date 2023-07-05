@@ -5,9 +5,9 @@ using PcMonitor.Core;
 
 namespace PcMonitor.ValueTaskSource;
 
-internal class PcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
+internal class PcStatisticsManualResetValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
 {
-    private ObjectPool<PcStatisticsValueTaskSource>? _pool;
+    private ObjectPool<PcStatisticsManualResetValueTaskSource>? _pool;
     private ValueTaskSourcePcMonitor? _monitor;
     private TimeSpan _lastMeasurementTime = TimeSpan.Zero;
     private PcStatistics _cachedResult = new();
@@ -19,7 +19,7 @@ internal class PcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, IDis
 
     private static void OnTimerTimeout(object? state)
     {
-        var source = ( PcStatisticsValueTaskSource ) state!;
+        var source = ( PcStatisticsManualResetValueTaskSource ) state!;
         try
         {
             source._cancellationToken.ThrowIfCancellationRequested();
@@ -63,7 +63,7 @@ internal class PcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, IDis
         _source.OnCompleted(continuation, state, token, flags);
     }
 
-    public ValueTask<PcStatistics> Start(ValueTaskSourcePcMonitor monitor, ObjectPool<PcStatisticsValueTaskSource> pool, CancellationToken token = default)
+    public ValueTask<PcStatistics> Start(ValueTaskSourcePcMonitor monitor, ObjectPool<PcStatisticsManualResetValueTaskSource> pool, CancellationToken token = default)
     {
         _pool = pool;
         _monitor = monitor;
@@ -86,7 +86,7 @@ internal class PcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, IDis
         return new ValueTask<PcStatistics>(this, _source.Version);
     }
 
-    public PcStatisticsValueTaskSource()
+    public PcStatisticsManualResetValueTaskSource()
     {
         _timer = new Timer(OnTimerTimeout, this, Timeout.Infinite, Timeout.Infinite);
     }

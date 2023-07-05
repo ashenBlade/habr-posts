@@ -11,7 +11,7 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
     private TimeSpan _prevScrapTime = TimeSpan.Zero;
     private TimeSpan _nextScrapTime = TimeSpan.Zero;
     private readonly Timer _updateTimer;
-    private readonly ObjectPool<PcStatisticsValueTaskSource> _pool;
+    private readonly ObjectPool<PcStatisticsManualResetValueTaskSource> _pool;
     private bool _started;
 
     internal (PcStatistics Measurement, TimeSpan ScrapTime) LastMeasurement => ( _cache, _prevScrapTime );
@@ -19,8 +19,8 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
     public ValueTaskSourcePcMonitor(TimeSpan scrapTimeout)
     {
         _scrapTimeout = scrapTimeout;
-        _policy = new ConcurrentBagObjectPolicy<PcStatisticsValueTaskSource>(() => new());
-        _pool = new DefaultObjectPool<PcStatisticsValueTaskSource>(_policy, 10);
+        _policy = new ConcurrentBagObjectPolicy<PcStatisticsManualResetValueTaskSource>(() => new());
+        _pool = new DefaultObjectPool<PcStatisticsManualResetValueTaskSource>(_policy, 10);
         _updateTimer = new Timer(OnTimeout, this, Timeout.Infinite, Timeout.Infinite);
     }
 
@@ -43,7 +43,7 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
     }
 
     private static readonly TimeSpan Delta = TimeSpan.FromMilliseconds(10);
-    private readonly ConcurrentBagObjectPolicy<PcStatisticsValueTaskSource> _policy;
+    private readonly ConcurrentBagObjectPolicy<PcStatisticsManualResetValueTaskSource> _policy;
 
     internal bool IsMeasurementActual(TimeSpan savedCacheTimestampTicks)
     {
@@ -98,10 +98,18 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
 
     public ValueTask<PcStatistics> GetStatisticsAsync(CancellationToken token = default)
     {
+        // var x = new ManualPcStatisticsValueTaskSource();
+        // return x.Start(this, token);
         var source = _pool.Get();
         return source.Start(this, _pool, token);
     }
-    
+
+    public async Task<PcStatistics> GetStatisticsTaskAsync(CancellationToken token = default)
+    {
+        await Task.Delay(GetTimeBeforeNextScrap(), token);
+        return _cache;
+    }
+
     public void Dispose()
     {
         Stop();
