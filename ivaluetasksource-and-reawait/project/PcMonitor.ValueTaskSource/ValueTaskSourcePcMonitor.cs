@@ -98,10 +98,10 @@ public class ValueTaskSourcePcMonitor: IDisposable, IPcMonitor
 
     public ValueTask<PcStatistics> GetStatisticsAsync(CancellationToken token = default)
     {
-        // var x = new ManualPcStatisticsValueTaskSource();
-        // return x.Start(this, token);
-        var source = _pool.Get();
-        return source.Start(this, _pool, token);
+        var x = new ManualPcStatisticsValueTaskSource();
+        return x.Start(this, token);
+        // var source = _pool.Get();
+        // return source.Start(this, _pool, token);
     }
 
     public async Task<PcStatistics> GetStatisticsTaskAsync(CancellationToken token = default)

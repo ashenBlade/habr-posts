@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Principal;
 using System.Threading.Tasks.Sources;
 using PcMonitor.Core;
 
@@ -70,9 +71,18 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
             InvokeContinuation(previous, _state, false);
         }
     }
+
+    private void CheckVersion(short version)
+    {
+        if (version != _version)
+        {
+            throw new InvalidOperationException("Обнаружено множественное ожидание");
+        }
+    }
     
     public PcStatistics GetResult(short version)
     {
+        CheckVersion(version);
         if (_exception is not null)
         {
             var exception = _exception!;
@@ -110,6 +120,7 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
 
     public ValueTaskSourceStatus GetStatus(short token)
     {
+        CheckVersion(token);
         if (_cancellationToken.IsCancellationRequested)
         {
             return ValueTaskSourceStatus.Canceled;
@@ -169,6 +180,8 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
                             short token,
                             ValueTaskSourceOnCompletedFlags flags)
     {
+        CheckVersion(token);
+        
         if (UseExecutionContext())
         {
             _ec = ExecutionContext.Capture();
@@ -187,10 +200,8 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
         var prev = Interlocked.CompareExchange(ref _continuation, continuation, null);
         if (prev is null)
         {
-            Console.WriteLine($"null");
             return;
         }
-        Console.WriteLine($"not null");
         
         _state = null;
         if (!ReferenceEquals(prev, Sentinel))
