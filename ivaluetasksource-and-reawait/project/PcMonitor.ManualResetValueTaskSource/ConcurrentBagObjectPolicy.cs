@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.ObjectPool;
 
-namespace PcMonitor.ValueTaskSource;
+namespace PcMonitor.ManualResetValueTaskSource;
 
 public class ConcurrentBagObjectPolicy<T>: IPooledObjectPolicy<T>, IDisposable where T : notnull, IDisposable
 {

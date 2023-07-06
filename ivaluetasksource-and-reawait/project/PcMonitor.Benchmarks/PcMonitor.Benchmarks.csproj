@@ -8,7 +8,7 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\PcMonitor.ValueTaskSource\PcMonitor.ValueTaskSource.csproj" />
+      <ProjectReference Include="..\PcMonitor.ManualResetValueTaskSource\PcMonitor.ManualResetValueTaskSource.csproj" />
     </ItemGroup>
 
     <ItemGroup>

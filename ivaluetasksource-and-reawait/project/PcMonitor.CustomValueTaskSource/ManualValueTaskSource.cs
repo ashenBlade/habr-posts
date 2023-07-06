@@ -1,20 +1,18 @@
 using System.Diagnostics;
-using System.Security.Principal;
 using System.Threading.Tasks.Sources;
 using PcMonitor.Core;
 
-namespace PcMonitor.ValueTaskSource;
+namespace PcMonitor.CustomValueTaskSource;
 
-public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
+public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
 {
     private static readonly Action<object?> Sentinel = _ =>
     {
         Debug.Assert(false, "Sentinel не должен был быть вызван. Работа завершена до вызова OnCompleted");
     };
 
-    private ValueTaskSourcePcMonitor? _monitor;
+    private CustomPcMonitor? _monitor;
     private TimeSpan _lastMeasurementTime = TimeSpan.Zero;
-    private CancellationToken _cancellationToken;
     
     private PcStatistics _cachedResult = new();
     private Exception? _exception;
@@ -24,19 +22,14 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
     private Action<object?>? _continuation;
     private short _version;
     private ExecutionContext? _ec;
-    
-    
 
     private readonly Timer _timer;
     private static void OnTimerTimeout(object? state)
     {
-        var source = ( ManualPcStatisticsValueTaskSource ) state!;
+        var source = ( ManualValueTaskSource ) state!;
         try
         {
-            source._cancellationToken.ThrowIfCancellationRequested();
-            
-            Debug.Assert(source._monitor is not null, "source._monitor is not null");
-            var (statistics, lastTime) = source._monitor.LastMeasurement;
+            var (statistics, lastTime) = source._monitor!.LastMeasurement;
             source._lastMeasurementTime = lastTime;
             source._cachedResult = statistics;
             source.NotifyCompleted();
@@ -62,7 +55,7 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
             _ec = null;
             ExecutionContext.Run(ec, state =>
             {
-                var tuple = ( Tuple<ManualPcStatisticsValueTaskSource, Action<object?>, object?> ) state!;
+                var tuple = ( Tuple<ManualValueTaskSource, Action<object?>, object?> ) state!;
                 tuple.Item1.InvokeContinuation(tuple.Item2, tuple.Item3, false);
             }, Tuple.Create(this, previous, _state));
         }
@@ -83,18 +76,10 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
     public PcStatistics GetResult(short version)
     {
         CheckVersion(version);
+        
         if (_exception is not null)
         {
-            var exception = _exception!;
-            Reset();
-            throw exception;
-        }
-
-        if (_cancellationToken.IsCancellationRequested)
-        {
-            var token = _cancellationToken;
-            Reset();
-            token.ThrowIfCancellationRequested();
+            throw _exception;
         }
 
         if (_cachedResult == default)
@@ -102,29 +87,13 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
             // Результат еще не готов
             throw new InvalidOperationException("Работа еще не завершена");
         }
-        
-        var result = _cachedResult;
-        Reset();
-        return result;
 
-        void Reset()
-        {
-            _version++;
-            _cachedResult = default;
-            _exception = null;
-            _state = null;
-            _continuation = null;
-            _cancellationToken = default;
-        }
+        return _cachedResult;
     }
 
     public ValueTaskSourceStatus GetStatus(short token)
     {
         CheckVersion(token);
-        if (_cancellationToken.IsCancellationRequested)
-        {
-            return ValueTaskSourceStatus.Canceled;
-        }
         
         if (_exception is not null)
         {
@@ -210,7 +179,7 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
         }
         
         // Вызываем продолжение синхронно, т.к. уже результат уже есть
-        InvokeContinuation(continuation, state, true);
+        InvokeContinuation(continuation, state, synchronously: true);
         
         bool UseExecutionContext() => ( flags & ValueTaskSourceOnCompletedFlags.FlowExecutionContext ) is not ValueTaskSourceOnCompletedFlags.None;
 
@@ -221,11 +190,10 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
         object GetScheduler() => ( object? ) SynchronizationContext.Current ?? TaskScheduler.Current;
     }
 
-    public ValueTask<PcStatistics> Start(ValueTaskSourcePcMonitor monitor, CancellationToken token = default)
+    public ValueTask<PcStatistics> Start(CustomPcMonitor monitor)
     {
         _monitor = monitor;
-        _cancellationToken = token;
-        
+
         // Если замер достаточно свежий, то возвращаем его
         if (_monitor.IsMeasurementActual(_lastMeasurementTime))
         {
@@ -243,7 +211,7 @@ public class ManualPcStatisticsValueTaskSource: IValueTaskSource<PcStatistics>, 
         return new ValueTask<PcStatistics>(this, _version);
     }
 
-    public ManualPcStatisticsValueTaskSource()
+    public ManualValueTaskSource()
     {
         _timer = new Timer(OnTimerTimeout, this, Timeout.Infinite, Timeout.Infinite);
     }

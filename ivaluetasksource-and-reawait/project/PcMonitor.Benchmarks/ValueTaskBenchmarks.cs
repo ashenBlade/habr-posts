@@ -1,5 +1,5 @@
 using BenchmarkDotNet.Attributes;
-using PcMonitor.ValueTaskSource;
+using PcMonitor.ManualResetValueTaskSource;
 
 namespace PcMonitor.Benchmarks;
 

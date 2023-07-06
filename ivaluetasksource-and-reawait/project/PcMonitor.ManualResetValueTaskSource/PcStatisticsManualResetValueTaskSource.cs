@@ -4,7 +4,7 @@ using System.Threading.Tasks.Sources;
 using Microsoft.Extensions.ObjectPool;
 using PcMonitor.Core;
 
-namespace PcMonitor.ValueTaskSource;
+namespace PcMonitor.ManualResetValueTaskSource;
 
 internal class PcStatisticsManualResetValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
 {
