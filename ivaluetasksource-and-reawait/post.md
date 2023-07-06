@@ -390,27 +390,201 @@ public ValueTask<PcStatistics> GetStatisticsAsync(CancellationToken token = defa
 
 # Как реализован сокет с помощью него (все делают пример на нем, я не исключение)
 
-`IValueTaskSource` (как говорят) был добавлен специально для сокетов.
-Все делают примеры на нем - я не исключение.
+Основным примером реализации `IValueTaskSource` является `Socket`. Не буду исключением.
+Читать или писать в сокет можно только одним потоком (только один или читает или пишет).
+Растратно каждый раз создавать новые `Task`'и на каждый чих (учитывая что ["Сеть надежна"](https://ru.wikipedia.org/wiki/Заблуждения_о_распределённых_вычислениях)).
+Поэтому внутри себя сокет содержит 2 буфера `IValueTaskSource` - для чтения и записи
+```cs
+public partial class Socket
+{
+    /// <summary>Cached instance for receive operations that return <see cref="ValueTask{Int32}"/>. Also used for ConnectAsync operations.</summary>
+    private AwaitableSocketAsyncEventArgs? _singleBufferReceiveEventArgs;
+    /// <summary>Cached instance for send operations that return <see cref="ValueTask{Int32}"/>. Also used for AcceptAsync operations.</summary>
+    private AwaitableSocketAsyncEventArgs? _singleBufferSendEventArgs;
+    // ...
+    
+    
+    internal sealed class AwaitableSocketAsyncEventArgs 
+      : SocketAsyncEventArgs, 
+        IValueTaskSource, IValueTaskSource<int>, 
+        IValueTaskSource<Socket>, 
+        IValueTaskSource<SocketReceiveFromResult>, 
+        IValueTaskSource<SocketReceiveMessageFromResult>
+    {
+        // ...
+    }
+}
+```
 
-Реализация -  `AwaitableSocketsEventArgs`
+Например, при чтении из сокета буфер используется таким образом:
+```cs
+internal ValueTask<int> ReceiveAsync(Memory<byte> buffer, SocketFlags socketFlags, bool fromNetworkStream, CancellationToken cancellationToken)
+{
+    // Получаем закэшированный IValueTaskSource или создаем новый (потом положим обратно в кэш)
+    AwaitableSocketAsyncEventArgs saea =
+        Interlocked.Exchange(ref _singleBufferReceiveEventArgs, null) ??
+        new AwaitableSocketAsyncEventArgs(this, isReceiveForCaching: true);
+    
+    // Обновляем состояние IValueTaskSource для новой работы
+    saea.SetBuffer(buffer);
+    saea.SocketFlags = socketFlags;
+    saea.WrapExceptionsForNetworkStream = fromNetworkStream;
 
-Пример на ReceiveAsync.
-Используется один буфер, т.к. чтение только 1 потоком возможно.
-Строка 307
+    // Запускаем асинхронную операцию
+    return saea.ReceiveAsync(this, cancellationToken);
+}
+```
 
-Строка 953 - если операция не завершилась - передача самого себя
+Создание `ValueTask` находится в `saea.ReceiveAsync`
+```csharp
+/// <summary>Initiates a receive operation on the associated socket.</summary>
+/// <returns>This instance.</returns>
+public ValueTask<int> ReceiveAsync(Socket socket, CancellationToken cancellationToken)
+{
+    if (socket.ReceiveAsync(this, cancellationToken))
+    {
+        // Операция не завершена синхронно - запускаем асинхронную операцию
+        _cancellationToken = cancellationToken;
+        return new ValueTask<int>(this, _token);
+    }
 
-Внутри все доходит до нативной операции и происходит возврат
+    int bytesTransferred = BytesTransferred;
+    SocketError error = SocketError;
 
-Внутри `SocketAsyncEventArgs` (базовом классе) есть переменные для каждой возможной операции.
-Начало класса
+    Release();
+    
+    // Операция завершилась синхронно
+    return error == SocketError.Success ?
+        new ValueTask<int>(bytesTransferred) :
+        ValueTask.FromException<int>(CreateException(error));
+}
+```
 
-Сделать аналогию с нашей реализацией
 
-# Бенчмарки?
+`IValueTaskSource` используется также в `Channel`'ах.
+Он используется как в `Bounded` так и в `Unbounded`, но пример сделаю на `Bounded`.
 
-Сравнение памяти ValueTask и Task
+В `BoundedChannel` есть следующие поля
+```cs
+internal sealed class BoundedChannel<T> : Channel<T>, IDebugEnumerable<T>
+{
+    /// <summary>Readers waiting to read from the channel.</summary>
+    private readonly Deque<AsyncOperation<T>> _blockedReaders = new Deque<AsyncOperation<T>>();
+    /// <summary>Writers waiting to write to the channel.</summary>
+    private readonly Deque<VoidAsyncOperationWithData<T>> _blockedWriters = new Deque<VoidAsyncOperationWithData<T>>();
+    /// <summary>Linked list of WaitToReadAsync waiters.</summary>
+    private AsyncOperation<bool>? _waitingReadersTail;
+    /// <summary>Linked list of WaitToWriteAsync waiters.</summary>
+    private AsyncOperation<bool>? _waitingWritersTail;
+    // ...
+}
+```
+
+Как можно заметить, здесь есть поля, использующие `AsyncOperation` - тот самый `IValueTaskSource`:
+```cs
+internal partial class AsyncOperation<TResult> : AsyncOperation, IValueTaskSource, IValueTaskSource<TResult>
+{
+    // Предназначен ли для пулинга
+    private readonly bool _pooled;
+    // Асинхронное продолжение
+    private readonly bool _runContinuationsAsynchronously;
+    // Результат операции
+    private TResult? _result;
+    // Исключение в процессе работы
+    private ExceptionDispatchInfo? _error;
+    // continuation из OnCompleted
+    private Action<object?>? _continuation;
+    // state из OnCompleted
+    private object? _continuationState;
+    // SynchronizationContext или TaskScheduler
+    private object? _schedulingContext;
+    private ExecutionContext? _executionContext;
+    // token
+    private short _currentId;
+}
+```
+
+Для чтения из канала используется метод `ValueTask<T> ReadAsync`:
+```cs
+public override ValueTask<T> ReadAsync(CancellationToken cancellationToken)
+{
+    BoundedChannel<T> parent = _parent;
+    lock (parent.SyncObj)
+    {
+        // Если есть свободные элементы - вернуть их
+        if (!parent._items.IsEmpty)
+        {
+            return new ValueTask<T>(DequeueItemAndPostProcess());
+        }
+        
+        // Используем закэшированный IValueTaskSource
+        if (!cancellationToken.CanBeCanceled)
+        {
+            AsyncOperation<T> singleton = _readerSingleton;
+            if (singleton.TryOwnAndReset())
+            {
+                parent._blockedReaders.EnqueueTail(singleton);
+                return singleton.ValueTaskOfT;
+            }
+        }
+
+        // Возвращаем новый IValueTaskSource
+        var reader = new AsyncOperation<T>(parent._runContinuationsAsynchronously | cancellationToken.CanBeCanceled, cancellationToken);
+        parent._blockedReaders.EnqueueTail(reader);
+        return reader.ValueTaskOfT;
+    }
+}
+```
+
+Для записи `ValueTask WriteAsync`:
+```cs
+public override ValueTask WriteAsync(T item, CancellationToken cancellationToken)
+{
+    // Количество элемент в очереди
+    int count = parent._items.Count;
+
+    if (count == 0)
+    {
+        // Добавляем элемент в свободную очередь или заблокированного читателя
+    }
+    else if (count < parent._bufferedCapacity)
+    {
+        // Синхронно добавляем элемент в свободную очередь
+    }
+    else if (parent._mode == BoundedChannelFullMode.Wait)
+    {
+        // Очередь полна, создаем асинхронную операцию записи
+
+        // Используем закэшированный IValueTaskSource
+        if (!cancellationToken.CanBeCanceled)
+        {
+            VoidAsyncOperationWithData<T> singleton = _writerSingleton;
+            if (singleton.TryOwnAndReset())
+            {
+                singleton.Item = item;
+                parent._blockedWriters.EnqueueTail(singleton);
+                return singleton.ValueTask;
+            }
+        }
+
+        // Создаем новый IValueTaskSource
+        var writer = new VoidAsyncOperationWithData<T>(runContinuationsAsynchronously: true, cancellationToken);
+        writer.Item = item;
+        parent._blockedWriters.EnqueueTail(writer);
+        return writer.ValueTask;
+    }
+    else if (parent._mode == BoundedChannelFullMode.DropWrite)
+    {
+        // Отбрасываем элемент, т.к. очередь полна
+    }
+    else
+    {
+        // Удаляем последний/первый элемент в очереди и записываем новый
+    }
+    
+    return default;
+}
+```
 
 # Полезные ссылки
 

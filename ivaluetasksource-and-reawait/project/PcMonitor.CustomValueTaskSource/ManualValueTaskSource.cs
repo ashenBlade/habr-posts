@@ -6,7 +6,8 @@ namespace PcMonitor.CustomValueTaskSource;
 
 public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
 {
-    private static readonly Action<object?> Sentinel = _ =>
+    // Колбэк, выставляемый в _continuation, когда операция завершилась, но колбэк еще не проставлен (OnCompleted не был вызван)
+    private static readonly Action<object?> CompletionSentinel = _ =>
     {
         Debug.Assert(false, "Sentinel не должен был быть вызван. Работа завершена до вызова OnCompleted");
     };
@@ -19,6 +20,10 @@ public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
 
     private object? _state;
     private object? _scheduler;
+    
+    // Sentinel - операция завершилась, но колбэк не был выставлен
+    // null - операция выполняется и еще не выставили 
+    // Остальное - выставленный callback
     private Action<object?>? _continuation;
     private short _version;
     private ExecutionContext? _ec;
@@ -44,7 +49,7 @@ public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
     private void NotifyCompleted()
     {
         // Опять состояние гонки
-        var previous = Interlocked.CompareExchange(ref _continuation, Sentinel, null);
+        var previous = Interlocked.CompareExchange(ref _continuation, CompletionSentinel, null);
         if (previous is null)
         {
             return;
@@ -162,9 +167,9 @@ public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
             _scheduler = scheduler;
         }
 
-        // Здесь может быть состояние гонки, когда 
-        // результат выставляется быстрее, чем заканчивается вызов OnCompleted.
-        // В нашем случае, такое может случиться, когда время ожидания таймера было очень мало
+        // Возможно состояние гонки, когда результат выставляется быстрее,
+        // чем заканчивается вызов OnCompleted.
+        // Такое может случиться, когда время ожидания таймера очень мало
         _state = state;
         var prev = Interlocked.CompareExchange(ref _continuation, continuation, null);
         if (prev is null)
@@ -173,9 +178,9 @@ public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
         }
         
         _state = null;
-        if (!ReferenceEquals(prev, Sentinel))
+        if (!ReferenceEquals(prev, CompletionSentinel))
         {
-            throw new InvalidOperationException("Обнаружено множественное ожидание");
+            throw new InvalidOperationException("При вызове OnCompleted и синхронном завершении в _continuation должен находится Sentinel");
         }
         
         // Вызываем продолжение синхронно, т.к. уже результат уже есть
