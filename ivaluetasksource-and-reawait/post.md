@@ -10,15 +10,16 @@
 # ValueTask до и после .NET Core 2.1
 
 Обычно `ValueTask` используют ради оптимизации. 
-Например, возврат закэшированного результата, или возврата ValueTask.FromCancelled с переданным CancellationToken.
+Например, возврат закэшированного результата, или `ValueTask.FromCancelled` с переданным `CancellationToken`.
 
-Но время шло, аппетиты возрастали и одним ранним выходом теперь не обойтись.
-Поэтому в .NET Core 2.1 был добавлен `IValueTaskSource`.
+Но нет предела оптимизациям и одним ранним выходом теперь не обойтись.
+Поэтому был добавлен `IValueTaskSource`.
 
 Теперь `ValueTask` можно создать не только передав готовый результат или `Task`, но 
 и упомянутый выше `IValueTaskSource`.
 
 ```cs
+// Конструкторы
 public ValueTask(IValueTaskSource source, short token);
 public ValueTask(Task task);
 public ValueTask<T>(T result);
@@ -36,7 +37,7 @@ public interface IValueTaskSource<out TResult>
     // Получить статус выполнения текущей операции  
     ValueTaskSourceStatus GetStatus(short token);
 
-    // Запланировать продолжение на выполнение по окончании операции
+    // Запланировать продолжение на выполнение при завершении работы
     void OnCompleted(
       Action<object?> continuation,
       object? state,
@@ -49,7 +50,7 @@ public interface IValueTaskSource<out TResult>
 ```
 
 `GetStatus` - получает статус выполнения.
-Статус представляет собой перечисление `ValueTaskSourceStatus`
+Статус представляется перечислением `ValueTaskSourceStatus`
 
 ```cs
 public enum ValueTaskSourceStatus
@@ -104,7 +105,7 @@ public enum ValueTaskSourceOnCompletedFlags
 >  - Фоновый поток завершил операцию и выставил результат
 >  - В этот момент вызвалось продолжение 
 >  - Продолжение зашло в `GetResult` и остановилось на семафоре
->  - Фоновый поток не получил обратно управление, т.к. продолжение было вызвано и не выставил семафор
+>  - Фоновый поток не получил обратно управление, т.к. продолжение было вызвано, но семафор еще не выставилен
 
 Также во всех методах присутствует `token`. 
 Это специальное значения для обнаружения множественных `await`.
@@ -119,14 +120,18 @@ public enum ValueTaskSourceOnCompletedFlags
    1. `GetStatus`
    2. `GetResult`
 
+Здесь можно провести аналогию с тем, как работает магия `async/await` и ее машины состояний.
+Грубо говоря, мы создали свой собственный `Task` с блэкджеком, но без аллокаций.
+
 # Делаем полностью своими руками
 
 Теперь сделаем свою реализацию. 
-Представим, что у нас есть класс `PcMonitor`. 
-Он вызывается очень часто и замеряет статистику компьютера.
-Для оптимизации мы решили:
-- Делать запросы не на каждый вызов, а с определенным интервалом и хранить полученные значения в кэшэ.
-- Если при вызове значение из кэша еще актуально, то вернуть его, иначе ждать до следующего сбора.
+
+Представим, перед нами задача получения статистики ПК.
+У нас есть класс `PcMonitor`, отдающий эту статистику. 
+Он вызывается очень часто, поэтому для оптимизации мы решили:
+- Опрашивать ПК не на каждый вызов, а с определенным интервалом и хранить полученные значения в кэше
+- Если при вызове значение из кэша еще актуально, то вернуть его, иначе ждать до следующего сбора
 
 <spoiler title="Детали реализации">
 
@@ -141,36 +146,34 @@ public readonly record struct PcStatistics(double CpuTemperature);
 Сбор статистики реализован с помощью `System.Threading.Timers.Timer`, 
 который с определенным интервалом кладет в кэш новое значение и обновляет время сбора.
 
-Время сбора представляет `TimeStamp`, получаемый с помощью `Stopwatch` (не самая лучшая идея, но сойдет)
+Время сбора представляет `TimeSpan`, получаемый с помощью `Stopwatch` (не самая лучшая идея, но сойдет)
 
 </spoiler>
 
-Реализация `IValueTaskSource` представляется классом `ManualValueTaskSource`.
-Он хранит в себе необходимые для работы поля.
+Наша реализация `IValueTaskSource` представляется классом `PcStatisticsManualResetValueTaskSource`.
+Он хранит в себе необходимые для работы данные.
 ```cs
-// Наш "отец"
-private CustomPcMonitor? _monitor;
-
-// Объекты для получения результата
+// Результат работы
 private CancellationToken _cancellationToken;
 private PcStatistics _cachedResult = new();
 private Exception? _exception;
 
-// Объекты для правильной работы IValueTaskSource
+// Инфраструтура для работы IValueTaskSource
 private object? _state;
 private object? _scheduler;
 private Action<object?>? _continuation;
 private short _version;
 private ExecutionContext? _ec;
 
-// Вспомогательный объекты
+// Инфраструктура бизнес-логики
 private readonly Timer _timer;
 private TimeSpan _lastMeasurementTime = TimeSpan.Zero;
+private CustomPcMonitor? _monitor;
 ```
 
 `GetStatus`
 
-Пожалуй, это самая простая реализация
+Пожалуй, его реализация самая простая
 ```cs
 public ValueTaskSourceStatus GetStatus(short token)
 {
@@ -264,7 +267,7 @@ public PcStatistics GetResult(short version)
 }
 ```
 
-Все приведенные выше методы довольно просты в реализации, но в прод их не принесешь:
+Все приведенные выше методы довольно просты в реализации, но на прод их не принесешь:
 - Нет поддержки отмены
 - Плохая работа с конкурентностью
 - `ExecutionContext` не используется
@@ -314,12 +317,8 @@ private void InvokeContinuation(Action<object?>? continuation, object? state, bo
 
 # Добавляем ManualResetValueTaskSource
 
-Реализацию написали. Мы молодцы. А теперь все выбрасываем, так как реализация за нас уже сделана - `ManualResetValueTaskSource`.
-Она реализует все выше приведенные 
-
-Реализация по большей части шаблонная.
-
-Конкурентная реализация уже есть в `ManualResetValueTaskSourceCore`.
+Реализацию написали. Мы молодцы. А теперь все выбрасываем, так как реализация за нас уже сделана - `ManualResetValueTaskSourceCore`.
+Она реализует все выше приведенные методы логики `IValueTaskSource`.
 Теперь перепишем старые методы с его использованием.
 
 ```cs
@@ -348,10 +347,12 @@ public void OnCompleted(Action<object?> continuation, object? state, short token
 Почему бы не переиспользовать создаваемые `ValueTaskSource` и возвращать их обратно при вызове `GetResult`.
 
 Так и сделаем. 
-В `PcMonitor` добавим пул этих объектов и будем забирать при вызове `GetStatisticsAsync`, а при вызове `GetResult` будем возвращать себя обратно в пул.
+В `PcMonitor` добавим пул этих объектов: при вызове `GetStatisticsAsync` берем из, а в `GetResult` будем возвращать обратно в.
 
 ```cs
-// ValueTaskSource
+// PcStatisticsManualResetValueTaskSource
+private ObjectPool<PcStatisticsManualResetValueTaskSource>? _pool;
+
 public PcStatistics GetResult(short token)
 {
     try
@@ -360,39 +361,52 @@ public PcStatistics GetResult(short token)
     }
     finally
     {
-        // Возвращаем в пул
         _pool.Return(this);
+        // Сбрасываем состояние, чтобы использовать дальше
+        _source.Reset();   
     }
 }
 
 // PcMonitor
+private ObjectPool<PcStatisticsManualResetValueTaskSource> _pool;
+
 public ValueTask<PcStatistics> GetStatisticsAsync(CancellationToken token = default)
 {
-    // Берем из пула
     var source = _pool.Get();
     return source.Start(this, _pool, token);
 }
 ```
 
-`GetResult` вызывается всегда один раз - при получении результата. 
-При этом наш `ValueTaskSource` возвращается обратно в пул.
-
 Теперь мы можем создать ограниченное количество `ValueTaskSource` и постоянно их переиспользовать без лишних аллокаций памяти!
 
 Но что, если кто-то попытается за`await`'ить `ValueTask` несколько раз? 
-Даже если эти вызовы были крайне близки во времени, никто не гарантирует, что за это время 
-тот же самый `ValueTaskSource` не будет передан в другой `ValueTask` и хранить новое значение.
+Тогда _в лучшем случае_ ему вернется старый результат.
+
+Но даже если эти вызовы были крайне близки во времени, никто не гарантирует, что за это время тот же самый `ValueTaskSource` не будет передан в другой `ValueTask` и будет хранить новое значение.
 
 Вот тут и нужен `short token`, передававшийся в любой метод. 
 Он призван проверять, что вызвавший код, обращается к `ValueTask`, в которой находится актуальный `ValueTaskSource`.
 В `ManualResetValueTaskSourceCore` он реализован в виде простого счетчика, поэтому там он называется `Version`.
 Но в общем случае это не обязательно - сойдет любое неповторяющееся значение.
 
-# Как реализован сокет с помощью него (все делают пример на нем, я не исключение)
+Этот токен задается в самом начале и не изменяется в процессе работы `ValueTask`
+```cs
+public ValueTask<PcStatistics> Start(ValueTaskSourcePcMonitor monitor, ObjectPool<PcStatisticsManualResetValueTaskSource> pool, CancellationToken token = default)
+{
+    // ...
+    
+    // ManualResetValueTaskSourceCore.Version - токен, который инкрементируется при вызове Reset()
+    return new ValueTask<PcStatistics>(this, _source.Version);
+}
+```
 
-Основным примером реализации `IValueTaskSource` является `Socket`. Не буду исключением.
+# Примеры реализации из .NET
+
+Когда кто-то представляет `IValueTaskSource`, почти всегда в пример приводят сокет.
+Я не буду исключением.
+
 Читать или писать в сокет можно только одним потоком (только один или читает или пишет).
-Растратно каждый раз создавать новые `Task`'и на каждый чих (учитывая что ["Сеть надежна"](https://ru.wikipedia.org/wiki/Заблуждения_о_распределённых_вычислениях)).
+Растратно каждый раз создавать новые `Task`'и на каждый чих (особенно учитывая что ["Сеть надежна"](https://ru.wikipedia.org/wiki/Заблуждения_о_распределённых_вычислениях)).
 Поэтому внутри себя сокет содержит 2 буфера `IValueTaskSource` - для чтения и записи
 ```cs
 public partial class Socket
@@ -401,12 +415,13 @@ public partial class Socket
     private AwaitableSocketAsyncEventArgs? _singleBufferReceiveEventArgs;
     /// <summary>Cached instance for send operations that return <see cref="ValueTask{Int32}"/>. Also used for AcceptAsync operations.</summary>
     private AwaitableSocketAsyncEventArgs? _singleBufferSendEventArgs;
-    // ...
     
+    // ...
     
     internal sealed class AwaitableSocketAsyncEventArgs 
       : SocketAsyncEventArgs, 
-        IValueTaskSource, IValueTaskSource<int>, 
+        IValueTaskSource, 
+        IValueTaskSource<int>, 
         IValueTaskSource<Socket>, 
         IValueTaskSource<SocketReceiveFromResult>, 
         IValueTaskSource<SocketReceiveMessageFromResult>
@@ -433,33 +448,30 @@ internal ValueTask<int> ReceiveAsync(Memory<byte> buffer, SocketFlags socketFlag
     // Запускаем асинхронную операцию
     return saea.ReceiveAsync(this, cancellationToken);
 }
-```
 
-Создание `ValueTask` находится в `saea.ReceiveAsync`
-```csharp
-/// <summary>Initiates a receive operation on the associated socket.</summary>
-/// <returns>This instance.</returns>
-public ValueTask<int> ReceiveAsync(Socket socket, CancellationToken cancellationToken)
+internal sealed class AwaitableSocketAsyncEventArgs 
 {
-    if (socket.ReceiveAsync(this, cancellationToken))
+    public ValueTask<int> ReceiveAsync(Socket socket, CancellationToken cancellationToken)
     {
-        // Операция не завершена синхронно - запускаем асинхронную операцию
-        _cancellationToken = cancellationToken;
-        return new ValueTask<int>(this, _token);
-    }
-
-    int bytesTransferred = BytesTransferred;
-    SocketError error = SocketError;
-
-    Release();
+        if (socket.ReceiveAsync(this, cancellationToken))
+        {
+            // Операция не завершена синхронно - запускаем асинхронную операцию
+            _cancellationToken = cancellationToken;
+            return new ValueTask<int>(this, _token);
+        }
     
-    // Операция завершилась синхронно
-    return error == SocketError.Success ?
-        new ValueTask<int>(bytesTransferred) :
-        ValueTask.FromException<int>(CreateException(error));
+        int bytesTransferred = BytesTransferred;
+        SocketError error = SocketError;
+    
+        Release();
+        
+        // Операция завершилась синхронно
+        return error == SocketError.Success ?
+            new ValueTask<int>(bytesTransferred) :
+            ValueTask.FromException<int>(CreateException(error));
+    }
 }
 ```
-
 
 `IValueTaskSource` используется также в `Channel`'ах.
 Он используется как в `Bounded` так и в `Unbounded`, но пример сделаю на `Bounded`.
@@ -482,7 +494,10 @@ internal sealed class BoundedChannel<T> : Channel<T>, IDebugEnumerable<T>
 
 Как можно заметить, здесь есть поля, использующие `AsyncOperation` - тот самый `IValueTaskSource`:
 ```cs
-internal partial class AsyncOperation<TResult> : AsyncOperation, IValueTaskSource, IValueTaskSource<TResult>
+internal partial class AsyncOperation<TResult> 
+    : AsyncOperation, 
+      IValueTaskSource, 
+      IValueTaskSource<TResult>
 {
     // Предназначен ли для пулинга
     private readonly bool _pooled;
@@ -504,7 +519,7 @@ internal partial class AsyncOperation<TResult> : AsyncOperation, IValueTaskSourc
 }
 ```
 
-Для чтения из канала используется метод `ValueTask<T> ReadAsync`:
+Для чтения из канала используется `ValueTask<T> ReadAsync`:
 ```cs
 public override ValueTask<T> ReadAsync(CancellationToken cancellationToken)
 {
@@ -536,7 +551,7 @@ public override ValueTask<T> ReadAsync(CancellationToken cancellationToken)
 }
 ```
 
-Для записи `ValueTask WriteAsync`:
+Для записи - `ValueTask WriteAsync`:
 ```cs
 public override ValueTask WriteAsync(T item, CancellationToken cancellationToken)
 {
@@ -588,7 +603,11 @@ public override ValueTask WriteAsync(T item, CancellationToken cancellationToken
 
 # Полезные ссылки
 
-- Мой проект
-- Реализация сокета (гитхаб)
-- 
+Надеюсь, теперь стало понятно, почему пере`await`'ить `ValueTask` плохая затея, и как работают `IValueTaskSource`.
+Если кому-то стала интересна эта тема, то прилагаю полезные ссылки:
 
+- [Немного про `ValueTask`](https://habr.com/ru/articles/458828/)
+- [`ManualResetValueTaskSourceCore`](https://github.com/dotnet/runtime/blob/a2c19cd005a1130ba7f921e0264287cfbfa8513c/src/libraries/Microsoft.Bcl.AsyncInterfaces/src/System/Threading/Tasks/Sources/ManualResetValueTaskSourceCore.cs#L22C26-L22C26)
+- [`AwaitableSocketAsyncEventArgs`](https://github.com/dotnet/runtime/blob/a2c19cd005a1130ba7f921e0264287cfbfa8513c/src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Tasks.cs#L919)
+- [`AsyncOperation`](https://github.com/dotnet/runtime/blob/ee2355c801d892f2894b0f7b14a20e6cc50e0e54/src/libraries/System.Threading.Channels/src/System/Threading/Channels/AsyncOperation.cs)
+- [Статья, с которой скопировал реализацию](https://tooslowexception.com/implementing-custom-ivaluetasksource-async-without-allocations/)

@@ -15,14 +15,14 @@ public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
     private CustomPcMonitor? _monitor;
     private TimeSpan _lastMeasurementTime = TimeSpan.Zero;
     
-    private PcStatistics _cachedResult = new();
+    private PcStatistics _cachedResult;
     private Exception? _exception;
 
     private object? _state;
     private object? _scheduler;
     
     // Sentinel - операция завершилась, но колбэк не был выставлен
-    // null - операция выполняется и еще не выставили 
+    // null - операция выполняется и еще не выставили продолжение
     // Остальное - выставленный callback
     private Action<object?>? _continuation;
     private short _version;
@@ -80,8 +80,6 @@ public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
     
     public PcStatistics GetResult(short version)
     {
-        CheckVersion(version);
-        
         if (_exception is not null)
         {
             throw _exception;
@@ -213,6 +211,8 @@ public class ManualValueTaskSource: IValueTaskSource<PcStatistics>, IDisposable
         {
             throw new Exception("Не удалось запустить таймер");
         }
+
+        _version = (short) Random.Shared.Next(0, short.MaxValue);
         return new ValueTask<PcStatistics>(this, _version);
     }
 

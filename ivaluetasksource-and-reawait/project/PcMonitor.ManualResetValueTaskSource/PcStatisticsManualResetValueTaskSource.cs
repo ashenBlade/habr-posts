@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Net.Sockets;
 using System.Threading.Tasks.Sources;
 using Microsoft.Extensions.ObjectPool;
 using PcMonitor.Core;
@@ -11,9 +10,9 @@ internal class PcStatisticsManualResetValueTaskSource: IValueTaskSource<PcStatis
     private ObjectPool<PcStatisticsManualResetValueTaskSource>? _pool;
     private ValueTaskSourcePcMonitor? _monitor;
     private TimeSpan _lastMeasurementTime = TimeSpan.Zero;
-    private PcStatistics _cachedResult = new();
+    private PcStatistics _cachedResult;
 
-    private ManualResetValueTaskSourceCore<PcStatistics> _source = new();
+    private ManualResetValueTaskSourceCore<PcStatistics> _source;
 
     private CancellationToken _cancellationToken;
     private readonly Timer _timer;
@@ -41,12 +40,20 @@ internal class PcStatisticsManualResetValueTaskSource: IValueTaskSource<PcStatis
     {
         try
         {
-            return _source.GetResult(token);
+            var result = _source.GetResult(token);
+            Reset();
+            return result;
         }
-        finally
+        catch (Exception e) when (e is not InvalidOperationException)
+        {
+            Reset();
+            throw;
+        }
+
+        void Reset()
         {
             Debug.Assert(_pool is not null, "pool is not null");
-            _pool.Return(this);
+            _pool!.Return(this);
             _pool = null;
             _monitor = null;
             _timer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -94,7 +101,6 @@ internal class PcStatisticsManualResetValueTaskSource: IValueTaskSource<PcStatis
 
     public void Dispose()
     {
-        _monitor?.Dispose();
         _timer.Dispose();
     }
 }

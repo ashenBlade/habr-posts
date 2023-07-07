@@ -1,5 +1,4 @@
 ﻿using System.Diagnostics;
-using System.Net.Sockets;
 using PcMonitor.ManualResetValueTaskSource;
 
 using var monitor = new ValueTaskSourcePcMonitor(TimeSpan.FromMilliseconds(100));
