@@ -357,13 +357,23 @@ public PcStatistics GetResult(short token)
 {
     try
     {
-        return _source.GetResult(token);
+        var result = _source.GetResult(token);
+        Reset();
+        return result;
     }
-    finally
+    catch (Exception e) when (e is not InvalidOperationException)
     {
-        _pool.Return(this);
-        // Сбрасываем состояние, чтобы использовать дальше
-        _source.Reset();   
+        Reset();
+        throw;
+    }
+
+    void Reset()
+    {
+        // Возвращаем в пул
+        _pool!.Return(this);
+        
+        // Перетираем состояние, чтобы переиспользовать
+        _source.Reset();
     }
 }
 
