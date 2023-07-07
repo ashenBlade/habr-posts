@@ -617,6 +617,7 @@ public override ValueTask WriteAsync(T item, CancellationToken cancellationToken
 Если кому-то стала интересна эта тема, то прилагаю полезные ссылки:
 
 - [Немного про `ValueTask`](https://habr.com/ru/articles/458828/)
+- [Проект из примера](https://github.com/ashenBlade/habr-posts/tree/post/ivaluetasksource-and-reawait/ivaluetasksource-and-reawait/project)
 - [`ManualResetValueTaskSourceCore`](https://github.com/dotnet/runtime/blob/a2c19cd005a1130ba7f921e0264287cfbfa8513c/src/libraries/Microsoft.Bcl.AsyncInterfaces/src/System/Threading/Tasks/Sources/ManualResetValueTaskSourceCore.cs#L22C26-L22C26)
 - [`AwaitableSocketAsyncEventArgs`](https://github.com/dotnet/runtime/blob/a2c19cd005a1130ba7f921e0264287cfbfa8513c/src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Tasks.cs#L919)
 - [`AsyncOperation`](https://github.com/dotnet/runtime/blob/ee2355c801d892f2894b0f7b14a20e6cc50e0e54/src/libraries/System.Threading.Channels/src/System/Threading/Channels/AsyncOperation.cs)
