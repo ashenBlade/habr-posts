@@ -22,7 +22,7 @@
 
 Важная деталь - на первом уровне все узлы расположены в порядке возрастания.
 
-// TODO: добавить картинку изображения
+![Визуализация списка с пропусками](img/skip-list.png)
 
 </spoiler>
 
@@ -37,16 +37,70 @@
 Основной структурой является узел
 
 ```cs
-// TODO: добавить код 
+internal class SkipListNode<TKey, TValue>
+{
+    /// <summary>
+    /// Ключ
+    /// </summary>
+    public TKey Key = default!;
+    
+    /// <summary>
+    /// Значение
+    /// </summary>
+    public TValue Value = default!;
+
+    /// <summary>
+    /// Массив указателей на другие узлы в списке.
+    /// Каждый индекс соответствует своему уровню, начиная снизу.
+    /// </summary>
+    public SkipListNode<TKey, TValue>[] Successors = null!;
+
+    /// <summary>
+    /// Следующий узел логически удален
+    /// </summary>
+    public volatile bool NextDeleted;
+    
+    /// <summary>
+    /// Узел находится в процессе вставки
+    /// </summary>
+    public volatile bool Inserting;
+
+    /// <summary>
+    /// Блокировка на время обновления узла
+    /// </summary>
+    public SpinLock UpdateLock = new();
+} 
 ```
 
 Сама очередь с приоритетами представляется таким образом
 
 ```cs
-// TODO: добавить код
-```
+public class ConcurrentPriorityQueue<TKey, TValue>
+{
+    /// <summary>
+    /// Голова списка
+    /// </summary>
+    private readonly SkipListNode<TKey, TValue> _head;
+    
+    /// <summary>
+    /// Хвост списка
+    /// </summary>
+    private readonly SkipListNode<TKey, TValue> _tail;
+    
+    /// <summary>
+    /// Максимальная высота списка
+    /// </summary>
+    private int Height => _head.Successors.Length;
+    
+    /// <summary>
+    /// Максимальное количество хранимых логически удаленных узлов
+    /// </summary>
+    private readonly int _deleteThreshold;
+    
 
-- Сказать что флаг нужен только для 1 уровня ???
+    // ...
+}    
+```
 
 ## Enqueue
 
@@ -69,7 +123,46 @@
 Повторяем так, пока не достигнем первого уровня.
 
 ```cs
-// TODO: код GetInsertLocation
+/// <summary>
+/// Для заданного ключа получить список всех ближайших левых (ключ меньше) узлов
+/// </summary>
+private (SkipListNode<TKey, TValue>[] Predecessors, SkipListNode<TKey, TValue>[] Successors, SkipListNode<TKey, TValue>? LastDeleted) GetInsertLocation(TKey key)
+{
+   var previous = _head;
+   // Последний удаленный узел
+   var lastDeleted = ( SkipListNode<TKey, TValue>? ) null;
+   // Предшествующие узлы
+   var predecessors = new SkipListNode<TKey, TValue>[Height];
+   // Последующие узлы
+   var successors = new SkipListNode<TKey, TValue>[Height];
+   var i = Height - 1;
+   while (0 <= i)
+   {
+         var current = previous.Successors[i];
+         while (!IsTail(current) && 
+               (
+                  IsLessOrEqualThan(current.Key, key)
+               || current.NextDeleted
+               || ( previous.NextDeleted && i == 0 ) )
+               )
+         {
+            if (previous.NextDeleted && i == 0)
+            {
+               // Запоминаем последний удаленный узел из префикса
+               lastDeleted = current;
+            }
+
+            previous = current;
+            current = previous.Successors[i];
+         }
+
+         predecessors[i] = previous;
+         successors[i] = current;
+         i--;
+   }
+   
+   return ( predecessors, successors, lastDeleted );
+}
 ```
 
 В результате у нас есть 2 массива: `predecessors` и `successors` - предшествующие и последующие узлы для нового узла,
@@ -83,7 +176,54 @@
 В случае, если операция провалилась - повторяем этот этап заново, так как список был изменен (в частности, перед предшественником на 1 уровне параллельно вставили узел)
 
 ```cs
-// TODO: код вставки
+public void Enqueue(TKey key, TValue value)
+{
+   // 1. Аллоцируем память, под узел
+   var height = _random.Next(1, Height);
+
+   var node = new SkipListNode<TKey, TValue>()
+   {
+      Key = key, 
+      Value = value, 
+      Successors = new SkipListNode<TKey, TValue>[height],
+      Inserting = true,
+   };
+   // 2. Находим место, куда нужно вставить элемент
+   var (predecessors, successors, lastDeleted) = GetInsertLocation(key);
+
+   // 3. Пытаемся вставить в список на 1 уровне.
+   //    Эта операция аналогична добавлению узла в сам список
+   while (true)
+   {
+         node.Successors[0] = successors[0];
+         var pred = predecessors[0];
+         
+         // Пытаемся атомарно обновить следующий узел в предыдущем узле
+         var taken = false;
+         pred.UpdateLock.Enter(ref taken);
+         try
+         {
+            if (pred.Successors[0] == successors[0]
+            && !successors[0].NextDeleted)
+            {
+               pred.Successors[0] = node;
+               break;
+            }
+         }
+         finally
+         {
+            if (taken)
+            {
+               pred.UpdateLock.Exit();
+            }
+         }
+
+         // Заново рассчитываем предшественников и последователей
+         ( predecessors, successors, lastDeleted ) = GetInsertLocation(key);
+   }
+
+   // ...
+}
 ```
 
 ### Наращивание высоты
@@ -91,7 +231,7 @@
 Когда узел был успешно добавлен в список, переходим ко 2 этапу - наращивание высоты. 
 Начиная с этого момента, вставляемый узел является полноценным членом списка, поэтому в любой момент может быть удален, либо около него вставлены элементы.
 
-Наращивание высоты происходит так же как и в обычном списке с пропусками снизу вверх (за исключением проверок):
+Наращивание высоты происходит так же как и в обычном списке с пропусками снизу вверх (за исключением дополнительных проверок):
 1. Переходим к очередному уровню `i`
 2. Проверяем, что узел не удален
 3. На новом узле выставляем ссылку на следующий узел на высоте `i` 
@@ -111,7 +251,43 @@
 Может случиться и так, что добавился новый узел с одинаковым ключом, но наш узел еще не до конца добавлен. Я принял решение прекращать добавление новых узлов, так как это проще реализовать. 
 
 ```cs
-// TODO: код вставки
+public void Enqueue(TKey key, TValue value)
+{
+   // ...
+
+   // 4. Постепенно наращиваем высоту вставляемого узла
+   var i = 1;
+   while (i < height)
+   {
+         if (node.NextDeleted
+            || // Узел удален в процессе вставки 
+            successors[i].NextDeleted
+            || // Узел дальше удален, соответсвенно и мы
+            successors[i] == lastDeleted)
+         {
+            // Узел был удален в процессе вставки
+            break;
+         }
+
+         node.Successors[i] = successors[i];
+
+         var old = Interlocked.CompareExchange(ref predecessors[i].Successors[i], node, successors[i]);
+         if (old != successors[i])
+         {
+            // Кто-то другой изменил список, заходим на другой круг
+            ( successors, predecessors, lastDeleted ) = GetInsertLocation(key);
+            if (!ReferenceEquals(predecessors[0], node))
+            {
+               // Если добавлен новый узел
+               break;
+            }
+         }
+
+         i++;
+   }
+
+   node.Inserting = false;
+}
 ```
 
 ## Dequeue
@@ -135,52 +311,204 @@
 В качестве блокировки использую `SpinLock`. Под капотом он использует `Interlocked.CompareExchange`, и так как при захваченной блокировке выполняется только простая проверка с присвоением (сложной логики нет), то (грубо) все действия можно заменить на один `CAS`.
 
 ```cs
-// TODO: код
+public bool TryDequeue(out TKey key, out TValue value)
+{
+   // Текущий первый узел
+   var currentHead = _head.Successors[0];
+   
+   // Запоминаем первый узел, чтобы избежать гонки при удалении старых узлов
+   var observedHead = currentHead;
+   
+   // Количество пройденных удаленных узлов
+   var deletedCount = 0;
+   
+   // Здесь храним новую голову списка, которой заменим старую 
+   var newHead = ( SkipListNode<TKey, TValue>? ) null;
+   
+   while (true)
+   {
+      if (IsTail(currentHead))
+      {
+            key = default!;
+            value = default!;
+            return false;
+      }
+
+      if (currentHead.Inserting && 
+            newHead is null)
+      {
+            newHead = currentHead;
+      }
+
+      if (currentHead.Deleted)
+      {
+            deletedCount++;
+            currentHead = currentHead.Successors[0];
+            continue;
+      }
+
+      // CAS
+      lock (currentHead)
+      {
+         if (!currentHead.Deleted)
+         {
+            currentHead.Deleted = true;
+            deletedCount++;
+            break;
+         }
+      }
+
+      currentHead = currentHead.Successors[0];
+      deletedCount++;
+   }
+
+   // На этом моменте, в currentHead хранится узел, который мы удалили
+   if (deletedCount < _deleteThreshold)
+   {
+      key = currentHead.Key;
+      value = currentHead.Value;
+      return true;
+   }
+
+   // ...
+}
 ```
 
 ### Физическое удаление
 
 Физическое удаление - очищение памяти. В случае управляемого языка, это значит просто удалить все указатели на удаленные узлы, а GC сам очистит память.
-Для оптимизации физическое удаление происходит батчами, т.е. при достижении определенного количества логически удаленных узлов.
+Для оптимизации физическое удаление происходит батчами, т.е. при достижении определенного количества логически удаленных узлов. Размер указывается параметром `DeleteThreshold`
 
 Все логически удаленные узлы формируют префикс и таким образом список можно разделить на 2 части: 
-- Префикс удаленных узлов
-- Список с живыми узлами с неубывающими ключами
+- Префикс из удаленных узлов
+- Список с живыми узлами с неубывающими ключами (сам список с пропусками)
 
 Удаление так же выполняется с помощью `CAS` - старый первый узел меняется новым. 
 Причем новый первый узел должен быть также удаленным, т.е. после первого удаления голова списка всегда будет указывать на удаленный узел. 
-Это нужно для того 
 
 ```cs
-// TODO: код
+public bool TryDequeue(out TKey key, out TValue value)
+{
+   // ...
+
+   // На данный момент, если newHead не null, то содержит узел, который был в процессе вставки в момент обхода.
+   newHead ??= currentHead;
+
+   var updated = false;
+
+   // CAS
+   lock(_head)
+   {
+      if (_head.Successors[0] == observedHead)
+      {
+         _head.Successors[0] = newHead;
+         updated = true;
+      }
+   }
+   
+   if (updated)
+   {
+      RemoveDeletedNodes();
+   }
+
+   key = currentHead.Key;
+   value = currentHead.Value;
+   return true;
+}
+
+/// <summary>
+/// Удалить ссылки на удаленные узлы из головы списка
+/// </summary>
+/// <remarks>
+/// Удаление происходит только на верхних уровнях - первый не затрагивается
+/// </remarks>
+private void RemoveDeletedNodes()
+{
+   var i = Height - 1;
+   var previous = _head;
+   while (i > 0)
+   {
+      // Запоминаем старую голову списка, чтобы при обновлении не задеть новую
+      var savedHead = _head.Successors[i];
+      if (!savedHead.NextDeleted)
+      {
+            i--;
+            continue;
+      }
+      
+      var next = previous.Successors[i];
+
+      // Находим последний удаленный узел
+      while (next.NextDeleted)
+      {
+            previous = next;
+            next = previous.Successors[i];
+      }
+      
+      // Выставляем ссылку на следующий узел у головы списка
+      var old = Interlocked.CompareExchange(ref _head.Successors[i], previous.Successors[i], savedHead);
+      if (old == savedHead)
+      {
+            // Успешно обновили ссылку.
+            // Ссылка могла не обновиться если есть несколько конкурентных операций Restructure,
+            // в таком случае, просто повторяем операцию
+            i--;
+      }
+   }
+}
 ```
 
 # Бенчмарки
 
 Теперь настало время сравнения производительности.
 Для сравнения я использовал очередь с приоритетом из стандартной библиотеки `System.Collections.Generic.PriorityQueue`. 
-Она реализована с помощью 4-арной кучей (вместо 2 потомков - 4). Разбор реализации есть в (этой статье)[https://habr.com/ru/companies/skbkontur/articles/666018/]
 
-Предварительно я добавил пулинг массивов `successors` и `predecessors` при вставке нового элемента.
+Сама очередь реализована с помощью 4-арной кучей (вместо 2 потомков - 4). Разбор реализации есть в [этой статье](https://habr.com/ru/companies/skbkontur/articles/666018/). А блокировка выполнена с помощью `lock`
 
-Параметризация тестов нескольких видов:
-- Количество потоков: 1, 2, 4, 6, 8, 10
-- Стратегия добавляемых ключей: случайные, возрастающие, убывающие
-- Стратегия выполнения операций: вставка/удаления поочередно; сначала вставка всех элементов, затем удаление
-- Количество элементов для добавления: 100000, 500000
+```cs
+public class LockingPriorityQueue<TKey, TValue>
+{
+   private readonly PriorityQueue<TValue, TKey> _queue = new();
 
-Тесты проводились на ноутбуке:
-- AMD Ryzen 5 
-- 16 Гб RAM
+   public void Enqueue(TKey key, TValue value)
+   {
+      lock (_queue)
+      {
+         _queue.Enqueue(value, key);
+      }
+   }
 
+   public bool TryDequeue(out TKey key, out TValue value)
+   {
+      lock (_queue)
+      {
+         return _queue.TryDequeue(out value, out key);
+      }
+   }
+}
+```
+
+Предварительно я добавил пулинг массивов `successors` и `predecessors` при вставке нового элемента. Реализован он с помощью `ConcurrentQueue`
+
+Добавляемые ключи и значения генерируются предварительно. Количество элементов 100000. Во всех тестах используются одни и те же значения, так как ключ генерации одинаков.
+
+Для тестов используются 2 вида поведения:
+- Равномерное: каждый поток, после каждого `Enqueue` вызывает `Dequeue`
+- Сначала вставка, потом удаление: каждый поток сначала добавляет все элементы затем вызывает `Dequeue` столько раз, сколько вызывал `Enqueue`
+
+Параметры стенда:
+- AMD Ryzen 5 6600H, 12 логических и 6 физических ядер
+- 16 Гб ОЗУ
+- .NET 6.0.21
+- Ubuntu 22.04
 
 Результаты представлены на графиках
 
-// TODO: добавить графики
+![График производительности](img/performance-plot.png)
 
 Как видно: моя конкурентная реализация сильно уступает версии с глобальной блокировкой.
 
-Даже когда заменил инстанциирование новых массивов `Successors` на пуллинг, а в версии с глобальной блокировкой заменил `SpinLock`  на `lock` практически ничего не поменялось: даже худшее исполнение глобальной блокировки было лучше конкурентной версии кратно.
+Даже когда заменил инстанциирование новых массивов `Successors` на пуллинг, а в версии с глобальной блокировкой заменил `SpinLock` на `lock` практически ничего не поменялось: даже худшее исполнение глобальной блокировки было лучше конкурентной версии кратно.
 
 # Вывод
 
@@ -188,9 +516,12 @@
 Причиной этому я вижу:
 - Большие накладные расходы на поиск места вставки нового узла и его постоянные вычисления
 - Расходы на аллокации памяти для новых узлов
+- Оптимальная реализация версии из стандартной библиотеки перевешивает затраты на глобальную блокировку
 
-В оригинальной статье приводилось сравнение с другими, уже существующими *конкурентными* реализациями, но сравнения с синхронной под блокировкой не было. Зато она была в статье ... и там, версия Linden сильно обгоняла все остальные. 
-Из этого я делаю вывод, что проблема скорее всего из-за моей неправильной реализации.
+В оригинальной статье приводилось сравнение с другими  *конкурентными* реализациями, но сравнения с синхронной под блокировкой не было. Зато она была в статье [Jakob Gruber](https://arxiv.org/pdf/1509.07053.pdf) и там, версия Linden сильно обгоняла все остальные. 
 
-А пока я не нашел ответа "почему так?" предлагаю использовать обертку с глобальной блокировкой.
+![Сравнение нескольких реализаций](img/comparison-multiple.png)
 
+> В ней использовалась реализация от авторов статьи. Думаю, в их реализации есть оптимизация некоторых моментов, которые я не учел.
+
+Если есть предположения причин подобного, то пишите в комментариях. 
