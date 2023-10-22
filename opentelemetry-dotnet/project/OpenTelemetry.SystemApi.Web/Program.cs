@@ -61,7 +61,8 @@ builder.Services
                     {
                         var assemblyName = typeof(Program).Assembly.GetName();
                         var name = assemblyName.Name!;
-                        var version = assemblyName.Version?.ToString()!;
+                        var version = assemblyName.Version?
+                           .ToString()!;
                         r.AddService(serviceName: name, serviceVersion: version);
                     })
                    .AddSource(Tracing.WebActivitySource.Name);
