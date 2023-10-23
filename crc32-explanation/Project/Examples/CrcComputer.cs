@@ -10,12 +10,12 @@ public static class CrcComputer
     /// <summary>
     /// Изначальное значение регистра для табличной реализации
     /// </summary>
-    public const uint InitialTableRegister = 0xC704DD7B;
+    public const uint InitialOptimizedRegister = 0xC704DD7B;
     
     /// <summary>
     /// Изначальное значение регистра для побайтовой реализации
     /// </summary>
-    public const uint InitialPerByteRegister = 0xFFFFFFFF;
+    public const uint InitialSimpleRegister = 0xFFFFFFFF;
     
     /// <summary>
     /// Полином
@@ -49,7 +49,7 @@ public static class CrcComputer
 
     public static uint ComputePerBit(byte[] payload)
     {
-        var register = InitialPerByteRegister;
+        var register = InitialSimpleRegister;
         
         foreach (var bit in IterateBits())
         {
@@ -93,7 +93,7 @@ public static class CrcComputer
 
     public static uint ComputeTableSimple(byte[] payload)
     {
-        var register = InitialPerByteRegister;
+        var register = InitialSimpleRegister;
 
         foreach (var b in payload)
         {
@@ -110,11 +110,29 @@ public static class CrcComputer
 
     public static uint ComputeTableOptimized(byte[] payload)
     {
-        var register = InitialTableRegister;
+        var register = InitialOptimizedRegister;
 
         foreach (var b in payload)
         {
             register = ( register << 8 ) ^ Table[( register >> 24 ) ^ b];
+        }
+        
+        return register;
+    }
+
+    public static uint ComputeNewTableValue(uint oldInitialValue)
+    {
+        var register = oldInitialValue;
+        
+        // Обрабатываем нулевые биты сообщения (дополненные)
+        for (var i = 0; i < 32; i++)
+        {
+            var bitSet = ( register & 0x80000000 ) != 0;
+            register <<= 1;
+            if (bitSet)
+            {
+                register ^= Polynomial;
+            }
         }
         
         return register;
