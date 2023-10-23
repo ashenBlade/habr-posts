@@ -124,7 +124,8 @@ public static class CrcComputer
     {
         var register = oldInitialValue;
         
-        // Обрабатываем нулевые биты сообщения (дополненные)
+        // Используем побитовое, т.к. вычислить можно в compile time
+        // Не делаю оптимизацию, чтобы было лучше понятно как работает
         for (var i = 0; i < 32; i++)
         {
             var bitSet = ( register & 0x80000000 ) != 0;
