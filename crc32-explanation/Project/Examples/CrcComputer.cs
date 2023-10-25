@@ -47,13 +47,14 @@ public static class CrcComputer
         return table;
     }
 
-    public static uint ComputePerBit(byte[] payload)
+    public static byte ComputePerBit(byte[] payload)
     {
-        var register = InitialSimpleRegister;
-        
+        // var register = InitialSimpleRegister;
+        var register = (byte) 0;
+        var Polynomial = ( byte ) 0b00101101;
         foreach (var bit in IterateBits())
         {
-            var bitSet = ( register & 0x80000000 ) != 0;
+            var bitSet = ( register & 0x80 ) != 0;
             register <<= 1;
             register |= bit;
             if (bitSet)
@@ -63,9 +64,9 @@ public static class CrcComputer
         }
         
         // Обрабатываем нулевые биты сообщения (дополненные)
-        for (var i = 0; i < 32; i++)
+        for (var i = 0; i < 8; i++)
         {
-            var bitSet = ( register & 0x80000000 ) != 0;
+            var bitSet = ( register & 0x80 ) != 0;
             register <<= 1;
             // Дальше идут только 0
             // register |= bitSet;
@@ -77,15 +78,15 @@ public static class CrcComputer
         
         return register;
 
-        IEnumerable<uint> IterateBits()
+        IEnumerable<byte> IterateBits()
         {
             foreach (var b in payload)
             {
                 for (byte byteMask = 0b10000000; byteMask != 0; byteMask >>= 1)
                 {
-                    yield return ( b & byteMask ) == 0 
-                                     ? 0u
-                                     : 1u;
+                    yield return (byte)( ( b & byteMask ) == 0
+                                       ? 0
+                                       : 1 );
                 }
             }
         }
