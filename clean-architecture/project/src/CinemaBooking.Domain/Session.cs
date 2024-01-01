@@ -173,7 +173,10 @@ public class Session
     }
 
     /// <summary>
-    /// Посетитель, который бронирует место 
+    /// Реализация <see cref="ISeatVisitor{T}"/>, который бронирует место.
+    /// Возвращает:
+    /// - Новый объект, если место было забронировано,
+    /// - null - если место уже было забронировано этим же посетителем ранее
     /// </summary>
     private class BookingSeatVisitor : ISeatVisitor<BookedSeat?>
     {

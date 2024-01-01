@@ -1,11 +1,12 @@
 namespace CinemaBooking.Domain;
 
-public class BookingService: IBookingService
+public class SeatService: ISeatService
 {
     private readonly ISessionRepository _sessionRepository;
 
-    public BookingService(ISessionRepository sessionRepository)
+    public SeatService(ISessionRepository sessionRepository)
     {
+        ArgumentNullException.ThrowIfNull(sessionRepository);
         _sessionRepository = sessionRepository;
     }
     

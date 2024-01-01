@@ -10,24 +10,24 @@ namespace CinemaBooking.WebApi.Controllers;
 [DomainExceptionFilter]
 public class SessionsController: ControllerBase
 {
-    private readonly IBookingService _bookingService;
+    private readonly ISeatService _seatService;
 
-    public SessionsController(IBookingService bookingService)
+    public SessionsController(ISeatService seatService)
     {
-        _bookingService = bookingService;
+        _seatService = seatService;
     }
 
     [HttpPut("{sessionId:int}/places/{placeId:int}/book")]
     public async Task<IActionResult> BookSeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
     {
-        await _bookingService.BookSeatAsync(sessionId, placeId, userId, token);
+        await _seatService.BookSeatAsync(sessionId, placeId, userId, token);
         return Ok();
     }
     
     [HttpPut("{sessionId:int}/places/{placeId:int}/buy")]
     public async Task<IActionResult> BuySeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
     {
-        await _bookingService.BuySeatAsync(sessionId, placeId, userId, token);
+        await _seatService.BuySeatAsync(sessionId, placeId, userId, token);
         return Ok();
     }
 }

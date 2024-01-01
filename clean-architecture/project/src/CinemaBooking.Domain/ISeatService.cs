@@ -3,7 +3,7 @@ namespace CinemaBooking.Domain;
 /// <summary>
 /// Сервис для бронирования и покупки мест в кинотеатре
 /// </summary>
-public interface IBookingService
+public interface ISeatService
 {
     /// <summary>
     /// Забронировать место для указанного сеанса

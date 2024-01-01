@@ -25,7 +25,7 @@ builder.Services
        .AddScoped<ISessionRepository, PostgresSessionRepository>();
 
 builder.Services
-       .AddScoped<IBookingService>(sp => new BookingService(sp.GetRequiredService<ISessionRepository>()));
+       .AddScoped<ISeatService>(sp => new SeatService(sp.GetRequiredService<ISessionRepository>()));
 
 var app = builder.Build();
 

@@ -2,6 +2,15 @@ namespace CinemaBooking.Domain;
 
 public class SessionInterval
 {
+    /// <summary>
+    /// Время начала сеанса
+    /// </summary>
+    public DateTime Start { get; }
+    
+    /// <summary>
+    /// Время окончания сеанса
+    /// </summary>
+    public DateTime End { get; }
     public SessionInterval(DateTime start, DateTime end)
     {
         if (end <= start)
@@ -13,7 +22,4 @@ public class SessionInterval
         Start = start;
         End = end;
     }
-
-    public DateTime Start { get; }
-    public DateTime End { get; }
 }
