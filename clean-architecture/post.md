@@ -43,14 +43,6 @@ TODO: показать диаграмму + пояснить, что там пр
 
 ## Предметная область
 
-Каждый создаст свою чистую архитектуру (и у каждого будет правильная)
-
-Пример - бронирование мест в кинотеатре
-
-Сказать что это разбиение horizontal slices, а есть еще  vertical slices + ссылка на статью какую-нибудь (для микросервисов сойдет)
-
----
-
 Чтобы стало понятнее, создадим свой проект, используя идею чистой архитектуры.
 В качестве предметной области выберем бронирование билетов в кинотеатре.
 
@@ -498,7 +490,162 @@ class SeatService
 
 ## Работаем с внешним миром
 
+### Хранилище
 
+Бизнес-логика реализована. 
+Теперь уже стоит подумать как мы будем работать с внешним миром.
+
+Для нас это означает 1 вещь - реализация `ISessionRepository`.
+По требованиям мы должны хранить данные в БД, поэтому и реализация будет ее использовать.
+
+Во-первых, надо разработать схему того, как эти данные будут храниться в БД.
+Я использую ORM (Entity Framework), поэтому покажу в виде классов.
+
+> Для разграничения доменных моделей и моделей БД использую префикс `Database`
+
+```csharp
+public class DatabaseSession
+{
+    public int Id { get; set; }
+    public DateTime Start { get; set; }
+    public DateTime End { get; set; }
+    public int MovieId { get; set; }
+    public ICollection<DatabaseSeat> Seats { get; set; } 
+}
+
+public class DatabaseSeat
+{
+    public int SessionId { get; set; }
+    public DatabaseSession Session { get; set; }
+    public int Number { get; set; }
+    public SeatType Type { get; set; }
+    public int? ClientId { get; set; }
+}
+```
+
+Здесь можно заметить разницу:
+- Модель места такая же как и показывалась ранее - денормализованная и хранит ссылку на сеанс, которому принадлежит;
+- Интервал сеанса хранится не как доменный объект, а в виде 2 дат - начала и окончания.
+
+Теперь перейдем к самому хранилищу сеансов и мест `ISessionRepository`.
+
+```csharp
+public class PostgresSessionRepository: ISessionRepository
+{
+    private readonly SessionDbContext _context;
+
+    public PostgresSessionRepository(SessionDbContext context)
+    {
+        _context = context;
+    }
+    
+    public async Task<Session> GetSessionByIdAsync(int sessionId, CancellationToken token)
+    {
+        var found = await _context.Sessions
+                                  .AsNoTracking()
+                                  .Include(s => s.Seats)
+                                  .FirstOrDefaultAsync(s => s.Id == sessionId, token);
+        if (found is null)
+        {
+            throw new SessionNotFoundException(sessionId);
+        }
+
+        var interval = new SessionInterval(found.Start, found.End);
+        var seats = found.Seats.Select(seat => seat.ToDomainSeat());
+        return new Session(interval, found.MovieId, seats);
+    }
+    
+    public async Task UpdateSeatAsync(int sessionId, Seat seat, CancellationToken token)
+    {
+        var databaseSeat = seat.Accept(new DatabaseSeatMapperSeatVisitor(sessionId));
+        var updated = await _context.Seats
+                                    .Where(s => s.SessionId == sessionId && s.Number == seat.Number)
+                                    .ExecuteUpdateAsync(calls => calls.SetProperty(s => s.ClientId, databaseSeat.ClientId)
+                                                                      .SetProperty(s => s.Type, databaseSeat.Type), token);
+        if (updated == 0)
+        {
+            throw new SessionNotFoundException(sessionId);
+        }
+    }
+}
+```
+
+Единственная обязанность хранилища - маппинг объектов.
+Никакой бизнес-логики в нем не содержится.
+
+TODO: ссылка на папку с реализацией
+
+### Пользуемся
+
+На последнее я оставил то, как пользователь будет взаимодействовать с нашей системой.
+Выбирать мы можем любой способ - бизнес-логика ничего не знает о UI слое.
+
+Представим, что мы делаем REST API. 
+Тогда реализация будет примерно следующей.
+
+```csharp
+[ApiController]
+[Route("sessions")]
+public class SessionsController: ControllerBase
+{
+    private readonly ISeatService _seatService;
+
+    public SessionsController(ISeatService seatService)
+    {
+        _seatService = seatService;
+    }
+
+    [HttpPut("{sessionId:int}/places/{placeId:int}/book")]
+    public async Task<IActionResult> BookSeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
+    {
+        await _seatService.BookSeatAsync(sessionId, placeId, userId, token);
+        return Ok();
+    }
+    
+    [HttpPut("{sessionId:int}/places/{placeId:int}/buy")]
+    public async Task<IActionResult> BuySeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
+    {
+        await _seatService.BuySeatAsync(sessionId, placeId, userId, token);
+        return Ok();
+    }
+}
+```
+
+Вот и все - нам достаточно только получить этот `ISeatService` и вызвать нужный Use Case/Метод.
+
+Осталось подумать, что делать с доменными исключениями. 
+Можно в каждом методе контроллера прописывать `try/catch` блок, но я воспользуюсь возможностями ASP.NET Core и создам фильтр исключений.
+
+```csharp
+class DomainExceptionFilterAttribute: ExceptionFilterAttribute
+{
+    public override void OnException(ExceptionContext context)
+    {
+        if (context.Exception is not DomainException domainException)
+        {
+            return;
+        }
+    
+        var responseObject = new {message = domainException.Message};
+        context.Result = domainException switch
+                         {
+                             SeatNotFoundException    => new NotFoundObjectResult(responseObject),
+                             SessionNotFoundException => new NotFoundObjectResult(responseObject),
+                             _                        => new BadRequestObjectResult(responseObject)
+                         };
+    
+        context.ExceptionHandled = true;
+    }
+}
+
+[DomainExceptionFilter]
+public class SessionsController: ControllerBase
+{
+    // ...
+}
+```
+
+Вот и все приложение готово!
 
 # Тестирование
 
@@ -506,11 +653,130 @@ class SeatService
 
 > Все ниже можно в виде `Фичи/А зачем это все нужно` секции офомить с подпунктами
 
+Теперь перейдем к фичам и замечаниями, которые ранее были опущены. 
+Начнем с тестирования.
+
+Хочется отметить, то что теперь бизнес-логика прекрасно тестируется - никаких внешних зависимостей делать не нужно, просто создадим моки.
+
+Для примера, напишем тест на бронирования места.
+
+```csharp
+public class SeatServiceTests
+{
+    private static readonly SessionInterval StubInterval = new(new DateTime(2022, 1, 1), new DateTime(2022, 2, 1));
+    private static readonly SeatEqualityComparer SeatComparer = new();
+    
+    [Fact]
+    public async Task BookSeatAsync__WhenSeatIsFree__ShouldMarkSeatBooked()
+    {
+        var (sessionId, seatNumber, movieId, clientId) = ( 1, 1, 1, 2 );
+        var expectedSeat = new BookedSeat(seatNumber, clientId); 
+        var session = new Session(sessionId, StubInterval, movieId, new[] {new FreeSeat(seatNumber)});
+        var sessionRepo = new StubSessionRepository(new[] {session});
+        var service = new SeatService(sessionRepo);
+
+        var actual = await service.BookSeatAsync(sessionId, seatNumber, clientId);
+        
+        Assert.Equal(expectedSeat, actual, SeatComparer);
+    }
+
+    [Fact]
+    public async Task BookSeatAsync__WhenSeatIsBought__ShouldThrowSeatBoughtException()
+    {
+        var (sessionId, seatNumber, movieId, clientId, boughtClientId) = ( 1, 1, 1, 2, 10 );
+        var session = new Session(sessionId, StubInterval, movieId, new[] {new BoughtSeat(seatNumber, boughtClientId)});
+        var sessionRepo = new StubSessionRepository(new[] {session});
+        var service = new SeatService(sessionRepo);
+
+        await Assert.ThrowsAnyAsync<SeatBoughtException>(() => service.BookSeatAsync(sessionId, seatNumber, clientId));
+    }
+
+    [Fact]
+    public async Task BookSeatAsync__WhenSeatIsBought__ShouldSpecifyCorrectClientIdInException()
+    {
+        var (sessionId, seatNumber, movieId, clientId, boughtClientId) = ( 1, 1, 1, 2, 10 );
+        var session = new Session(sessionId, StubInterval, movieId, new[] {new BoughtSeat(seatNumber, boughtClientId)});
+        var sessionRepo = new StubSessionRepository(new[] {session});
+        var service = new SeatService(sessionRepo);
+
+        var exception = (SeatBoughtException) ( await Record.ExceptionAsync(() => service.BookSeatAsync(sessionId, seatNumber, clientId)) )!;
+        Assert.Equal(boughtClientId, exception.ClientId);
+    }
+}
+```
+
+> Замечание: не вся бизнес-логика теперь находится в наших руках. 
+> Например, гораздо более эффективно отслеживать дублирование Id в самом хранилище, нежели загружать все данные в память,
+> поэтому нормально часть логики вынести в эти сервисы, которые являются адаптерами к внешнему миру.
+> В данном случае, `ISessionRepository` может кинуть `SessionNotFoundException`, если нужного сеанса не нашлось.
+> Согласитесь, это лучше, чем загружать всю БД в память, верно?
+
 # Декораторы
 
-Метрики, логирование, трейсинг
+Объекты в доменном проекте не имеют лишних, внешних зависимостей: никакого логирования, трейсинга, аудита, сбора метрик и т.д.
 
-Выделяем интерфейсы даже там где не надо
+Но подключать эти зависимости к доменному проекту нельзя, вместо них мы можем использовать декораторы.
+Алгоритм выглядит так:
+1. Выделить места, где необходимо добавить функциональность;
+2. При необходимости выделить отдельные объекты для них;
+3. Вынести эту функциональность в интерфейсы;
+4. Вместо самостоятельного создания этих объектов и использования конкретных классов - внедрение зависимостей выделенных интерфейсов.
+
+Для примера, добавим сбор метрик приложения:
+- Количество купленных мест
+- Количество забронированных мест
+
+TODO: ссылка на этот проект
+
+```csharp
+public static class MetricsRegistry
+{
+    public static readonly Meter AppMeter = new Meter("CinemaBooking", "1.0.0");
+    public static readonly Counter<long> BoughtSeatsCount = AppMeter.CreateCounter<long>(
+        name: "seats-bought-count",
+        unit: null,
+        description: "Количество купленных мест");
+
+    public static readonly Counter<long> BookedSeatsCount = AppMeter.CreateCounter<long>(
+        name: "booked-seats-count",
+        unit: null,
+        description: "Количество забронированных мест"); 
+}
+
+public class MetricScrapperSeatService: ISeatService
+{
+    private readonly ISeatService _service;
+
+    public MetricScrapperSeatService(ISeatService service)
+    {
+        _service = service;
+    }
+
+    public async Task<BookedSeat> BookSeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
+    {
+        var booked = await _service.BookSeatAsync(sessionId, place, clientId, token);
+        MetricsRegistry.BookedSeatsCount.Add(1);
+        return booked;
+    }
+
+    public async Task<BoughtSeat> BuySeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
+    {
+        var bought = await _service.BuySeatAsync(sessionId, place, clientId, token);
+        MetricsRegistry.BoughtSeatsCount.Add(1);
+        return bought;
+    }
+}
+```
+
+# Можно разные эндпоинты подключать быстро
+
+Для примера, мы использовали только HTTP Rest интерфейс. Но не вебом едины. Есть и другие интерфейсы входа.
+
+Для начала попробуем добавить gRPC интерфейс.
+
+HTTP + gRPC изи добавлять
+
+Под каждый Use Case свой метод - оптимально используем логику
 
 # Не люблю Repository\<T>
 
@@ -524,11 +790,6 @@ class SeatService
 
 Обрабатываем happy path, а исключения бизнес-логики превратить в Dto с помощью ExceptionFilter
 
-# Можно разные эндпоинты подключать быстро
-
-HTTP + gRPC изи добавлять
-
-Под каждый Use Case свой метод - оптимально используем логику
 
 # Сравнение в другими подходами
 

@@ -1,0 +1,36 @@
+syntax = 'proto3';
+
+option csharp_namespace = "CinemaBooking.Grpc";
+
+enum OperationResultCode {
+  Ok = 0;
+  SessionNotFound = 1;
+  SeatNotFound = 2;
+  SeatBooked = 3;
+  SeatBought = 4;
+}
+
+message BookRequest {
+  int32 sessionId = 1;
+  int32 seatNumber = 2;
+  int32 userId = 3;
+}
+
+message BookResponse {
+  OperationResultCode resultCode = 1;
+}
+
+message BuyRequest {
+  int32 sessionId = 1;
+  int32 seatNumber = 2;
+  int32 userId = 3;
+}
+
+message BuyResponse {
+  OperationResultCode resultCode = 1;
+} 
+
+service SeatService {
+  rpc BookSeat(BookRequest) returns (BookResponse);
+  rpc BuySeat(BuyRequest) returns (BuyResponse);
+}

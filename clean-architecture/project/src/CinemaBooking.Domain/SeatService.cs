@@ -10,21 +10,19 @@ public class SeatService: ISeatService
         _sessionRepository = sessionRepository;
     }
     
-    public async Task BookSeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
+    public async Task<BookedSeat> BookSeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
     {
         var session = await _sessionRepository.GetSessionByIdAsync(sessionId, token);
-        if (session.TryBook(place, clientId, out var bookedSeat))
-        { 
-            await _sessionRepository.UpdateSeatAsync(sessionId, bookedSeat, token);
-        }
+        var bookedSeat = session.Book(place, clientId);
+        await _sessionRepository.UpdateSeatAsync(sessionId, bookedSeat, token);
+        return bookedSeat;
     }
 
-    public async Task BuySeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
+    public async Task<BoughtSeat> BuySeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
     {
         var session = await _sessionRepository.GetSessionByIdAsync(sessionId, token);
-        if (session.TryBuy(place, clientId, out var boughtSeat))
-        {
-            await _sessionRepository.UpdateSeatAsync(sessionId, boughtSeat, token);
-        }
+        var boughtSeat = session.Buy(place, clientId);
+        await _sessionRepository.UpdateSeatAsync(sessionId, boughtSeat, token);
+        return boughtSeat;
     }
 }

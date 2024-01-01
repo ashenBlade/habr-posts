@@ -26,34 +26,19 @@ public class PostgresSessionRepository: ISessionRepository
 
         var interval = new SessionInterval(found.Start, found.End);
         var seats = found.Seats.Select(seat => seat.ToDomainSeat());
-        return new Session(interval, found.MovieId, seats);
+        return new Session(found.Id, interval, found.MovieId, seats);
     }
     
     public async Task UpdateSeatAsync(int sessionId, Seat seat, CancellationToken token = default)
     {
-        var found = await _context.Sessions
-                                  .Include(s => s.Seats)
-                                  .FirstOrDefaultAsync(s => s.Id == sessionId, token);
-        if (found is null)
+        var databaseSeat = seat.Accept(new DatabaseSeatMapperSeatVisitor(sessionId));
+        var updated = await _context.Seats
+                                    .Where(s => s.SessionId == sessionId && s.Number == seat.Number)
+                                    .ExecuteUpdateAsync(calls => calls.SetProperty(s => s.ClientId, databaseSeat.ClientId)
+                                                                      .SetProperty(s => s.Type, databaseSeat.Type), token);
+        if (updated == 0)
         {
             throw new SessionNotFoundException(sessionId);
         }
-
-        var databaseSeat = seat.Accept(new DatabaseSeatMapperSeatVisitor(sessionId));
-        
-        var existingSeat = found.Seats.FirstOrDefault(s => s.Number == seat.Number);
-        if (existingSeat is null)
-        {
-            found.Seats.Add(databaseSeat);
-        }
-        else
-        {
-            existingSeat.Type = databaseSeat.Type;
-            existingSeat.ClientId = databaseSeat.ClientId;
-            existingSeat.SessionId = databaseSeat.SessionId;
-            existingSeat.Number = databaseSeat.Number;
-        }
-
-        await _context.SaveChangesAsync(token);
     }
 }

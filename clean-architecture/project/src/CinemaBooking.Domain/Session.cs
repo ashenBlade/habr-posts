@@ -1,15 +1,15 @@
-using System.Data;
 using CinemaBooking.Domain.Exceptions;
 
 namespace CinemaBooking.Domain;
 
 public class Session
 {
-    public Session(SessionInterval interval, int movieId, IEnumerable<Seat> seats)
+    public Session(int id, SessionInterval interval, int movieId, IEnumerable<Seat> seats)
     {
         ArgumentNullException.ThrowIfNull(interval);
         ArgumentNullException.ThrowIfNull(seats);
-        
+
+        Id = id;
         Interval = interval;
         MovieId = movieId;
         _seats = BuildSeatsArray(seats);
@@ -28,6 +28,11 @@ public class Session
 
         return array;
     }
+
+    /// <summary>
+    /// Идентификатор сеанса
+    /// </summary>
+    public int Id { get; }
 
     /// <summary>
     /// Промежуток времени, занимаемый сеансом.
@@ -52,25 +57,17 @@ public class Session
     /// </summary>
     /// <param name="place">Место, которое нужно купить</param>
     /// <param name="clientId">Клиент, которому нужно купить место</param>
-    /// <param name="boughtSeat">Купленное новое место, иначе null</param>
     /// <returns><c>true</c> - место было куплено, <c>false</c> - место УЖЕ было куплено этим клиентом</returns>
     /// <exception cref="SeatNotFoundException">Место с указанным номером не найдено</exception>
     /// <exception cref="SeatBoughtException">Указанное место куплено другим посетителем</exception>
     /// <exception cref="SeatBookedException">Указанное место забронировано другим посетителем</exception>
-    public bool TryBuy(int place, int clientId, out BoughtSeat boughtSeat)
+    public BoughtSeat Buy(int place, int clientId)
     {
         var (seat, index) = FindSeatByPlace(place);
 
         var visitor = new BuyingSeatVisitor(clientId, index, this);
 
-        if (seat.Accept(visitor) is {} b)
-        {
-            boughtSeat = b;
-            return true;
-        }
-
-        boughtSeat = default!;
-        return false;
+        return seat.Accept(visitor);
     }
 
     /// <summary>
@@ -94,7 +91,7 @@ public class Session
     /// <summary>
     /// Посетитель, который покупает место для указанного клиента
     /// </summary>
-    private class BuyingSeatVisitor : ISeatVisitor<BoughtSeat?>
+    private class BuyingSeatVisitor : ISeatVisitor<BoughtSeat>
     {
         /// <summary>
         /// Клиент, на которого нужно оформить место
@@ -118,24 +115,19 @@ public class Session
             Parent = parent;
         }
         
-        public BoughtSeat? Visit(FreeSeat freeSeat)
+        public BoughtSeat Visit(FreeSeat freeSeat)
         {
             var seat = new BoughtSeat(freeSeat.Number, ClientId);
             Parent._seats[Index] = seat;
             return seat;
         }
 
-        public BoughtSeat? Visit(BoughtSeat boughtSeat)
+        public BoughtSeat Visit(BoughtSeat boughtSeat)
         {
-            if (boughtSeat.ClientId == ClientId)
-            {
-                return null;
-            }
-
             throw new SeatBoughtException(boughtSeat.ClientId);
         }
 
-        public BoughtSeat? Visit(BookedSeat bookedSeat)
+        public BoughtSeat Visit(BookedSeat bookedSeat)
         {
             if (bookedSeat.ClientId == ClientId)
             {
@@ -153,23 +145,15 @@ public class Session
     /// </summary>
     /// <param name="place">Место, которое нужно забронировать</param>
     /// <param name="clientId">Клиент, за которым нужно забронировать место</param>
-    /// <param name="bookedSeat">Новое забронированное место</param>
     /// <returns><c>true</c> - место забронировано, <c>false</c> - место уже было забронировано этим клиентом</returns>
     /// <exception cref="SeatNotFoundException">Место с указанным номером не найдено</exception>
     /// <exception cref="SeatBoughtException">Указанное место уже куплено, возможно, этим же самым посетителем</exception>
     /// <exception cref="SeatBookedException">Указанное место забронировано другим посетителем</exception>
-    public bool TryBook(int place, int clientId, out BookedSeat bookedSeat)
+    public BookedSeat Book(int place, int clientId)
     {
         var (seat, index) = FindSeatByPlace(place);
         var visitor = new BookingSeatVisitor(this, index, clientId);
-        if (seat.Accept(visitor) is {} s)
-        {
-            bookedSeat = s;
-            return true;
-        }
-
-        bookedSeat = default!;
-        return false;
+        return seat.Accept(visitor);
     }
 
     /// <summary>
@@ -178,7 +162,7 @@ public class Session
     /// - Новый объект, если место было забронировано,
     /// - null - если место уже было забронировано этим же посетителем ранее
     /// </summary>
-    private class BookingSeatVisitor : ISeatVisitor<BookedSeat?>
+    private class BookingSeatVisitor : ISeatVisitor<BookedSeat>
     {
         /// <summary>
         /// Сеанс, который мы обслуживаем
@@ -200,25 +184,20 @@ public class Session
             ClientId = clientId;
         }
         
-        public BookedSeat? Visit(FreeSeat freeSeat)
+        public BookedSeat Visit(FreeSeat freeSeat)
         {
             var bookedSeat = new BookedSeat(freeSeat.Number, ClientId);
             Parent._seats[Index] = bookedSeat;
             return bookedSeat;
         }
 
-        public BookedSeat? Visit(BoughtSeat boughtSeat)
+        public BookedSeat Visit(BoughtSeat boughtSeat)
         {
             throw new SeatBoughtException(boughtSeat.ClientId);
         }
 
-        public BookedSeat? Visit(BookedSeat bookedSeat)
+        public BookedSeat Visit(BookedSeat bookedSeat)
         {
-            if (bookedSeat.ClientId == ClientId)
-            {
-                return null;
-            }
-
             throw new SeatBookedException(bookedSeat.ClientId);
         }
     }
