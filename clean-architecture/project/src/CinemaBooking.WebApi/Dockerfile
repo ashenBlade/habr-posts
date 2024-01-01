@@ -9,6 +9,9 @@ WORKDIR /src
 COPY ["CinemaBooking.Domain/CinemaBooking.Domain.csproj", "CinemaBooking.Domain/"]
 COPY ["CinemaBooking.Services/CinemaBooking.Services.csproj", "CinemaBooking.Services/"]
 COPY ["CinemaBooking.WebApi/CinemaBooking.WebApi.csproj", "CinemaBooking.WebApi/"]
+COPY ["CinemaBooking.Grpc/CinemaBooking.Grpc.csproj", "CinemaBooking.Grpc/"]
+COPY ["CinemaBooking.Infrastructure/CinemaBooking.Infrastructure.csproj", "CinemaBooking.Infrastructure/"]
+
 RUN dotnet restore "CinemaBooking.WebApi/CinemaBooking.WebApi.csproj"
 COPY . .
 WORKDIR "/src/CinemaBooking.WebApi"

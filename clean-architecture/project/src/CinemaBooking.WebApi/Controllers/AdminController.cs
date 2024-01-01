@@ -1,4 +1,6 @@
+using System.ComponentModel.DataAnnotations;
 using CinemaBooking.Services.SessionRepository;
+using CinemaBooking.WebApi.Specifications;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -52,5 +54,14 @@ public class AdminController: ControllerBase
         {
             return NotFound();
         }
+    }
+
+    [HttpGet("sessions/unvisited")]
+    public async Task<IActionResult> GetUnvisitedSessions([FromQuery][Required] int days, CancellationToken token)
+    {
+        var response = await _context.Sessions
+                                     .Where(SessionSpecifications.LastDays(days).And(SessionSpecifications.AllFreeSeats()))
+                                     .ToListAsync(token);
+        return Ok(response);
     }
 }

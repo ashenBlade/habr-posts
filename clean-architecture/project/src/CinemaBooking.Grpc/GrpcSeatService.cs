@@ -15,58 +15,39 @@ public class GrpcSeatService: SeatService.SeatServiceBase
     
     public override async Task<BookResponse> BookSeat(BookRequest request, ServerCallContext context)
     {
-        OperationResultCode code;
-        try
-        {
-            await _service.BookSeatAsync(request.SessionId, request.SeatNumber, request.UserId,
-                context.CancellationToken);
-            code = OperationResultCode.Ok;
-        }
-        catch (SessionNotFoundException)
-        {
-            code = OperationResultCode.SessionNotFound;
-        }
-        catch (SeatNotFoundException)
-        {
-            code = OperationResultCode.SeatNotFound;
-        }
-        catch (SeatBoughtException)
-        {
-            code = OperationResultCode.SeatBought;
-        }
-        catch (SeatBookedException)
-        {
-            code = OperationResultCode.SeatBought;
-        }
-
+        var code = await ExecuteGetResultCodeAsync(t => _service.BookSeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
         return new BookResponse() {ResultCode = code};
     }
 
     public override async Task<BuyResponse> BuySeat(BuyRequest request, ServerCallContext context)
     {
-        OperationResultCode code;
+        var code = await ExecuteGetResultCodeAsync(t => _service.BuySeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
+        return new BuyResponse() {ResultCode = code};
+    }
+
+    private static async Task<OperationResultCode> ExecuteGetResultCodeAsync(Func<CancellationToken, Task> code, CancellationToken token)
+    {
         try
         {
-            await _service.BuySeatAsync(request.SessionId, request.SeatNumber, request.UserId, context.CancellationToken);
-            code = OperationResultCode.Ok;
+            await code(token);
+            return OperationResultCode.Ok;
         }
         catch (SessionNotFoundException)
         {
-            code = OperationResultCode.SessionNotFound;
+            return OperationResultCode.SessionNotFound;
         }
         catch (SeatNotFoundException)
         {
-            code = OperationResultCode.SeatNotFound;
+            return OperationResultCode.SeatNotFound;
         }
         catch (SeatBoughtException)
         {
-            code = OperationResultCode.SeatBought;
+            return OperationResultCode.SeatBought;
         }
         catch (SeatBookedException)
         {
-            code = OperationResultCode.SeatBought;
+            return OperationResultCode.SeatBought;
         }
 
-        return new BuyResponse() {ResultCode = code};
     }
 }

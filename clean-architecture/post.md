@@ -772,33 +772,336 @@ public class MetricScrapperSeatService: ISeatService
 
 Для примера, мы использовали только HTTP Rest интерфейс. Но не вебом едины. Есть и другие интерфейсы входа.
 
-Для начала попробуем добавить gRPC интерфейс.
+## gRPC интерфейс
 
-HTTP + gRPC изи добавлять
+Сперва, попробуем добавить gRPC интерфейс.
+Для этого добавим отдельный проект, в котором реализуем всю нужную функциональность.
 
-Под каждый Use Case свой метод - оптимально используем логику
+Вначале, сам proto файл:
+```protobuf
+syntax = 'proto3';
 
-# Не люблю Repository\<T>
+option csharp_namespace = "CinemaBooking.Grpc";
 
-Каждый делает базовый, который нужно переопределять
+enum OperationResultCode {
+   Ok = 0;
+   SessionNotFound = 1;
+   SeatNotFound = 2;
+   SeatBooked = 3;
+   SeatBought = 4;
+}
 
-Лучше делать для каждого свой со своими методами
+message BookRequest {
+   int32 sessionId = 1;
+   int32 seatNumber = 2;
+   int32 userId = 3;
+}
 
-Если хочешь - спецификация (паттерн)
+message BookResponse {
+   OperationResultCode resultCode = 1;
+}
 
-# Доменные исключения превращаются в Dto
+message BuyRequest {
+   int32 sessionId = 1;
+   int32 seatNumber = 2;
+   int32 userId = 3;
+}
 
-Обрабатываем happy path, а исключения бизнес-логики превратить в Dto с помощью ExceptionFilter
+message BuyResponse {
+   OperationResultCode resultCode = 1;
+}
 
+service SeatService {
+   rpc BookSeat(BookRequest) returns (BookResponse);
+   rpc BuySeat(BuyRequest) returns (BuyResponse);
+}
+```
 
-# Сравнение в другими подходами
+А теперь сгенерируем все нужные классы и реализуем наш сервис.
 
-DDD (анемичные и богатые модели, отражение предметной области)
+```csharp
+public class GrpcSeatService: SeatService.SeatServiceBase
+{
+    private readonly ISeatService _service;
 
-CQRS (медиатр) - можно и через него, но описать мой кейс когда было лишним
+    public GrpcSeatService(ISeatService service)
+    {
+        _service = service;
+    }
+    
+    public override async Task<BookResponse> BookSeat(BookRequest request, ServerCallContext context)
+    {
+        var code = await ExecuteGetResultCodeAsync(t => _service.BookSeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
+        return new BookResponse() {ResultCode = code};
+    }
+
+    public override async Task<BuyResponse> BuySeat(BuyRequest request, ServerCallContext context)
+    {
+        var code = await ExecuteGetResultCodeAsync(t => _service.BuySeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
+        return new BuyResponse() {ResultCode = code};
+    }
+
+    private static async Task<OperationResultCode> ExecuteGetResultCodeAsync(Func<CancellationToken, Task> code, CancellationToken token)
+    {
+        try
+        {
+            await code(token);
+            return OperationResultCode.Ok;
+        }
+        catch (SessionNotFoundException)
+        {
+            return OperationResultCode.SessionNotFound;
+        }
+        catch (SeatNotFoundException)
+        {
+            return OperationResultCode.SeatNotFound;
+        }
+        catch (SeatBoughtException)
+        {
+            return OperationResultCode.SeatBought;
+        }
+        catch (SeatBookedException)
+        {
+            return OperationResultCode.SeatBought;
+        }
+    }
+}
+```
+
+Вот gRPC и добавили - без лишней мороки.
+
+## Консольное приложение
+
+А теперь попробуем что-нибудь посложнее.
+Представим, что мы захотели автоматизировать работу и нужно создать консольное приложение.
+Тут тоже ничего сложного не будет: все что нам нужно - доменная сборка и реализация сервисов. 
+Всего 2 зависимости.
+
+```csharp
+// Main
+var arguments = CommandLineArguments.FromCommandLineArguments(args);
+
+await using var database = GetDatabaseConnection();
+var repo = new PostgresSessionRepository(database);
+var seatService = new SeatService(repo);
+var (command, sessionId, seat, clientId) = arguments;
+
+var responseCode = 0;
+try
+{
+    switch (command)
+    {
+        case OperationType.Book:
+            try
+            {
+                await seatService.BookSeatAsync(sessionId, seat, clientId);
+                Console.WriteLine($"Место забронировано");
+            }
+            catch (SeatBookedException e) when (e.ClientId == clientId)
+            {
+                Console.WriteLine($"Вы уже забронировали это место");
+            }
+
+            break;
+        case OperationType.Buy:
+            try
+            {
+                await seatService.BuySeatAsync(sessionId, seat, clientId);
+                Console.WriteLine($"Место куплено");
+            }
+            catch (SeatBoughtException e) when (e.ClientId == clientId)
+            {
+                Console.WriteLine($"Вы уже купили это место");
+            }
+
+            break;
+        default:
+            throw new ArgumentOutOfRangeException(nameof(command), command, "Неизвестная команда");
+    }
+}
+catch (SeatNotFoundException snf)
+{
+    Console.WriteLine($"Место {snf.Seat} не найдено");
+    responseCode = 2;
+}
+catch (SessionNotFoundException snf)
+{
+    Console.WriteLine($"Сеанс {snf.SessionId} не найден");
+    responseCode = 3;
+}
+catch (SeatBookedException)
+{
+    Console.WriteLine($"Указанное место забронировано за другим посетителем");
+    responseCode = 4;
+}
+catch (SeatBoughtException)
+{
+    Console.WriteLine($"Указанное место куплено другим посетителем");
+    responseCode = 5;
+}
+
+return responseCode;
+```
+
+В итоге, для создания простого консольного приложения потребовалось добавить только 3 файла.
+
+Тот же самый трюк можно провернуть и для других точек входа:
+- Оконное приложение
+- Мобильное приложение
+- Serverless
+
+TODO: добавить ссылку на консольный проект
+
+# Не люблю Repository\<T> (или "Немного про IRepository")
+
+Хотелось бы побольше поговорить про `IRepository`, а если быть точнее, то про его обобщенный интерфейс, который выглядит примерно так:
+
+```csharp
+interface IRepository<T>
+{
+    void Add(T item);
+    void Remove(T item);
+    T GetById(int id);
+    IEnumerable<T> GetAll();
+}
+```
+
+А дальше начинается целый цирк:
+```csharp
+interface IUserRepository: IRepository<User>
+{ }
+```
+
+И вот дальше начинается ад:
+- Мы указали, тип ID для этого `T` - `int`, но что если это не `int`, а какой-нибудь `Guid`?
+- А если мне не нужны какие-то методы? Зачем тащить ненужные?
+- Какой тип мне использовать: `IRepository<User>` или `IUserRepository`? 
+- Если я в этот базовый `IRepository` добавлю единственный метод, то все наследники должны реализовать указанный, т.е. мы жестко связываем все объекты.
+
+Я предпочитаю специализированные сервисы `IXRepository`, в которых содержатся только необходимые методы.
+Плюсы этого подхода:
+- Все методы интерфейса необходимы - не нужно писать лишний код;
+- Работу каждого метода можно оптимизировать - можно писать логику под конкретное использование (например, оптимизированный SQL запрос).
+
+Хорошо. Решили, что будем создавать `IRepository` под конкретные варианты использования. Остался вопрос - что делать с запросами на чтение? Например, мы хотим получить все сеансы за эту неделю, или статистику посещения кинотеатра за весь месяц.
+
+Есть 2+ вариантов:
+1. Под каждый такой вариант писать отдельный метод репозитория. Например,
+   ```csharp
+   interface ISessionRepository
+   {
+       int GetTotalSessionsCountForLastWeek();
+       int GetMostPopularSeats();
+       // ...
+   }
+   ```
+   Этот подход мне не нравится, т.к. в бизнес-логике появляется слишком много ненужных методов.
+   И это затрудняет понимание кода.
+
+2. Использовать подключение к источнику данных напрямую - делать прямые запросы к БД, другим сервисам. 
+   Для примера, я добавил контроллер для получения информации из БД, используя этот подход. 
+   ```csharp
+   [ApiController]
+   [Route("admin")]
+   public class AdminController: ControllerBase
+   {
+       private readonly SessionDbContext _context;
+   
+       public AdminController(SessionDbContext context)
+       {
+           _context = context;
+       }
+   
+       [HttpGet("sessions")]
+       public async Task<IActionResult> GetAllSessionsAsync(CancellationToken token)
+       {
+           return Ok(await _context.Sessions.Select(s => new
+           {
+               s.Id, s.Start, s.End, s.MovieId
+           }).ToListAsync(token));
+       }
+   }   
+   ```
+
+<spoiler title="CQRS">
+
+Второй подход называют CQRS: когда все запросы разделяются на чтение и запись.
+
+В данном примере, для чтения мы напрямую работаем с БД, а для записи - используем операции над доменными объектами.
+
+Плюсы данного подхода:
+- Для чтения можно использовать различные источники, а не только БД. Например, мы могли бы использовать Redis для кэширования сложных запросов,
+  и работать с моделями БД напрямую, а не через доменные;
+- Производительность операций чтения увеличивается, т.к. не нужно тратить время на маппинг и дополнительные проверки;
+- Модифицирующие операции все так же защищены, т.к. работаем мы с доменными объектами;
+
+Что касается синхронизации со схемой в БД, то мы используем ORM. Если схема будет изменена (и при этом будет нарушен запрос чтения), то проект даже не скомпилируется.
+
+</spoiler>
+
+3. По середине между 1 и 2 пунктом лежит 3-ий вариант - паттерн "Спецфикация". 
+   Его суть заключается в том, что для этого репозитория мы добавляем отдельный метод, именуемый примерно как `GetAll(Specification spec)`.
+   То, как этот класс `Spcification` реализован зависит от разработчика, но она должна позволять фильтровать элементы. Для .NET чаще всего видел решение через использование `Expression`. 
+   Сам паттерн в базовом представлении выглядит следующим образом:
+```csharp
+public abstract class Specification<T>
+{
+    public abstract Expression<Func<T, bool>> Expression { get; }
+
+    public Specification<T> And(Specification<T> other)
+    {
+        return new AndSpecification<T>(this, other);
+    }
+
+    public Specification<T> Or(Specification<T> other)
+    {
+        return new OrSpecification<T>(this, other);
+    }
+
+    public Specification<T> Not()
+    {
+        return new NotSpecification<T>(this);
+    }
+
+    public static implicit operator Expression<Func<T, bool>>(Specification<T> spec) => spec.Expression;
+}
+```
+   А теперь реализуем свои спецификации:
+   ```csharp
+   public static class SessionSpecifications
+   {
+       public static Specification<DatabaseSession> LastDays(int days)
+       {
+           var boundary = DateTime.SpecifyKind( DateTime.Now - TimeSpan.FromDays(days), DateTimeKind.Utc);
+           return new GenericSpecification<DatabaseSession>(session => boundary < session.Start);
+       }
+   
+       public static Specification<DatabaseSession> AllFreeSeats()
+       {
+           return new GenericSpecification<DatabaseSession>(session =>
+               session.Seats.All(seat => seat.Type == SeatType.Free));
+       }
+   }
+   
+   [HttpGet("sessions/unvisited")]
+   public async Task<IActionResult> GetUnvisitedSessions([FromQuery][Required] int days, CancellationToken token)
+   {
+       var response = await _context.Sessions
+                                    .Where(SessionSpecifications.LastDays(days).And(SessionSpecifications.AllFreeSeats()))
+                                    .ToListAsync(token);
+       return Ok(response);
+   }
+   ```
+   
+   Я не стал реализовывать `GetAll(Specification<Session> specification)` в `ISessionRepository`, чтобы не нагромождать место лишним кодом.   
 
 # Заключение
 
+Чистая архитектура - это идея, а не готовый фреймворк. Идея разделения бизнес-логики от внешнего мира. 
 
-Документация?
+Реализовать ее можно самыми различными способами. Например:
+- Вместо исключений возвращать специализированные `Result<T>`;
+- Использовать абстрактные методы для `Seat` вместо паттерна посетитель;
+- Вынести логику напрямую в объекты и не вводить отдельный сервис `SeatService` (текущая логика довольно тривиальна).
 
+Если сильно упороться в последний пункт, то мы уйдем в DDD, но это уже другая история.
