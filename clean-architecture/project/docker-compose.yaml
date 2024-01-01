@@ -1,0 +1,23 @@
+version: '3.8'
+
+services: 
+  sessions-db:
+    image: postgres:15-alpine
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+  
+  web:
+    build:
+      context: src
+      dockerfile: CinemaBooking.WebApi/Dockerfile
+    ports:
+      - '8080:8080'
+    environment:
+      ASPNETCORE_URLS: 'http://+:8080'
+      ConnectionStrings__PostgresSessionsDb: 'Host=sessions-db;Port=5432;Database=postgres;User Id=postgres;Password=postgres'
