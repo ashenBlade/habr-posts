@@ -5,15 +5,14 @@ namespace CinemaBooking.Domain.Tests;
 
 public class SeatServiceTests
 {
-    private static readonly SessionInterval StubInterval = new(new DateTime(2022, 1, 1), new DateTime(2022, 2, 1));
     private static readonly SeatEqualityComparer SeatComparer = new();
     
     [Fact]
     public async Task BookSeatAsync__WhenSeatIsFree__ShouldMarkSeatBooked()
     {
-        var (sessionId, seatNumber, movieId, clientId) = ( 1, 1, 1, 2 );
+        var (sessionId, seatNumber, clientId) = ( 1, 1, 2 );
         var expectedSeat = new BookedSeat(seatNumber, clientId); 
-        var session = new Session(sessionId, StubInterval, movieId, new[] {new FreeSeat(seatNumber)});
+        var session = new Session(sessionId, new[] {new FreeSeat(seatNumber)});
         var sessionRepo = new StubSessionRepository(new[] {session});
         var service = new SeatService(sessionRepo);
 
@@ -25,8 +24,8 @@ public class SeatServiceTests
     [Fact]
     public async Task BookSeatAsync__WhenSeatIsBought__ShouldThrowSeatBoughtException()
     {
-        var (sessionId, seatNumber, movieId, clientId, boughtClientId) = ( 1, 1, 1, 2, 10 );
-        var session = new Session(sessionId, StubInterval, movieId, new[] {new BoughtSeat(seatNumber, boughtClientId)});
+        var (sessionId, seatNumber, clientId, boughtClientId) = ( 1, 1, 2, 10 );
+        var session = new Session(sessionId, new[] {new BoughtSeat(seatNumber, boughtClientId)});
         var sessionRepo = new StubSessionRepository(new[] {session});
         var service = new SeatService(sessionRepo);
 
@@ -36,8 +35,8 @@ public class SeatServiceTests
     [Fact]
     public async Task BookSeatAsync__WhenSeatIsBought__ShouldSpecifyCorrectClientIdInException()
     {
-        var (sessionId, seatNumber, movieId, clientId, boughtClientId) = ( 1, 1, 1, 2, 10 );
-        var session = new Session(sessionId, StubInterval, movieId, new[] {new BoughtSeat(seatNumber, boughtClientId)});
+        var (sessionId, seatNumber, clientId, boughtClientId) = ( 1, 1, 2, 10 );
+        var session = new Session(sessionId,  new[] {new BoughtSeat(seatNumber, boughtClientId)});
         var sessionRepo = new StubSessionRepository(new[] {session});
         var service = new SeatService(sessionRepo);
 

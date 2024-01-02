@@ -2,7 +2,7 @@ namespace CinemaBooking.Domain;
 
 public interface ISeatVisitor<out T>
 {
-    T Visit(FreeSeat freeSeat);
-    T Visit(BoughtSeat boughtSeat);
-    T Visit(BookedSeat bookedSeat);
+    public T Visit(FreeSeat seat);
+    public T Visit(BookedSeat seat);
+    public T Visit(BoughtSeat seat);
 }
