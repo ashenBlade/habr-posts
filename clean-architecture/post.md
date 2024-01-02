@@ -1,56 +1,44 @@
 # Введение
 
-TODO: написать введение получше
+Приветствую!
 
-TODO: спрятать портянки кода в spoiler
+Недавно познакомил друга с понятием "Чистая архитектура". С того момента он часто атаковал меня вопросами по типу "А как это сделать? А как то сделать?". В один момент хотел просто кинуть ему ссылку с туториалом, но не нашел подходящего.
 
-Написано под влиянием книги Мартина Фаулера "Чистая архитектура" и часто задаваемых вопросов.
-
-Написано для:
-- Junior разработчиков
-- Разработчиков, которые хотят устроить холи-вар
-- Разработчиков, которые хотят поделиться своим мировоззрением чистой архитектуры
+Поэтому, перечитав книгу Мартина Фаулера ["Чистая архитектура"](https://www.chitai-gorod.ru/product/chistaya-arhitektura-iskusstvo-razrabotki-programmnogo-obespecheniya-2640391), освежив свои знания и преисполнившись в познании, приступаю.
 
 # Что такое чистая архитектура
 
-Чистую архитектуру можно описать фразой `Раздели Бизнес Логику и работу с внешним миром`.
-То есть мы сначала моделируем предметную область и только потом обкладываем его всякими контроллерами, БД, HTTP клиентами и др.
+Чистую архитектуру можно описать фразой - `строй приложение вокруг бизнес-логики`:
+- Сначала моделируется предметная область и в конце обкладываем его всякими контроллерами, БД, HTTP клиентами и т.д.;
+- Все решения по поводу работы с внешним миром откладываются, пока не будет реализована бизнес-логика.
 
 Частные случаи этого:
 1. Нет никаких контроллеров/презентеров;
 2. Мы не знаем ни о какой базе данных - только об абстрактном хранилище чего-либо;
 3. Как мы работаем с другими сервисами не известно - просто вызываем функции/методы.
 
-> Замечание: пункт 2 не означает, что ВСЯ логика на стороне кода. Объяснение дальше. 
-
-<spoiler title="Domain-first">
+<spoiler title="Domain first подход">
 
 В контексте работы с БД есть 3 подхода:
 - Code first
 - Database first
 - Model first
 
-В контексте API сервисов:
+Для API сервисов:
 - Code first
 - Contract first
 
-Для подхода с чистой архитектурой я бы дал название `Domain-first`
+Для подхода чистой архитектуры я бы дал название `Domain-first`
 
 <spoiler>
 
-
-TODO: про книгу написать
-
-TODO: показать диаграмму + пояснить, что там презентер, но в вебе другое представление и надо пояснить что да как
-
-Эта статья частично написана под влиянием книги Мартина Фаулера "Чистая архитектура". 
-Многие видели эту диаграмму:
+Многие видели эту диаграмму из книги "Чистая архитектура":
 
 ![Диаграмма чистой архитектуры](img/clean-architecture.png)
 
 Попытаюсь объяснить что на ней происходит.
 
-Слева мы видим общий взгляд на архитектуру проекта. Структура разделена по слоям (снизу вверх):
+Слева мы видим общий взгляд на архитектуру проекта. Модули разделены по слоям (снизу вверх):
 1. Entities 
    - Сущности, которые содержат самую важную логику/алгоритмы
    - Пример: расчет угла броска снаряда 
@@ -59,14 +47,39 @@ TODO: показать диаграмму + пояснить, что там пр
    - Этот слой содержит прикладную логику - логику нашей предметной области
    - Занимается тем, что манипулирует Entities
    - Пример: приложения для расчета угла удара в бильярде и траектории выстрела из пушки  
-3. Контроллеры, Презентеры 
+3. Контроллеры/Презентеры 
    - Те, с кем внешний мир взаимодействует
    - Пример: MVC контроллеры, заглушка для gRPC, модель представления (MVVM)
 4. UI, БД, Устройства 
    - Это тот самый внешний мир
    - Пример: база данных, внешний сервис
 
-Важно заметить, что зависимости идут из внешнего мира внутрь: наша бизнес-логика ничего не знает о том, где она выполняется или с кем работает.
+<spoiler title="Объяснение из книги">
+
+В книге Мартин Фаулер дает следующие определения:
+- Critical Business Rules - это правила и законы, по которым работает система и без наших программ
+   > ... they are critical to the business itself, and would exist even if there were no system to automate them
+
+- Critical Business Data - это данные, которые необходимы для работы этих самых Critical Business Rules
+   > ... the data that would exist even if the system were not automated
+  
+И теперь переходим к определению самого `Entity`:
+
+> Entity - это объект, который хранит в себе Critical Business Rules и нужные для их работы Critical Business Data
+
+А `Use Cases` - это объекты, которые манипулируют этими `Entity`, так как это делается в настоящей системе.
+
+В качестве примера дается модель банковской системы:
+- Critical Business Rules - это функция для расчета процентной ставки по кредиту;
+- Critical Business Data - это параметры для этого процента: банковская ставка, размер залога, время кредитования;
+- Entity - это объект, который по формуле `Critical Business Rules` вычисляет процентную ставку по `Critical Business Data`;
+- Use Case - это сервис, который исходя из того, кто хочет взять кредит повышает или понижает требования по первоначальному взносу.
+
+</spoiler>
+
+Также стоит заметить 2 вещи:
+1. На диаграмме представлены зависимости **исходного кода** - не поток управления (то, что будет вызвано в реальности);
+2. Зависимости идут строго от внешних слоев ко внутренним - один модуль может ссылать на другой, только если по этой иерархии он расположен ниже.
 
 Справа идет диаграмма зависимостей - то, как приложение должно себя вести в чистой архитектуре.
 Диаграмма представлена в формате UML и стрелки представляют соответственно связи между объектами.
@@ -89,7 +102,7 @@ TODO: показать диаграмму + пояснить, что там пр
 
 Если сейчас не понятно, то, надеюсь, к концу станет яснее.
 
-# Чистая архитектура на примере
+# Разрабатываем систему
 
 ## Предметная область
 
@@ -111,8 +124,6 @@ TODO: показать диаграмму + пояснить, что там пр
 Правил немного, но этого хватит.
 
 > Стоит отметить, что кроме бронирования и покупки мы ничего больше не делаем: не знаем как появляются новые сеансы, откуда берутся клиенты и т.д.
-
-> Стоит заметить, что мы моделируем только бронирование/покупку мест: за то как формируются сеансы, добавляются новые фильмы, как принимается оплата (и есть ли она вообще) и др. мы не отвечаем - это не наша обязанность.
 
 ## Моделирование предметной области
 
@@ -165,18 +176,13 @@ class Session
 }
 ```
 
-> Все что нужно 
-
 Единственный способ нарушить состояние — самим накосячить:
 - Создание объекта через вызов конструктора, где проверяются все входные параметры;
 - В коде просто так состояние не изменить — все свойства неизменяемые (get-only, IReadOnlyCollection);
 
-Вы могли заметить, что для мест используется класс `Seat`, но его определения еще не было, — это далее.
+Для объекта места используется класс `Seat`, но его определения еще не было, — это далее.
 
-Место может быть в 3 состояниях: свободно, забронировано и куплено.
-Причем, если место забронировано или куплено, то ЗА КЕМ-ТО.
-
-Если бы мы сначала думали про БД, то реализовали как-то так:
+Место может иметь 3 состояния: свободно, забронировано и куплено. Причем, если место забронировано или куплено, то ЗА КЕМ-ТО. Если бы мы сначала думали про БД, то реализовали как-то так:
 
 ```csharp
 enum SeatType
@@ -196,7 +202,8 @@ class Seat
 }
 ```
 
-Это простой POCO класс, где вся реализация видна. 
+Это простой POCO класс, где вся реализация открыта наружу.
+
 Мы, конечно, могли бы добавить пару методов для дополнительных проверок и логики.
 Например, для получения `Id` клиента, когда место забронировано:
 
@@ -221,9 +228,7 @@ class Seat
 2. У разных состояний обязательно должны быть поля, которые ему не нужны: например, Id клиента для свободного места;
 3. Поле `ClientId` у разных состояний означает разные вещи: тот кто забронировал и кто купил место - то же самое может случиться и с другими полями.
 
-Будем исправлять эти проблемы поэтапно и начнем с 2 пункта.
-Можно заметить, что каждое состояние можно представить отдельным классом - без необходимости перечисления типа.
-Перепишем следующим образом:
+Будем исправлять эти проблемы поэтапно и начнем с 2 пункта. Можно заметить, что каждое состояние можно представить отдельным классом - без необходимости перечисления типа. Перепишем следующим образом:
 
 ```csharp
 abstract class Seat
@@ -313,8 +318,7 @@ public class BookedSeat: Seat
 }
 ```
 
-Теперь необходимо добавить логику. Место может быть либо куплено, либо забронировано, причем для каждого состояния свои правила перехода. Поэтому обязуем каждое состояние поддерживать эти операции.
-В C# это можно реализовать с помощью абстрактных методов.
+Место может быть либо куплено, либо забронировано, причем для каждого состояния свои правила перехода. Обязуем каждое состояние поддерживать эти операции. В C# это можно реализовать с помощью абстрактных методов.
 
 ```csharp
 abstract class Seat
@@ -362,40 +366,7 @@ class BookedSeat: Seat
 }
 ```
 
-Вот наши `Entity` и реализованы. Осталось дело за малым - `Use Cases`.
-
-Мы должны реализовать 2 операции - бронирование и покупка мест. Для этого определим отдельный сервис - `SeatService`. В нем будут содержаться наши варианты использования (`Use Cases`).
-
-```csharp
-class SeatService
-{
-    public Task BookSeatAsync(int sessionId, int place, int clientId, CancellationToken token)
-    {
-        // ...
-    }
-    
-    public Task BuySeatAsync(int sessionId, int place, int clientId, CancellationToken token)
-    {
-        // ...
-    }
-}
-```
-
-Перед реализацией логики нужно подумать откуда брать эти сеансы и места? Для этого выделим отдельный сервис-хранилище данных: `ISessionRepository`.
-
-От него нам нужно только 2 действия:
-- Получить сеанс с его местами;
-- Обновить информацию о месте (после бронирования/покупки).
-
-```csharp
-interface ISessionRepository
-{
-    public Task<Session> GetSessionByIdAsync(int sessionId, CancellationToken token = default);
-    public Task UpdateSeatAsync(int sessionId, Seat seat, CancellationToken token = default);
-}
-```
-
-На этом можно приступить к реализации. Начнем с бронирования.
+Осталось только научиться бронировать места на сеансе. Эту логику уже выделим в сам объект сеанса.
 
 ```csharp
 class Session
@@ -449,7 +420,43 @@ class Session
         return booked;
     }
 }
+```
 
+Что делать в случае нарушения правил бизнес-логики стало понятно из кода - стратегия доменных исключений. Например, когда клиент хочет забронировать уже купленное место, то бросается `SeatBoughtException`.
+
+`Entity` реализованы, осталось дело за малым - `Use Cases`. У нас есть 2 процесса - бронирование и покупка мест. Для этого определим отдельный сервис - `SeatService`. В нем будет содержаться наша бизнес-логика.
+
+```csharp
+class SeatService
+{
+    public Task BookSeatAsync(int sessionId, int place, int clientId, CancellationToken token)
+    {
+        // ...
+    }
+    
+    public Task BuySeatAsync(int sessionId, int place, int clientId, CancellationToken token)
+    {
+        // ...
+    }
+}
+```
+
+Перед реализацией логики нужно подумать откуда брать эти сеансы и места? Для этого выделим отдельный сервис-хранилище данных: `ISessionRepository`.
+От него нам нужно только 2 действия:
+- Получить сеанс с его местами;
+- Обновить информацию о месте (после бронирования/покупки).
+
+```csharp
+interface ISessionRepository
+{
+    public Task<Session> GetSessionByIdAsync(int sessionId, CancellationToken token = default);
+    public Task UpdateSeatAsync(int sessionId, Seat seat, CancellationToken token = default);
+}
+```
+
+На этом можно приступить к реализации.
+
+```csharp
 class SeatService
 {
     private readonly ISessionRepository _sessionRepository;
@@ -458,7 +465,7 @@ class SeatService
     {
         _sessionRepository = sessionRepository;
     }
-
+    
     public async Task<BookedSeat> BookSeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
     {
         var session = await _sessionRepository.GetSessionByIdAsync(sessionId, token);
@@ -466,7 +473,7 @@ class SeatService
         await _sessionRepository.UpdateSeatAsync(sessionId, bookedSeat, token);
         return bookedSeat;
     }
-
+    
     public async Task<BoughtSeat> BuySeatAsync(int sessionId, int place, int clientId, CancellationToken token = default)
     {
         var session = await _sessionRepository.GetSessionByIdAsync(sessionId, token);
@@ -477,9 +484,7 @@ class SeatService
 }
 ```
 
-Также долго откладывался вопрос, что делать в случае нарушения правил бизнес-логики.
-Я выбрал стратегию доменных исключений - когда нарушается какое-то бизнес-правило, то выкидывается соответствующее исключение.
-Например, когда клиент хочет забронировать уже купленное место, то бросается `SeatBoughtException`.
+На этом наша предметная область готова. Можно начинать думать о внешнем мире.
 
 ## Работаем с внешним миром
 
@@ -541,8 +546,7 @@ public void DoSomething(Seat seat)
 
 Но этот путь мне не нравится:
 - Каждый метод/функция будет сильно раздуваться;
-- При добавлении нового типа места необходимо будет найти ВСЕ точки использования этого `switch`;
-- Рефлексия сама по себе немного медленная + проблемы в AOT (это уже .NET).
+- При добавлении нового типа места необходимо будет найти ВСЕ точки использования этого `switch`.
 
 Эти проблемы можно частично исправить добавив перечисление типа, но придется изменить доменную модель. Я выбрал другой способ - паттерн [Посетитель](https://metanit.com/sharp/patterns/3.11.php).
 
@@ -587,9 +591,9 @@ class BoughtSeat: Seat
 
 Такое расширение функциональности я считаю допустимым:
 - Бизнес-логика не нарушается;
-- Внедрение посетителя дает знаний доменному уровню о том, где он исполняется.
+- Внедрение посетителя не дает знаний доменному уровню о том, где он исполняется.
 
-Теперь перейдем к самому хранилищу сеансов и мест `ISessionRepository`.
+Теперь перейдем к самой реализации хранилища `ISessionRepository`.
 
 ```csharp
 public class PostgresSessionRepository: ISessionRepository
@@ -631,14 +635,13 @@ public class PostgresSessionRepository: ISessionRepository
 }
 ```
 
-**Важное замечание!** Не вся бизнес-логика находится в нашем коде. В данном случае, `ISessionsRepository` может кинуть исключение, если не нашел нужного сеанса - гораздо выгоднее переложить задачу нахождения нужной сущности на хранилище, а не загружать всю БД в память и там выполнять поиск.
-Как такие места правильно выделять - мне не известно, просто я так чувствую. Но если и нахожу, то нужно четко всем рассказать, что этот сервис может кинуть такое исключение. В C# это можно реализовать с помощью строк документации для интерфейса.
+**Важное замечание!** 
+Не вся бизнес-логика находится в нашем коде. В данном случае, `ISessionsRepository` может кинуть исключение, если не нашел нужного сеанса - гораздо выгоднее переложить задачу нахождения сущности на хранилище, а не загружать всю БД в память и там выполнять поиск.
+Как такие места правильно выделять - мне не известно, просто я так чувствую. Но если и нахожу, то нужно четко всем рассказать, что этот сервис может кинуть такое исключение. В C# это можно сделать с помощью строк документации для интерфейса.
 
 Вот и получается, что слой хранения занимается 2 вещами:
 - Маппинг объектов между слоями;
 - Транслирует ошибки из внешней системы на внутреннюю (в этом примере - исключение, если нужного сеанса не найдено).
-
-TODO: ссылка на папку с реализацией
 
 ### Пользуемся
 
@@ -1183,8 +1186,244 @@ interface IRepository<T>
 Чистая архитектура - это идея, а не готовый фреймворк. Идея разделения чистой и правильной бизнес-логики от грязного и тупого внешнего мира. 
 
 Реализовать ее можно самыми различными способами и каждый будет правильным в своей степени. Например:
-- Вместо доменных исключений можно возвращать специализированные `Result<T>`;
-- Отдельные классы посетителей (`ISeatVisitor`), а не обязательные к реализации `Buy` и `Book` у объектов места;
-- Вынести всю логику из доменных объектов (`Seat`, `Session`) в сервис бронирования мест (`SeatService`), т.е. сделать объекты анемичными;
-- Использовать различное дробление модулей/сборок: сейчас использовался подход порты и адаптеры, но есть и другие: package by layer, package by feature, package by component.  
 
+## Убрать доменные исключения
+
+Вместо доменных исключений можно возвращать специализированные `Result<TResult, TError>`. 
+Этот паттерн позволяет избавиться от внезапных и неожиданных исключений ведь все ошибки будут отображены в самом `Result<TResult, TError>`.
+
+Для примера, можно было сделать так:
+```csharp
+enum ErrorType
+{
+    SeatBooked = 0,
+    SeatBought = 1,
+    SessionNotFound = 2,
+    SeatNotFound = 3,
+}
+
+class SeatService
+{
+    Result<BookedSeat, ErrorType> BookSeat()
+    {
+        if (success)
+        {
+            return Result.FromSuccess(/* успешный ответ */);
+        }
+        else
+        {
+            return Result.FromError(/* код ошибки */);
+        }
+    }
+}
+
+class SessionsController
+{
+    public IActionResult BookSeat()
+    {
+        var result = _seatService.BookSeat();
+        return result.Map(
+            success => Ok(new SuccessDto(success)),
+            error   => BadRequest(new ErrorDto(error)));
+    }
+}
+```
+
+# Заменить абстрактные методы на посетителей
+
+Класс `Seat` - абстрактный с 2 обязательными к реализации методами `Buy` и `Book`. Но строго говоря, ничто нам не мешает вместо этих методов определить отдельные `ISeatVisitor`, которые и будут определять какие действия для указанного состояния нужно выполнить.
+
+Я выбрал подход с абстрактными методами `Buy` и `Book`, так как:
+- Во-первых, бронирование и покупка мест наша главная обязанность и должна быть явно отражена в коде (см. [кричащая архитектура](https://blog.cleancoder.com/uncle-bob/2011/09/30/Screaming-Architecture.html));
+- Во-вторых, посетитель был добавлен для того, чтобы внешние пользователи могли без болей определять подтипы `Seat`.
+
+TODO: привести в порядок терминологию с клиентом/посетителем
+
+# Анемичные/богатые модели 
+
+Наши объекты - богатые модели: они содержат не только нужные им данные, но и поведение. Существуют также и анемичные модели - это просто набор данных без логики.
+
+У этих 2 лагерей есть свои сторонники:
+- За анемичные модели - эта [статья](https://en.wikipedia.org/wiki/Anemic_domain_model); 
+- За богатые - [эта](https://dev.to/crovitz/have-you-anemic-or-rich-domain-model-2ala).
+
+Я сторонник богатой модели, так как она позволяет понять логику получше (данные и алгоритмы хранятся вместе) и могут сохранить корректное состояние.
+
+# Различные стратегии разбиения модулей
+
+В этом проекте использовалась стратегия разбиения порты и адаптеры: 
+- Центральный проект с доменными сущностями, сервисами и интерфейсами для внешних систем/хранилищ - ни от кого не зависит;
+- Проект с реализациями интерфейсов внешних систем/сервисов - зависит от доменного;
+- Точка входа приложения - объединяет доменный проект и проект с реализациями.
+
+Но существуют и другие подходы. Обзор на них можно посмотреть в этой [статье](https://habr.com/ru/articles/683456/).
+
+# Не только ООП языки это поддерживают
+
+Я .NET разработчик и поэтому привел пример на C#:
+- В качестве модулей используются проекты (.csproj);
+- Для абстракций используются интерфейсы (`interface`);
+- Сущности представлены классами с методами и указанными модификаторами доступа.
+
+Но это не значит, что на других ЯП нельзя реализовать нечто подобное.
+
+Возьмем к примеру, функциональный язык F#. Эти самые концепции можно выразить следующим образом:
+- В качестве модулей можно использовать проекты или файлы;
+- Абстракции можно передавать в качестве отдельных функций;
+- Сущности можно представить модулем (`module`).
+
+<spoiler title="Реализация на F#">
+
+```fsharp
+namespace CinemaBooking.Domain.Functional
+
+open Microsoft.FSharp.Core
+
+
+// Для корректного представления номера места создадим отдельный тип данных
+module SeatNumber =
+    type SeatNumber = private SeatNumber of int
+
+    let number (seat: SeatNumber) : int =
+        match seat with
+        | SeatNumber(n) -> n
+    
+    let create number =
+        if number < 1 then
+            Option.None
+        else
+            Option.Some(SeatNumber number)
+
+type ClientId = int32
+
+module Seat =
+    open SeatNumber
+    
+    // Само место можем представить в качестве размеченного объединения (Discriminated Union)
+    type Seat =
+        | FreeSeat of Number: SeatNumber
+        | BookedSeat of Number: SeatNumber * ClientId: ClientId
+        | BoughtSeat of Number: SeatNumber * ClientId: ClientId
+
+    let number seat =
+        match seat with
+        | FreeSeat number -> number
+        | BookedSeat(number, _) -> number
+        | BoughtSeat(number, _) -> number
+
+    // Функции-конструкторы
+    let free (number: SeatNumber) : Seat = FreeSeat number
+    let booked (number: SeatNumber, clientId: ClientId) : Seat = BookedSeat(number, clientId)
+    let bought (number: SeatNumber, clientId: ClientId) : Seat = BoughtSeat(number, clientId)
+
+    type TransitionError =
+        | SeatBought of ClientId: ClientId
+        | SeatBooked of ClientId: ClientId
+
+    // Покупка места
+    let buy clientId seat =
+        match seat with
+        | FreeSeat number -> Ok(BoughtSeat(number, clientId))
+        | BookedSeat(number, bookedClientId) when (bookedClientId = clientId) -> Ok(BoughtSeat(number, clientId))
+        | BookedSeat(_, bookedClientId) -> Error(TransitionError.SeatBooked bookedClientId)
+        | BoughtSeat(_, boughtClientId) when (clientId = boughtClientId) -> Ok seat
+        | BoughtSeat(_, boughtClientId) -> Error(TransitionError.SeatBought boughtClientId)
+
+    // Бронирование места
+    let book clientId seat : Result<Seat, TransitionError> =
+        match seat with
+        | FreeSeat number -> Ok(BookedSeat(number, clientId))
+        | BookedSeat(_, bookedClientId) when (clientId = bookedClientId) -> Ok seat
+        | BookedSeat(_, bookedClientId) -> Error(TransitionError.SeatBooked bookedClientId)
+        | BoughtSeat(_, boughtClientId) -> Error(TransitionError.SeatBought boughtClientId)
+
+
+module Session =
+    open Seat
+    
+    type SessionId = int32
+
+    type Session =
+            { Id: SessionId
+              Seats: Seat.Seat list }
+
+    // Создать новый сеанс
+    let create id seats : Session = { Id = id; Seats = seats }
+    
+    // Найти указанное место на сеансе
+    let tryFindSeat seatNumber session =
+        List.tryFind (fun seat -> number seat = seatNumber) session.Seats
+    
+    // Обновить место на сеансе
+    let setSeat session seat =
+        {session with Seats = session.Seats
+                                     |> List.map (fun s -> if number s = number seat then seat else s)}
+    
+    type OperationError =
+        | SeatNotFound
+        | SeatBooked of ClientId: ClientId
+        | SeatBought of ClientId: ClientId
+
+    let makeSeatTransition (operation: Seat -> Result<Seat, TransitionError>) seat =
+        match operation seat with
+        | Ok newSeat -> Ok newSeat
+        | Error e -> match e with
+                     | TransitionError.SeatBought clientId -> Error (OperationError.SeatBought clientId)
+                     | TransitionError.SeatBooked clientId -> Error (OperationError.SeatBooked clientId)
+    
+    // Покупка места на сеансе
+    let buy session seatNumber clientId =
+        match session |> tryFindSeat seatNumber with
+        | None -> Error SeatNotFound
+        | Some seat -> seat
+                        |> makeSeatTransition (buy clientId)
+                        |> Result.map (setSeat session)
+    
+    // Бронирование места на сеансе
+    let book session seatNumber clientId =
+        match session |> tryFindSeat seatNumber with
+        | None -> Error SeatNotFound
+        | Some seat -> seat
+                        |> makeSeatTransition (book clientId)
+                        |> Result.map (setSeat session)
+
+
+
+module SeatService =    
+    open Session
+    
+    // Вместо интерфейсов - отдельные функции
+    type SessionFinder = SessionId -> Session option
+    type SessionUpdater = Session -> Unit
+    
+    type ServiceError =
+        | SessionNotFound
+        | SeatNotFound
+        | SeatBooked of ClientId: ClientId
+        | SeatBought of ClientId: ClientId
+        
+    let toOperationError e =
+        match e with
+        | OperationError.SeatNotFound -> ServiceError.SeatNotFound
+        | OperationError.SeatBooked clientId -> ServiceError.SeatBooked clientId
+        | OperationError.SeatBought clientId -> ServiceError.SeatBought clientId
+    
+    // Передаем функции-интерфейсы в качестве непосредственных аргументов для функции
+    let book sessionId number clientId sessionFinder sessionUpdater =
+        let session = sessionFinder sessionId
+        match session with
+        | None -> Error SessionNotFound
+        | Some session -> book session number clientId
+                          |> Result.mapError toOperationError
+                          |> Result.map (fun s -> sessionUpdater s; s) 
+                          
+    let buy sessionId number clientId sessionFinder sessionUpdater =
+        let session = sessionFinder sessionId
+        match session with
+        | None -> Error SessionNotFound
+        | Some session -> buy session number clientId
+                          |> Result.mapError toOperationError
+                          |> Result.map (fun s -> sessionUpdater s; s)
+```
+
+</spoiler>
