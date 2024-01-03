@@ -9,7 +9,7 @@ public record CommandLineArguments(OperationType Command, int SessionId, int Sea
             throw new InvalidOperationException();
         }
 
-        var (operation, session, seat, user) = ( arguments[0], arguments[1], arguments[2], arguments[3] );
+        var (operation, session, seat, client) = ( arguments[0], arguments[1], arguments[2], arguments[3] );
         OperationType command;
         if (operation.Equals("buy", StringComparison.InvariantCultureIgnoreCase))
         {
@@ -34,11 +34,11 @@ public record CommandLineArguments(OperationType Command, int SessionId, int Sea
             throw new InvalidOperationException();
         }
         
-        if (!int.TryParse(user, out var userId))
+        if (!int.TryParse(client, out var clientId))
         {
             throw new InvalidOperationException();
         }
 
-        return new CommandLineArguments(command, sessionId, seatNumber, userId);
+        return new CommandLineArguments(command, sessionId, seatNumber, clientId);
     }
 }

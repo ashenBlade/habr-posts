@@ -15,13 +15,13 @@ public class GrpcSeatService: SeatService.SeatServiceBase
     
     public override async Task<BookResponse> BookSeat(BookRequest request, ServerCallContext context)
     {
-        var code = await ExecuteGetResultCodeAsync(t => _service.BookSeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
+        var code = await ExecuteGetResultCodeAsync(t => _service.BookSeatAsync(request.SessionId, request.SeatNumber, request.ClientId, t), context.CancellationToken);
         return new BookResponse() {ResultCode = code};
     }
 
     public override async Task<BuyResponse> BuySeat(BuyRequest request, ServerCallContext context)
     {
-        var code = await ExecuteGetResultCodeAsync(t => _service.BuySeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
+        var code = await ExecuteGetResultCodeAsync(t => _service.BuySeatAsync(request.SessionId, request.SeatNumber, request.ClientId, t), context.CancellationToken);
         return new BuyResponse() {ResultCode = code};
     }
 
@@ -48,6 +48,5 @@ public class GrpcSeatService: SeatService.SeatServiceBase
         {
             return OperationResultCode.SeatBought;
         }
-
     }
 }

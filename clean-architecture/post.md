@@ -15,7 +15,7 @@
 Частные случаи этого:
 1. Нет никаких контроллеров/презентеров;
 2. Мы не знаем ни о какой базе данных - только об абстрактном хранилище чего-либо;
-3. Как мы работаем с другими сервисами не известно - просто вызываем функции/методы.
+3. Как мы работаем с другими сервисами неизвестно - просто вызываем функции/методы.
 
 <spoiler title="Domain first подход">
 
@@ -34,7 +34,7 @@
 
 Многие видели эту диаграмму из книги "Чистая архитектура":
 
-![Диаграмма чистой архитектуры](img/clean-architecture.png)
+![Диаграмма чистой архитектуры](https://raw.githubusercontent.com/ashenBlade/habr-posts/clean-architecture/clean-architecture/img/clean-architecture.png)
 
 Попытаюсь объяснить что на ней происходит.
 
@@ -91,10 +91,9 @@
 - `Use Case Output Port` - это интерфейс для представления результатов работы нашего бизнес-процесса. Результатом может быть изменение записи в БД, публикация нового события в очередь сообщений, отправка письма и т.д.;
 - `Presenter` - это сама реализация `Use Case Output Port`. Им может быть Presenter, который обновит информацию на экране телефона или объект, который выполнит SQL запрос для обновления данных.
 
-Также сквозь всю диаграмму, от `Controller` к `Presenter`, касаясь `Use Case Interactor`, движется стрелка.
-Это уже поток управления - кто-кого вызывает. 
+Также сквозь всю диаграмму, от `Controller` к `Presenter`, касаясь `Use Case Interactor`, движется стрелка. Это уже поток управления - кто-кого вызывает. 
 
-При правильной реализации поток управления будет выглядеть следующим образом: `Controller` -> `Use Case Interactor` -> `Presenter`. 
+При правильной реализации поток управления выглядит так: `Controller` -> `Use Case Interactor` -> `Presenter`. 
 Пример:
 1. Клиент сделал запрос на контроллер;
 2. Контроллер вызвал нужный метод на доменном сервисе;
@@ -241,7 +240,7 @@ abstract class Seat
     {
         if (number < 1)
         {
-            throw new ArgumentOutOfRangeException(nameof(number), number, "Номер места должно быть положительным");
+            throw new ArgumentOutOfRangeException(nameof(number), number, "Номер места должен быть положительным");
         }
         Number = number;
     }
@@ -618,6 +617,7 @@ public class PostgresSessionRepository: ISessionRepository
                                   .FirstOrDefaultAsync(s => s.Id == sessionId, token);
         if (found is null)
         {
+            // Доменное исклчение
             throw new SessionNotFoundException(sessionId);
         }
 
@@ -643,7 +643,7 @@ public class PostgresSessionRepository: ISessionRepository
 - Маппинг объектов между слоями;
 - Транслирует ошибки из внешней системы на внутреннюю (в этом примере - исключение, если нужного сеанса не найдено).
 
-### Пользуемся
+### Работа с пользователями
 
 На последнее я оставил то, как пользователь будет взаимодействовать с нашей системой.
 Выбирать мы можем любой способ - бизнес-логика ничего не знает о слое взаимодействия с пользователями.
@@ -663,16 +663,16 @@ public class SessionsController: ControllerBase
     }
 
     [HttpPut("{sessionId:int}/places/{placeId:int}/book")]
-    public async Task<IActionResult> BookSeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
+    public async Task<IActionResult> BookSeat(int sessionId, int placeId, [FromQuery][Required] int clientId, CancellationToken token = default)
     {
-        await _seatService.BookSeatAsync(sessionId, placeId, userId, token);
+        await _seatService.BookSeatAsync(sessionId, placeId, clientId, token);
         return Ok();
     }
     
     [HttpPut("{sessionId:int}/places/{placeId:int}/buy")]
-    public async Task<IActionResult> BuySeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
+    public async Task<IActionResult> BuySeat(int sessionId, int placeId, [FromQuery][Required] int clientId, CancellationToken token = default)
     {
-        await _seatService.BuySeatAsync(sessionId, placeId, userId, token);
+        await _seatService.BuySeatAsync(sessionId, placeId, clientId, token);
         return Ok();
     }
 }
@@ -711,7 +711,7 @@ public class SessionsController: ControllerBase
 }
 ```
 
-Вот и все приложение готово!
+Вот и все приложение готово! Код проекта расположен [здесь](https://github.com/ashenBlade/habr-posts/tree/clean-architecture/clean-architecture/project).
 
 ## Как это все соотносится с диаграммой
 
@@ -721,7 +721,7 @@ public class SessionsController: ControllerBase
 
 | Слой из диаграммы    | Слой из проекта |
 |----------------------|-----------------|
-| UI, Web, Devies      | Интернет, HTTP  |
+| UI, Web, Devices     | Интернет, HTTP  |
 | Controllers/Gateways | MVC Контроллеры |
 | Use Cases            | SeatService     |
 | Entities             | Seat            |
@@ -813,8 +813,6 @@ public class SeatServiceTests
 - Количество купленных мест
 - Количество забронированных мест
 
-TODO: ссылка на этот проект
-
 ```csharp
 public static class MetricsRegistry
 {
@@ -864,6 +862,7 @@ public class MetricScrapperSeatService: ISeatService
 Попробуем добавить gRPC интерфейс. Для этого добавим отдельный проект, в котором реализуем всю нужную функциональность.
 
 Вначале, сам `proto` файл с контрактом:
+
 ```protobuf
 syntax = 'proto3';
 
@@ -880,7 +879,7 @@ enum OperationResultCode {
 message BookRequest {
    int32 sessionId = 1;
    int32 seatNumber = 2;
-   int32 userId = 3;
+   int32 clientId = 3;
 }
 
 message BookResponse {
@@ -890,7 +889,7 @@ message BookResponse {
 message BuyRequest {
    int32 sessionId = 1;
    int32 seatNumber = 2;
-   int32 userId = 3;
+   int32 clientId = 3;
 }
 
 message BuyResponse {
@@ -917,13 +916,13 @@ public class GrpcSeatService: SeatService.SeatServiceBase
     
     public override async Task<BookResponse> BookSeat(BookRequest request, ServerCallContext context)
     {
-        var code = await ExecuteGetResultCodeAsync(t => _service.BookSeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
+        var code = await ExecuteGetResultCodeAsync(t => _service.BookSeatAsync(request.SessionId, request.SeatNumber, request.ClientId, t), context.CancellationToken);
         return new BookResponse() {ResultCode = code};
     }
 
     public override async Task<BuyResponse> BuySeat(BuyRequest request, ServerCallContext context)
     {
-        var code = await ExecuteGetResultCodeAsync(t => _service.BuySeatAsync(request.SessionId, request.SeatNumber, request.UserId, t), context.CancellationToken);
+        var code = await ExecuteGetResultCodeAsync(t => _service.BuySeatAsync(request.SessionId, request.SeatNumber, request.ClientId, t), context.CancellationToken);
         return new BuyResponse() {ResultCode = code};
     }
 
@@ -1035,7 +1034,7 @@ return responseCode;
 - Мобильное приложение
 - Serverless
 
-TODO: добавить ссылку на консольный проект
+Код консольной точки входа [здесь](https://github.com/ashenBlade/habr-posts/tree/clean-architecture/clean-architecture/project/src/CinemaBooking.Console).
 
 # Немного про IRepository<T>
 
@@ -1149,6 +1148,7 @@ interface IRepository<T>
        public static implicit operator Expression<Func<T, bool>>(Specification<T> spec) => spec.Expression;
    }
    ```
+   
    А теперь реализуем свои спецификации:
    ```csharp
    public static class SessionSpecifications
@@ -1229,7 +1229,7 @@ class SessionsController
 }
 ```
 
-# Заменить абстрактные методы на посетителей
+## Заменить абстрактные методы на посетителей
 
 Класс `Seat` - абстрактный с 2 обязательными к реализации методами `Buy` и `Book`. Но строго говоря, ничто нам не мешает вместо этих методов определить отдельные `ISeatVisitor`, которые и будут определять какие действия для указанного состояния нужно выполнить.
 
@@ -1237,9 +1237,7 @@ class SessionsController
 - Во-первых, бронирование и покупка мест наша главная обязанность и должна быть явно отражена в коде (см. [кричащая архитектура](https://blog.cleancoder.com/uncle-bob/2011/09/30/Screaming-Architecture.html));
 - Во-вторых, посетитель был добавлен для того, чтобы внешние пользователи могли без болей определять подтипы `Seat`.
 
-TODO: привести в порядок терминологию с клиентом/посетителем
-
-# Анемичные/богатые модели 
+## Анемичные/богатые модели 
 
 Наши объекты - богатые модели: они содержат не только нужные им данные, но и поведение. Существуют также и анемичные модели - это просто набор данных без логики.
 
@@ -1249,7 +1247,7 @@ TODO: привести в порядок терминологию с клиен�
 
 Я сторонник богатой модели, так как она позволяет понять логику получше (данные и алгоритмы хранятся вместе) и могут сохранить корректное состояние.
 
-# Различные стратегии разбиения модулей
+## Различные стратегии разбиения модулей
 
 В этом проекте использовалась стратегия разбиения порты и адаптеры: 
 - Центральный проект с доменными сущностями, сервисами и интерфейсами для внешних систем/хранилищ - ни от кого не зависит;
@@ -1258,7 +1256,7 @@ TODO: привести в порядок терминологию с клиен�
 
 Но существуют и другие подходы. Обзор на них можно посмотреть в этой [статье](https://habr.com/ru/articles/683456/).
 
-# Не только ООП языки это поддерживают
+## Не только ООП языки это поддерживают
 
 Я .NET разработчик и поэтому привел пример на C#:
 - В качестве модулей используются проекты (.csproj);
@@ -1427,3 +1425,11 @@ module SeatService =
 ```
 
 </spoiler>
+
+# Полезные ссылки
+
+- ["Чистая архитектура" Мартина Фаулера](https://www.chitai-gorod.ru/product/chistaya-arhitektura-iskusstvo-razrabotki-programmnogo-obespecheniya-2640391)
+- Проект на [GitHub](https://github.com/ashenBlade/habr-posts/tree/clean-architecture/clean-architecture/project)
+- [Основы CQRS](https://habr.com/ru/companies/simbirsoft/articles/329970/)
+- [Подходы к декомпозиции модулей](https://habr.com/ru/articles/683456/)
+- [DDD от Мартина Фаулера](https://martinfowler.com/tags/domain%20driven%20design.html)

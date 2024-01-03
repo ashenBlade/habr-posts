@@ -13,7 +13,7 @@ enum OperationResultCode {
 message BookRequest {
   int32 sessionId = 1;
   int32 seatNumber = 2;
-  int32 userId = 3;
+  int32 clientId = 3;
 }
 
 message BookResponse {
@@ -23,7 +23,7 @@ message BookResponse {
 message BuyRequest {
   int32 sessionId = 1;
   int32 seatNumber = 2;
-  int32 userId = 3;
+  int32 clientId = 3;
 }
 
 message BuyResponse {

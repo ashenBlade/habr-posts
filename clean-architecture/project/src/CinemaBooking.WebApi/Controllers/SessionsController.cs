@@ -19,25 +19,25 @@ public class SessionsController: ControllerBase
     }
 
     [HttpPut("{sessionId:int}/places/{placeId:int}/book")]
-    public async Task<IActionResult> BookSeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
+    public async Task<IActionResult> BookSeat(int sessionId, int placeId, [FromQuery][Required] int clientId, CancellationToken token = default)
     {
         try
         {
-            await _seatService.BookSeatAsync(sessionId, placeId, userId, token);
+            await _seatService.BookSeatAsync(sessionId, placeId, clientId, token);
         }
-        catch (SeatBookedException booked) when (booked.ClientId == userId)
+        catch (SeatBookedException booked) when (booked.ClientId == clientId)
         { }
         return Ok();
     }
     
     [HttpPut("{sessionId:int}/places/{placeId:int}/buy")]
-    public async Task<IActionResult> BuySeat(int sessionId, int placeId, [FromQuery][Required] int userId, CancellationToken token = default)
+    public async Task<IActionResult> BuySeat(int sessionId, int placeId, [FromQuery][Required] int clientId, CancellationToken token = default)
     {
         try
         {
-            await _seatService.BuySeatAsync(sessionId, placeId, userId, token);
+            await _seatService.BuySeatAsync(sessionId, placeId, clientId, token);
         }
-        catch (SeatBoughtException bought) when (bought.ClientId == userId)
+        catch (SeatBoughtException bought) when (bought.ClientId == clientId)
         { }
         return Ok();
     }
