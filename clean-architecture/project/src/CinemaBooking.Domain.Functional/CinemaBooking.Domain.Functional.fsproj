@@ -6,7 +6,11 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <Compile Include="Domain.fs" />
+        <Compile Include="ClientId.fs" />
+        <Compile Include="SeatNumber.fs" />
+        <Compile Include="Seat.fs" />
+        <Compile Include="Session.fs" />
+        <Compile Include="SeatService.fs" />
     </ItemGroup>
 
 </Project>
