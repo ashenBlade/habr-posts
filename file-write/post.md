@@ -993,18 +993,207 @@ HDD и SSD имеют встроенную поддержку ECC - Error Correc
 
 </spoiler>
 
-# Среда выполнения
+### TODO: секции "что делать" удалить
 
-Многие приложения
+На этом можно было бы и закончить, но мы пропустили один довольно важный слой - среда выполнения.
 
-Почему я заострил внимание - я нашел критичный (в этом контексте) баг .NET 7. Рассказать про найденный баг.
+# Рантайм
 
-Возможно найти другие баги различных райнтаймов (Java, GO, Python, .NET).
+В самом начале мы перешли от приложения сразу к операционной системе. 
+Но между ними может лежать еще один слой - рантайм:
+- Среда выполнения - Node.js, .NET, JVM
+- Интерпретаторы - Python, Ruby
 
-`Поэтому важно ручками проверить, что этих багов нет. Но пожалуй самый радикальный способ - напрямую вызывать системные вызовы`.
-Дать пример в C#
+Если при работе в C/C++ можно сразу вызвать `fsync`, то для других яп надо учитывать различные аспекты рантайма.
 
-Сюда можно еще добавить переупорядочивания компилятором как будто могут нарушить порядок выполнения
+Сейчас поговорим про `fsync`, так как он необходим для подтверждения сохранности данных.
+
+В java имеется метод `force(true)` для этого. В документации написано, что этот метод
+
+> Forces any updates to this channel's file to be written to the storage device that contains it.
+
+То есть напрямую `fsync` не вызывается, мы полагаемся на интерфейс, который среда предлагает.
+
+То же самое можем увидеть в .NET - у класса `FileStream` есть перегруженный метод `Flush(bool flushToDisk)`.
+Если ему передать значение `true`, то все данные будут записаны на диск:
+
+> Use this overload when you want to ensure that all buffered data in intermediate file buffers is written to disk.
+> When you call the Flush method, the operating system I/O buffer is also flushed.
+
+Но стоит заметить, что ничего про `fsync` не сказано.
+Да, это платформозависимая деталь реализации, но если мы хотим точно убедиться в сохранности лучше проверить.
+
+Я решил проверить, как себя ведет вызов этого метода. 
+Сначала поискал в исходниках и нашел следующую цепочку вызовов:
+
+<spoiler title="Цепочка вызовов">
+
+```cs
+public class FileStream
+{
+    private readonly FileStreamStrategy _strategy;
+    
+    // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/System.Private.CoreLib/src/System/IO/FileStream.cs#L389
+    public virtual void Flush(bool flushToDisk)
+    {
+        if (_strategy.IsClosed)
+        {
+            ThrowHelper.ThrowObjectDisposedException_FileClosed();
+        }
+
+        _strategy.Flush(flushToDisk);
+    }
+}
+
+internal abstract class OSFileStreamStrategy : FileStreamStrategy
+{
+    // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/System.Private.CoreLib/src/System/IO/Strategies/OSFileStreamStrategy.cs#L137
+    internal sealed override void Flush(bool flushToDisk)
+    {
+        if (flushToDisk && CanWrite)
+        {
+            FileStreamHelpers.FlushToDisk(_fileHandle);
+        }
+    }
+}
+
+internal static partial class FileStreamHelpers
+{
+    // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/System.Private.CoreLib/src/System/IO/Strategies/FileStreamHelpers.Unix.cs#L40
+    internal static void FlushToDisk(SafeFileHandle handle)
+    {
+        if (Interop.Sys.FSync(handle) < 0)
+        {
+            Interop.ErrorInfo errorInfo = Interop.Sys.GetLastErrorInfo();
+            switch (errorInfo.Error)
+            {
+                case Interop.Error.EROFS:
+                case Interop.Error.EINVAL:
+                case Interop.Error.ENOTSUP:
+                    // Ignore failures for special files that don't support synchronization.
+                    // In such cases there's nothing to flush.
+                    break;
+                default:
+                    throw Interop.GetExceptionForIoErrno(errorInfo, handle.Path);
+            }
+        }
+    }
+}
+
+internal static partial class Interop
+{
+    internal static partial class Sys
+    {
+        // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/Common/src/Interop/Unix/System.Native/Interop.FSync.cs#L11
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_FSync", SetLastError = true)]
+        internal static partial int FSync(SafeFileHandle fd);
+    }
+}
+
+// https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/native/libs/System.Native/pal_io.c#L736
+int32_t SystemNative_FSync(intptr_t fd)
+{
+    int fileDescriptor = ToFileDescriptor(fd);
+
+    int32_t result;
+    while ((result =
+#if defined(TARGET_OSX) && HAVE_F_FULLFSYNC
+    fcntl(fileDescriptor, F_FULLFSYNC)
+#else
+    fsync(fileDescriptor)
+#endif
+    < 0) && errno == EINTR);
+    return result;
+}
+```
+
+</spoiler>
+
+То есть, при указании `true`, должен произойти вызов `fsync`.
+Дальше я захотел проверить это в реальности. 
+Для этого написал следующий код и отследил его выполнение с помощью `strace`.
+
+### TODO: ссылка на код
+
+```cs
+using var file = new FileStream("sample.txt", FileMode.OpenOrCreate);
+file.Write("hello, world"u8);
+file.Flush(true);
+```
+
+Вот часть вывода `strace` с открытия и до закрытия файла.
+
+```shell
+openat(AT_FDCWD, "/path/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+pwrite64(19, "hello, world", 12, 0)     = 12
+fsync(19)                               = 0
+flock(19, LOCK_UN)                      = 0
+close(19)                               = 0
+```
+
+По шагам:
+1. `openat` - Открыт файл с дескриптором 19
+2. `lseek` - Указатель смещен в самое начала
+3. `pwrite64` - Записаны наши данные
+4. `fsync(19)` - Вызов `fsync`, сброс данных на диск
+5. `close(19` - Закрыли файл
+
+Вот и хорошо - `fsync` вызывается. 
+Но сейчас у меня версия .NET - 8.0.1.
+Мне стало интересно, а что будет на других версиях.
+Я выставил версию .NET 7, скомпилировал с теми же параметрами и запустил `strace` уже для него:
+
+```shell
+openat(AT_FDCWD, "/path/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+pwrite64(19, "hello, world", 12, 0)     = 12
+flock(19, LOCK_UN)                      = 0
+close(19)                               = 0
+```
+
+В последних строках нет `fsync`!
+Более того, если вызвать `Flush(true)` еще раз, то он появится:
+```shell
+openat(AT_FDCWD, "/home/ash-blade/Projects/habr-posts/file-write/src/FileWrite.FsyncCheckNet7/bin/Release/net7.0/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+pwrite64(19, "hello, world", 12, 0)     = 12
+fsync(19)                               = 0
+flock(19, LOCK_UN)                      = 0
+close(19)                               = 0
+```
+
+В итоге, я пришел к выводу, что первый вызов `Flush(true)` по каким-то причинам игнорируется, а последующие успешно вызывают `fsync`.
+
+Также стоит поговорить о возможностях, предоставляемых самим языком.
+Например, `fsync` может (и должен) вызывать на директориях, чтобы убедиться в создании или удалении файлов, поэтому нам необходимо получить файловый дескриптор директории.
+
+Тут я опять пожалуюсь на C# - понятия дескриптор для директории тут нет. 
+А получить дескриптор директории обычными способами нельзя - у класса `Directory` нет метода `Open` или какого-нибудь наподобие `Sync`, а если передать в `FileStream` директорию, даже с указанием ReadOnly режима, то возникнет исключение `UnauthorizedAccessException`.
+
+Я нашел обходной путь: с помощью импорта функции `open` получаем дескриптор директории, а после создаем `SafeFileHandle`, в который его и передаем. 
+В этом случае, исключений нет и `fsync` вызывается.
+
+```cs
+var directory = Directory.CreateDirectory("sample-directory");
+const int directoryFlags = 65536; // O_DIRECTORY | O_RDONLY
+var handle = Open(directory.FullName, directoryFlags); 
+using var stream = new FileStream(new SafeFileHandle(handle, true), FileAccess.ReadWrite);
+stream.Flush(true);
+
+[DllImport("libc", EntryPoint = "open")]
+static extern nint Open(string path, int flags);
+```
+
+И вот `strace`
+
+```shell
+openat(AT_FDCWD, "/path/sample-directory", O_RDONLY|O_DIRECTORY) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+lseek(19, 0, SEEK_CUR)                  = 0
+fsync(19)                               = 0
+close(19)                               = 0
+```
 
 # Рецепты файловой записи
 
