@@ -1276,79 +1276,128 @@ close(19)                               = 0
 
 ### TODO: посмотреть про атомарность rename (он атомарен только для пользователя, но что если отказ)
 
-
 После рассмотрения возможных сбоев и ошибок, которые могут возникнуть на каждом слое, рассмотрим некоторые паттерны работы с файлами.
 
 ## Создание нового файла
 
 Жизненный цикл файла начинается с его создания.
 Когда файл создается, то он изначально пуст.
+Если нам и нужен пустой файл, то дальше можно не читать.
 
-rename:
-- btrfs - https://archive.kernel.org/oldwiki/btrfs.wiki.kernel.org/index.php/FAQ.html#What_are_the_crash_guarantees_of_overwrite-by-rename.3F
-- 
+А теперь представим, что файл уже должен быть проинициализирован.
+Как мы уже видели последовательность "создать файл", "записать данные", "закрыть" не работает, так как в случае отказа в файле может быть мусор или окажется пустым или вообще его не окажется в директории.
 
-Стоит еще и рассказать про один интересный паттерн создания файлов.
+В подобных ситуациях используют упомянутый ранее паттерн `Atomic Create Via Rename`.
+Имя говорит само за себя - для создания нового файла мы используем операцию переименования.
 
-Представим, что нам нужно создать новый файл и при этом его нужно инициализировать каким-то содержимым.
+Алгоритм для этого следующий:
+1. `creat("/dir/file.tmp")` - Создаем временный файл
+2. `write("/dir/file.tmp", data)` - Записываем в этот файл необходимые данные
+3. `fsync("/dir/file.tmp")` - Сбрасываем необходимые данные в файл
+4. `rename("/dir/file.tmp", "/dir/file")` - Переименовываем временный файл в целевой
+5. `fsync("/dir/")` - Сбрасываем содержимое данных файла
 
-Первая идея - создать новый файл и записать в него нужные значения.
-Проблема здесь в неатомарности операции: создание файла и запись в него данных. Машина может отключиться прямо в середине записи в файл и тогда в файле может быть только половина содержимого.
-Это не проблема, если файл новый, - просто начать заново. Но что если нам нужно перезаписать существующий файл?
+В качестве примера - создание нового файла лога в [etcd](https://github.com/etcd-io/etcd/blob/4527093b166da6fb1d803649d7c0d7aef7d9b878/server/storage/wal/wal.go#L716):
 
-Чтобы понять как это решить, посмотрим на часть документации к `rename`:
-
-> If `newpath` already exists, it will be atomically replaced, so that there is no point at which another process attempting to access `newpath` will find it missing.
-
-Т.е. `rename` атомарная операция и если мы хотим изменить часть содержимого файла, либо создать готовый, то:
-1. Создаем временный файл
-2. Записываем в него данные
-3. Переименовываем файл в целевой - `rename`
-4. Вызываем `fsync` для директории (не забываем)
-
-Согласно этому [исследованию](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-pillai.pdf), такой подход используется в Git, Mercurial, LevelDB, HSQLDB, VMWare, HDFS.
-Я нашел такой подход в [etcd](https://github.com/etcd-io/etcd/blob/e54bd67554fa2d57e882a6cc949cc90624fecb29/server/storage/wal/wal.go#L733) при создании нового сегмента лога:
 ```go
 // cut closes current file written and creates a new one ready to append.
 // cut first creates a temp wal file and writes necessary headers into it.
 // Then cut atomically rename temp wal file to a wal file.
 func (w *WAL) cut() error {
-    // ... Закрытие старого конца 
+	// Название для нового файла сегмента
+	fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
+
+    // 1. Создание временного файла
 	
 	// create a temp wal file with name sequence + 1, or truncate the existing one
 	newTail, err := w.fp.Open()
+	if err != nil {
+		return err
+	}
 
-	// ... Записываем данные в новый сегмент - инициализируем
+    // 2. Записываем данные во временный файл
+    
+	// update writer and save the previous crc
+	w.locks = append(w.locks, newTail)
+	prevCrc := w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
 
-    // ... Атомарно переименовываем готовый файл сегмента
+	if err = w.saveCrc(prevCrc); err != nil {
+		return err
+	}
+
+	if err = w.encoder.encode(&walpb.Record{Type: MetadataType, Data: w.metadata}); err != nil {
+		return err
+	}
+
+	if err = w.saveState(&w.state); err != nil {
+		return err
+	}
+
 	// atomically move temp wal file to wal file
+    
+    // 3. Сбрасываем данные файла на диск
 	if err = w.sync(); err != nil {
 		return err
 	}
-	
+
+	off, err = w.tail().Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+    // 4. Переименовываем временный файл в целевой
 	if err = os.Rename(newTail.Name(), fpath); err != nil {
 		return err
 	}
 	
-	// ... Вызываем fsync для директории с сегментами лога
+	// 5. Сбрасываем содержимое директории на диск
+	start := time.Now()
 	if err = fileutil.Fsync(w.dirFile); err != nil {
 		return err
 	}
-    
-    // ... Обновление внутреннего состояния приложения
+	walFsyncSec.Observe(time.Since(start).Seconds())
+
+	// reopen newTail with its new path so calls to Name() match the wal filename format
+	newTail.Close()
+
+	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
+		return err
+	}
+	if _, err = newTail.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
+
+	w.locks[len(w.locks)-1] = newTail
+
+	prevCrc = w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
+
+	w.lg.Info("created a new WAL segment", zap.String("path", fpath))
+	return nil
 }
 ```
 
-В документации `rename` также прописано, что возможно существование окна, когда старый и новый пути указывают на файл, который собираемся переименовать.
-Но так как мы своего добились - атомарно обновили содержимое файла, то в случае отказа просто останется старый временный файл (еще один hardlink), который просто надо удалить.
+Дополнительными комментариями я отметил соответствие описанных шагов в алгоритме и того, что выполняется в коде.
+Шаги - одни и те же и в той же последовательности.
+
+Также, в конце файл заново открывается, но это необходимо для того, чтобы получать актуальное название файла, а не временное (с которым создали), и на целостность не влияет.
 
 
 ## Изменение файла
+
 
 Тезисы:
 - Изменение небольшого файла - rename
 - undo-log
 
+Изменение состояния через переименование: (LevelDB) https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/version_set.h#L181
 ## Управление файлами в директории
 
 Тезисы:
