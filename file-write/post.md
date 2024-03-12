@@ -350,6 +350,8 @@ void sample_function()
 
 ### TODO: возможный код реализации fsync - https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/buffer.c#L769
 
+### TODO: про fcntl(F_FULLFSYNC) на mac сказать
+
 # Файловая система
 
 Когда речь идет про запись в файлы, обычно говорят "записать на диск". 
@@ -1291,11 +1293,11 @@ close(19)                               = 0
 Имя говорит само за себя - для создания нового файла мы используем операцию переименования.
 
 Алгоритм для этого следующий:
-1. `creat("/dir/file.tmp")` - Создаем временный файл
-2. `write("/dir/file.tmp", data)` - Записываем в этот файл необходимые данные
-3. `fsync("/dir/file.tmp")` - Сбрасываем необходимые данные в файл
-4. `rename("/dir/file.tmp", "/dir/file")` - Переименовываем временный файл в целевой
-5. `fsync("/dir/")` - Сбрасываем содержимое данных файла
+1. `creat("/dir/data.tmp")` - Создаем временный файл
+2. `write("/dir/data.tmp", new_data)` - Записываем в этот файл необходимые данные
+3. `fsync("/dir/data.tmp")` - Сбрасываем необходимые данные в файл
+4. `rename("/dir/data.tmp", "/dir/data")` - Переименовываем временный файл в целевой
+5. `fsync("/dir")` - Сбрасываем содержимое данных файла
 
 В качестве примера - создание нового файла лога в [etcd](https://github.com/etcd-io/etcd/blob/4527093b166da6fb1d803649d7c0d7aef7d9b878/server/storage/wal/wal.go#L716):
 
@@ -1389,21 +1391,493 @@ func (w *WAL) cut() error {
 
 Также, в конце файл заново открывается, но это необходимо для того, чтобы получать актуальное название файла, а не временное (с которым создали), и на целостность не влияет.
 
-
 ## Изменение файла
 
+Файл у нас есть. 
+Теперь в него необходимо внести изменения.
+Тут 2 варианта.
 
-Тезисы:
-- Изменение небольшого файла - rename
-- undo-log
+### Изменение небольшого файла
 
-Изменение состояния через переименование: (LevelDB) https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/version_set.h#L181
+В случае, если файл небольшого размера, то мы можем применить паттерн `Atomic Replace Via Rename`.
+Алгоритм тот же, что и для `Atomic Create Via Rename`:
+1. `creat("/dir/data.tmp")` - Создаем временный файл
+2. `write("/dir/data.tmp", new_data)` - Записываем в этот файл необходимые данные
+3. `fsync("/dir/data.tmp")` - Сбрасываем необходимые данные в файл
+4. `rename("/dir/data.tmp", "/dir/data")` - Переименовываем временный файл в целевой
+5. `fsync("/dir")` - Сбрасываем содержимое данных файла
+
+Применение этого паттерна можно увидеть в LevelDB - сброс данных на диск из памяти, Compaction (вообще, переводится как "уплотнение", но логика именно сохранения данных на диск):
+
+```c++
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/db_impl.cc#L549
+void DBImpl::CompactMemTable() {
+  // ...
+
+  // Replace immutable memtable with the generated Table
+  if (s.ok()) {
+    edit.SetPrevLogNumber(0);
+    edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
+    s = versions_->LogAndApply(&edit, &mutex_); // Вызывается метод LogAndApply у класса VersionSet
+  }
+  
+  // ...
+}
+
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/version_set.cc#L777
+Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
+  // 1. Создаем новое состояние - применяем правки к текущему состоянию (пока в памяти)
+  Version* v = new Version(this);
+  {
+    Builder builder(this, current_);
+    builder.Apply(edit);
+    builder.SaveTo(v);
+  }
+  Finalize(v);
+
+  // Initialize new descriptor log file if necessary by creating
+  // a temporary file that contains a snapshot of the current version.
+  std::string new_manifest_file;
+  Status s;
+  if (descriptor_log_ == nullptr) { 
+    // 2. Создаем временный файл
+    new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+    s = env_->NewWritableFile(new_manifest_file, &descriptor_file_);
+    if (s.ok()) {
+      // 3. Записываем во временный файл новый снапшот БД
+      descriptor_log_ = new log::Writer(descriptor_file_);
+      s = WriteSnapshot(descriptor_log_);
+    }
+  }
+
+  {
+    if (s.ok()) {
+      // 4. Сбрасываем данные на диск
+      s = descriptor_file_->Sync();
+    }
+
+    // If we just created a new descriptor file, install it by writing a
+    // new CURRENT file that points to it.
+    if (s.ok() && !new_manifest_file.empty()) {
+      // 5. Переименовываем временный файл
+      s = SetCurrentFile(env_, dbname_, manifest_file_number_);
+    }
+
+    mu->Lock();
+  }
+  return s;
+}
+
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/util/env_posix.cc#L334
+class PosixWritableFile: public WritableFile {
+public:
+  Status Sync() override {
+    // На всякий случай вызываем fsync для содержащей файл директории (для снапшота - наш случай)
+    Status status = SyncDirIfManifest();
+    
+    status = FlushBuffer();
+    return SyncFd(fd_, filename_);
+  }
+private:
+  static Status SyncFd(int fd, const std::string& fd_path) {
+#if HAVE_FULLFSYNC
+    // On macOS and iOS, fsync() doesn't guarantee durability past power
+    // failures. fcntl(F_FULLFSYNC) is required for that purpose. Some
+    // filesystems don't support fcntl(F_FULLFSYNC), and require a fallback to
+    // fsync().
+    if (::fcntl(fd, F_FULLFSYNC) == 0) {
+      return Status::OK();
+    }
+#endif  // HAVE_FULLFSYNC
+
+#if HAVE_FDATASYNC
+    bool sync_success = ::fdatasync(fd) == 0;
+#else
+    bool sync_success = ::fsync(fd) == 0;
+#endif  // HAVE_FDATASYNC
+
+    if (sync_success) {
+      return Status::OK();
+    }
+    return PosixError(fd_path, errno);
+  }
+}
+
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/filename.cc#L123
+Status SetCurrentFile(Env* env, const std::string& dbname,
+                      uint64_t descriptor_number) {
+  // ...
+  if (s.ok()) {
+    // Переименовываем временный файл в настоящий/целевой
+    s = env->RenameFile(tmp, CurrentFileName(dbname));
+  }
+  return s;
+}
+```
+
+### Изменение большого файла
+
+Но что делать, если файл большой? 
+Или самой памяти мало?
+
+Вспомним с чего начинали - простая перезапись файла.
+Но теперь доработаем эту операцию так, чтобы она стала отказоустойчивой.
+Данный пример я взял из статьи [Files Are Hard](https://danluu.com/file-consistency/) и, по факту, просто перескажу ее.
+
+При записи в файл может случиться отказ и тогда, возможно, весь файл повредиться. 
+Вспомним, что может случиться:
+- Операции переупорядочиваются
+- Записаться может только часть данных
+- В файле может появиться мусор
+- Целостность содержимого может быть нарушена (даже после успешной записи)
+
+Для предоставления отказоустойчивости используется лог:
+- undo (rollback) - откат изменений
+- redo (write ahead log, wal) - завершение операций
+
+Немного подробнее про применение этих логов в базах данных можно почитать [тут](http://www.cburch.com/cs/340/reading/log/index.html).
+
+Теперь - как делать отказоустойчивое изменение данных файла
+
+#### Undo лог
+
+Undo лог хранит в себе данные, которые необходимы для отката операций.
+В случае перезаписи файла, он может хранить в себе полные участки файла, которые нужно записать обратно.
+Например, если мы хотим записать новые данные (`new_data`) начиная с 10 байта (`start`) длиной в 15 байтов (`length`), то в этот лог будут записаны байты с 10 по 15 из текущего, еще не измененного файла (`old_data`).
+
+Алгоритм записи данных будет следующим:
+
+1. `creat("/dir/undo.log")` - Создаем файл undo лога 
+2. `write("/dir/undo.log", "[check_sum, start, length, old_data]")` - Записываем в него данные из исходного файла, которые собираемся изменить:
+   - `start` - начальная позиция в файле, с которой собираемся производить запись
+   - `length` - длина перезаписываемого участка
+   - `old_data` - сами данные, которые перезаписываем (не новые, а старые для отката)
+   - `check_sum` - чек-сумма, вычисленная для `start`, `length` и `old_data`
+3. `fsync("/dir/undo.log")` - Сбрасываем данные файла на диск
+4. `fsync("/dir")` - Сбрасываем содержимое директории (теперь undo лог точно на диске)
+5. `write("/dir/data", start, new_data)` - Записываем новые данные (`start` - тот же самый, что и записали в `undo.log`)
+6. `fsync("/dir/data")` - Сбрасываем изменения основного файла на диск
+7. `unlink("/dir/undo.log")` - Удаляем undo лог
+8. `fsync("/dir")` - Сбрасываем изменение данных директории на диск (удаление undo лога)
+  
+Что здесь учли:
+- Отказ прямо после создания файла undo лога - в начале идет чек-сумма, с помощью которой можно это обнаружить (некоторые используют специальную константу, но чек-сумму и для этого можно использовать)
+- Переупорядочивание операций записи - чек-сумма для всей записи в undo логе на случай, если операции записи будут переупорядочены (если изменения большие, то возможно одним `write` не обойтись) или нарушения целостности
+- Отказ перед началом записи данных в сам файл - вызываем `fsync` для файла undo лога и самой директории, после этого можно быть уверенным, что файл на диске
+- Удаление самого файла undo лога - в конце вызываем `fsync` для директории, чтобы undo лог был действительно удален, иначе могут возникнуть проблемы
+
+Восстановление - тривиально: на старте проверяем, есть ли undo лог, и если он есть, то выполняем запись хранящихся в нем данных (конечно, еще и проверяем целостность самого undo лога чек-суммой).
+Если в конце не `fsync`'ать директорию, по сам undo.log может остаться и при перезагрузке изменения будут откатаны.
+Но удаление файла более затратная операция чем та же запись, т.к. надо обновить не только данные в директории, но и, возможно, пометить страницы чистыми для очищения места на диске.
+
+В SQLite используется журнал (undo лог) и в качестве оптимизации можно использовать 2 опции:
+- Обрезать файл до 0 - `PRAGMA journal_mode=TRUNCATE`
+- Занулять заголовок журнала - `PRAGMA journal_mode=PERSIST`
+
+В [документации](https://devdoc.net/database/sqlite-3.0.7.2/atomiccommit.html#section_7_6) это описано.
+
+<spoiler title="Undo лог в SQLite">
+
+Раз уж разговор зашел о SQLite, то и в качестве примера приведу его. 
+Сам процесс выполнения коммита описан на странице [Atomic Commit In SQLite](https://devdoc.net/database/sqlite-3.0.7.2/atomiccommit.html), но в коде реализован так:
+
+```c++
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/btree.c#L4388
+int sqlite3BtreeCommit(Btree *p){
+  int rc;
+  // Первая фаза - создание журнала и запись данных в файл БД
+  rc = sqlite3BtreeCommitPhaseOne(p, 0);
+  if( rc==SQLITE_OK ){
+    // Вторая фаза - удаление/обрезание/зануление журнала
+    rc = sqlite3BtreeCommitPhaseTwo(p, 0);
+  }
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/btree.c#L4267
+int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
+  int rc = SQLITE_OK;
+  if( p->inTrans==TRANS_WRITE ){
+    rc = sqlite3PagerCommitPhaseOne(pBt->pPager, zSuperJrnl, 0);
+  }
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L6437
+int sqlite3PagerCommitPhaseOne(
+  Pager *pPager,                  /* Pager object */
+  const char *zSuper,            /* If not NULL, the super-journal name */
+  int noSync                      /* True to omit the xSync on the db file */
+){
+  int rc = SQLITE_OK;             /* Return code */
+
+  if( 0==pagerFlushOnCommit(pPager, 1) ){
+    // ...
+  }else{
+    if( pagerUseWal(pPager) ){
+      // ...
+    }else{
+      // 1. Записываем страницы, которые хотим изменить в журнал
+      rc = pager_incr_changecounter(pPager, 0);
+      // 2. Сбрасываем журнал на диск
+      rc = syncJournal(pPager, 0);
+      if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+
+      // 3. Записываем измененные страницы в сам файл БД
+      pList = sqlite3PcacheDirtyList(pPager->pPCache);
+      if( /* ... */ ){
+        rc = pager_write_pagelist(pPager, pList);
+      }
+      if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+
+      // 3. Сбрасываем данные файла БД на диск
+      if( /* ... */ ){
+        rc = sqlite3PagerSync(pPager, zSuper);
+      }
+    }
+  }
+
+commit_phase_one_exit:
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L4259
+static int syncJournal(Pager *pPager, int newHdr){
+  int rc;                         /* Return code */
+
+  if( /* ... */ ){
+    if( /* ... */ ){
+      if( /* ... */ ){
+        // Вначале записываем количество страниц = 0, на всякий случай
+        if( rc==SQLITE_OK && 0==memcmp(aMagic, aJournalMagic, 8) ){
+          static const u8 zerobyte = 0;
+          rc = sqlite3OsWrite(pPager->jfd, &zerobyte, 1, iNextHdrOffset);
+        }
+
+        if( /* ... */ ){
+          // Сбрасываем записанные данные
+          rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags);
+          if( rc!=SQLITE_OK ) return rc;
+        }
+        
+        // Записываем сам заголовок
+        rc = sqlite3OsWrite(
+            pPager->jfd, zHeader, sizeof(zHeader), pPager->journalHdr
+        );
+        if( rc!=SQLITE_OK ) return rc;
+      }
+      if( /* ... */ ){
+        // Еще раз сбрасываем содержимое файла на диск
+        rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags|
+          (pPager->syncFlags==SQLITE_SYNC_FULL?SQLITE_SYNC_DATAONLY:0)
+        );
+        if( rc!=SQLITE_OK ) return rc;
+      }
+    }else{
+      pPager->journalHdr = pPager->journalOff;
+    }
+  }
+  
+  return SQLITE_OK;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L6372
+int sqlite3PagerSync(Pager *pPager, const char *zSuper){
+  int rc = SQLITE_OK;
+  if( /* ... */ ){
+    // fsync
+    rc = sqlite3OsSync(pPager->fd, pPager->syncFlags);
+  }
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/btree.c#L4356
+int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
+  if( p->inTrans==TRANS_WRITE ){
+    int rc;
+    rc = sqlite3PagerCommitPhaseTwo(p->pBt->pPager);
+    if( rc!=SQLITE_OK && bCleanup==0 ){
+      sqlite3BtreeLeave(p);
+      return rc;
+    }
+  }
+  
+  return SQLITE_OK;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L6674
+int sqlite3PagerCommitPhaseTwo(Pager *pPager){
+  int rc = SQLITE_OK;                  /* Return code */
+  rc = pager_end_transaction(pPager, pPager->setSuper, 1);
+  return pager_error(pPager, rc);
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L2033
+static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
+  int rc = SQLITE_OK;
+  int rc2 = SQLITE_OK;     
+
+  if( isOpen(pPager->jfd) ){
+    if( sqlite3JournalIsInMemory(pPager->jfd) ){
+      // ...
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_TRUNCATE ){
+      // PRAGMA journal_mode=TRUNCATE
+      // Обрезаем файл до 0
+      if( pPager->journalOff==0 ){
+        rc = SQLITE_OK;
+      }else{
+        rc = sqlite3OsTruncate(pPager->jfd, 0);
+        if( rc==SQLITE_OK && pPager->fullSync ){
+          rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags);
+        }
+      }
+      pPager->journalOff = 0;
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_PERSIST){
+      // PRAGMA journal_mode=PERSIST
+      // Зануляем заголовок журнала
+      rc = zeroJournalHdr(pPager, hasSuper||pPager->tempFile);
+      pPager->journalOff = 0;
+    }else{
+      // PRAGMA journal_mode=DELETE
+      // Удаляем файл журнала
+      int bDelete = !pPager->tempFile;
+      sqlite3OsClose(pPager->jfd);
+      if( bDelete ){
+        rc = sqlite3OsDelete(pPager->pVfs, pPager->zJournal, pPager->extraSync);
+      }
+    }
+  }
+  // ...
+  return (rc==SQLITE_OK?rc2:rc);
+}
+
+// Реализация sqlite3OsDelete для Unix систем 
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/os_unix.c#L6533
+static int unixDelete(
+  sqlite3_vfs *NotUsed,     /* VFS containing this as the xDelete method */
+  const char *zPath,        /* Name of file to be deleted */
+  int dirSync               /* If true, fsync() directory after deleting file */
+){
+  int rc = SQLITE_OK;
+  
+  // Удаляем файл - unlink
+  if( osUnlink(zPath)==(-1) ){
+    rc = unixLogError(SQLITE_IOERR_DELETE, "unlink", zPath);
+    return rc;
+  }
+  
+  // Обновляем содержимое директории
+  if( (dirSync & 1)!=0 ){
+    int fd;
+    rc = osOpenDirectory(zPath, &fd);
+    if( rc==SQLITE_OK ){
+      // Улучшенный "fsync"
+      if( full_fsync(fd,0,0) ){
+        rc = unixLogError(SQLITE_IOERR_DIR_FSYNC, "fsync", zPath);
+      }
+    }else{
+      rc = SQLITE_OK;
+    }
+  }
+  return rc;
+}
+
+// Улучшенная версия fsync, которая учитывает особенности и баги некоторых систем
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/os_unix.c#L3638
+static int full_fsync(int fd, int fullSync, int dataOnly){
+  int rc;
+
+  /* If we compiled with the SQLITE_NO_SYNC flag, then syncing is a
+  ** no-op.  But go ahead and call fstat() to validate the file
+  ** descriptor as we need a method to provoke a failure during
+  ** coverage testing.
+  */
+#ifdef SQLITE_NO_SYNC
+  {
+    struct stat buf;
+    rc = osFstat(fd, &buf);
+  }
+#elif HAVE_FULLFSYNC
+  if( fullSync ){
+    rc = osFcntl(fd, F_FULLFSYNC, 0);
+  }else{
+    rc = 1;
+  }
+  /* If the FULLFSYNC failed, fall back to attempting an fsync().
+  ** It shouldn't be possible for fullfsync to fail on the local
+  ** file system (on OSX), so failure indicates that FULLFSYNC
+  ** isn't supported for this file system. So, attempt an fsync
+  ** and (for now) ignore the overhead of a superfluous fcntl call.
+  ** It'd be better to detect fullfsync support once and avoid
+  ** the fcntl call every time sync is called.
+  */
+  if( rc ) rc = fsync(fd);
+
+#elif defined(__APPLE__)
+  /* fdatasync() on HFS+ doesn't yet flush the file size if it changed correctly
+  ** so currently we default to the macro that redefines fdatasync to fsync
+  */
+  rc = fsync(fd);
+#else
+  rc = fdatasync(fd);
+#if OS_VXWORKS
+  if( rc==-1 && errno==ENOTSUP ){
+    rc = fsync(fd);
+  }
+#endif /* OS_VXWORKS */
+#endif /* ifdef SQLITE_NO_SYNC elif HAVE_FULLFSYNC */
+
+  if( OS_VXWORKS && rc!= -1 ){
+    rc = 0;
+  }
+  return rc;
+}
+```
+
+</spoiler>
+
+#### Redo лог
+
+Redo лог работает по аналогичной схеме. 
+Разница в том, что записываем в этот лог не старые, а новые данные, и после выполнения операции не удаляем. 
+
+1. `creat("/dir/redo.log")` - Создаем файл redo лога
+2. `write("/dir/redo.log", "[check_sum, start, length, new_data]")` - Записываем в него данные из исходного файла, которые собираемся изменить:
+  - `start` - начальная позиция в файле, с которой собираемся производить запись
+  - `length` - длина перезаписываемого участка
+  - `new_data` - новые данные, которые хотим записать
+  - `check_sum` - чек-сумма, вычисленная для `start`, `length` и `new_data`
+3. `fsync("/dir/redo.log")` - Сбрасываем данные файла на диск
+4. `fsync("/dir")` - Сбрасываем содержимое директории (теперь undo лог точно на диске)
+5. `write("/dir/data", start, new_data)` - Записываем новые данные (`start` - тот же самый, что и записали в `redo.log`)
+6. `fsync("/dir/data")` - Сбрасываем изменения основного файла на диск
+7. `unlink("/dir/redo.log")` - Удаляем redo лог
+8. `fsync("/dir")` - Сбрасываем изменение данных директории на диск (удаление redo лога)
+
+Преимуществом redo лога можно считать, то, что ответ о завершенной операции пользователю можно отправлять как только мы успешно сделали запись в redo логе (шаг 5), т.к. изменения либо будут применены сейчас, либо при восстановлении после перезагрузки.
+
+Стоит также заметить, что постоянное создание и удаление файлов - операция затратная. 
+Для оптимизации, можно просто добавлять новые записи, которые потом надо будет просто применить при перезагрузке.
+Нужно операции коммитить, чтобы лишний раз их не применять. 
+Закоммитить записи можно с помощью с помощью специальной записи, которая добавляется в конец лога (получается каждая запись в логе может быть либо операцией, либо коммитом).
+Также можно специальным образом изменить заголовок записи операции, например, хранить флаг коммита и занулять его при завершении операции или занулять заголовок, как бы говоря, что операция применена (как в SQLite при `PRAGMA journal_mode=PERSIST`).
+
+Вот мы и пришли к WAL - Write Ahead Log.
+
+<spoiler title="WAL в Postgres">
+
+### TODO: пример - чек-поинты postgres ???
+
+</spoiler>
+
 ## Управление файлами в директории
 
 Тезисы:
 - При изменении файла в директории - надо fsync диреторию
 - При удалении надо закрывать дескрипторы, иначе файлы еще будут занимать место (не освободится)
 
+
+## Сегментированный лог
 
 ### TODO: тут про хардлинки поговорить (где-то видел это)
 
