@@ -1848,7 +1848,7 @@ Redo лог работает по аналогичной схеме.
   - `new_data` - новые данные, которые хотим записать
   - `check_sum` - чек-сумма, вычисленная для `start`, `length` и `new_data`
 3. `fsync("/dir/redo.log")` - Сбрасываем данные файла на диск
-4. `fsync("/dir")` - Сбрасываем содержимое директории (теперь undo лог точно на диске)
+4. `fsync("/dir")` - Сбрасываем содержимое директории (теперь redo лог точно на диске)
 5. `write("/dir/data", start, new_data)` - Записываем новые данные (`start` - тот же самый, что и записали в `redo.log`)
 6. `fsync("/dir/data")` - Сбрасываем изменения основного файла на диск
 7. `unlink("/dir/redo.log")` - Удаляем redo лог
@@ -1862,11 +1862,245 @@ Redo лог работает по аналогичной схеме.
 Закоммитить записи можно с помощью с помощью специальной записи, которая добавляется в конец лога (получается каждая запись в логе может быть либо операцией, либо коммитом).
 Также можно специальным образом изменить заголовок записи операции, например, хранить флаг коммита и занулять его при завершении операции или занулять заголовок, как бы говоря, что операция применена (как в SQLite при `PRAGMA journal_mode=PERSIST`).
 
-Вот мы и пришли к WAL - Write Ahead Log.
+Вот мы и пришли к WAL - Write Ahead Log. 
+По факту, это и есть тот самый redo лог.
 
 <spoiler title="WAL в Postgres">
 
-### TODO: пример - чек-поинты postgres ???
+Redo лог часто встречается в базах данных.
+
+
+```c++
+// https://github.com/postgres/postgres/blob/cc6e64afda530576d83e331365d36c758495a7cd/src/backend/access/transam/xact.c#L2158
+static void
+CommitTransaction(void)
+{
+	if (!is_parallel_worker)
+	{
+		latestXid = RecordTransactionCommit();
+	}
+	else
+	{
+		// ...
+	}
+	
+	if (/* Нужно закоммитить */)
+	{
+	    // 
+		XLogFlush(XactLastRecEnd);
+
+		/*
+		 * Now we may update the CLOG, if we wrote a COMMIT record above
+		 */
+		if (markXidCommitted)
+			TransactionIdCommitTree(xid, nchildren, children);
+	}
+}
+
+// https://github.com/postgres/postgres/blob/97d85be365443eb4bf84373a7468624762382059/src/backend/access/transam/xact.c#L1284
+static TransactionId
+RecordTransactionCommit(void)
+{
+    
+    // 3. Вставялем еще запись об успешном коммите в WAL
+	if (/* Не надо коммитить */)
+	{ }
+	else
+	{
+		XactLogCommitRecord(GetCurrentTransactionStopTimestamp(),
+							nchildren, children, nrels, rels,
+							ndroppedstats, droppedstats,
+							nmsgs, invalMessages,
+							RelcacheInitFileInval,
+							MyXactFlags,
+							InvalidTransactionId, NULL /* plain commit */ );
+	}
+    
+    // 
+	if (/* Нужно закоммитить синхронно */)
+	{
+	    // Сбрасываем данные на диск
+		XLogFlush(XactLastRecEnd);
+	}
+	else
+	{
+	    // ...
+	}
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/access/transam/xact.c#L5736
+XLogRecPtr
+XactLogCommitRecord(TimestampTz commit_time,
+					int nsubxacts, TransactionId *subxacts,
+					int nrels, RelFileLocator *rels,
+					int ndroppedstats, xl_xact_stats_item *droppedstats,
+					int nmsgs, SharedInvalidationMessage *msgs,
+					bool relcacheInval,
+					int xactflags, TransactionId twophase_xid,
+					const char *twophase_gid)
+{
+    // Вставляем запись в WAL о коммите
+	return XLogInsert(RM_XACT_ID, info);
+}
+
+XLogRecPtr
+XLogInsertRecord(XLogRecData *rdata,
+				 XLogRecPtr fpw_lsn,
+				 uint8 flags,
+				 int num_fpi,
+				 bool topxid_included)
+{
+    // ...
+    XLogFlush(EndPos);
+    // ...
+}
+
+// https://github.com/postgres/postgres/blob/dbfc44716596073b99e093a04e29e774a518f520/src/backend/access/transam/xlog.c#L2728
+void
+XLogFlush(XLogRecPtr record)
+{
+	// ...
+	XLogWrite(WriteRqst, insertTLI, false);
+    // ...
+}
+
+// https://github.com/postgres/postgres/blob/dbfc44716596073b99e093a04e29e774a518f520/src/backend/access/transam/xlog.c#L2273
+static void
+XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
+{
+	while (/* Есть данные для записи */)
+	{
+	    // 1. Создаем новый сегмент лога, либо открываем нужный
+	    if (/* Размер сегмента превышен */)
+		{
+			openLogFile = XLogFileInit(openLogSegNo, tli);
+		}
+
+		if (openLogFile < 0)
+		{
+			openLogFile = XLogFileOpen(openLogSegNo, tli);
+		}
+
+        // 2. Выполняем непосредственную запись страниц WAL лога
+        do
+        {
+            written = pg_pwrite(openLogFile, from, nleft, startoffset);
+        } while (/* Есть данные для записи */);
+        
+        // 3. Сбрасываем содержимое файла на диск
+        if (finishing_seg)
+        {
+            issue_xlog_fsync(openLogFile, openLogSegNo, tli);
+        }
+    }
+}
+
+// https://github.com/postgres/postgres/blob/dbfc44716596073b99e093a04e29e774a518f520/src/backend/access/transam/xlog.c#L8516
+void
+issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
+{
+    // Вызов fsync в зависимости от конфигурации
+	switch (wal_sync_method)
+	{
+		case WAL_SYNC_METHOD_FSYNC:
+		    pg_fsync_no_writethrough(fd);
+			break;
+		case WAL_SYNC_METHOD_FSYNC_WRITETHROUGH:
+		    pg_fsync_writethrough(fd);
+			break;
+		case WAL_SYNC_METHOD_FDATASYNC:
+		    pg_fdatasync(fd);    
+			break;
+		// ...
+	}
+}
+
+// По мере работы, грязные буферы сбрасываются на диск, в сам файл БД
+
+// https://github.com/postgres/postgres/blob/97d85be365443eb4bf84373a7468624762382059/src/backend/storage/buffer/bufmgr.c#L3437
+static void
+FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+			IOContext io_context)
+{
+    // 3. Сбрасываем буфер в WAL, если этого еще не произошло
+	if (buf_state & BM_PERMANENT)
+		XLogFlush(recptr);
+    
+    // 4. Сбрасываем изменения на диск, в файл БД
+    smgrwrite(reln,
+			  BufTagGetForkNum(&buf->tag),
+			  buf->tag.blockNum,
+			  bufToWrite,
+			  false);
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/include/storage/smgr.h#L121
+static inline void
+smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		  const void *buffer, bool skipFsync)
+{
+	smgrwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/smgr.c#L631
+void
+smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		   const void **buffers, BlockNumber nblocks, bool skipFsync)
+{
+	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
+										 buffers, nblocks, skipFsync);
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/md.c#L928
+void
+mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		 const void **buffers, BlockNumber nblocks, bool skipFsync)
+{
+    // Записываем данные в файл
+	while (/* Есть еще блоки для записи */)
+	{
+		for (/* Пока не записали все байты */)
+		{
+			nbytes = FileWriteV(v->mdfd_vfd, iov, iovcnt, seekpos,
+								WAIT_EVENT_DATA_FILE_WRITE);
+   		}
+	}
+	
+	// Сбрасываем данные на диск
+	if (/* Нужно сбросить данные на диск */)
+		register_dirty_segment(reln, forknum, v);
+}
+
+
+// https://github.com/postgres/postgres/blob/6b41ef03306f50602f68593d562cd73d5e39a9b9/src/backend/storage/file/fd.c#L2192
+ssize_t
+FileWriteV(File file, const struct iovec *iov, int iovcnt, off_t offset,
+		   uint32 wait_event_info)
+{
+    // 4. Запись в сам файл БД
+	returnCode = pg_pwritev(vfdP->fd, iov, iovcnt, offset);	
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/md.c#L1353
+static void
+register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
+{
+	if (/* Не удалось зарегистрировать fsync запрос для чекпоинтера */)
+	{
+		FileSync(seg->mdfd_vfd, WAIT_EVENT_DATA_FILE_SYNC);
+	}
+}
+
+// https://github.com/postgres/postgres/blob/c20d90a41ca869f9c6dd4058ad1c7f5c9ee9d912/src/backend/storage/file/fd.c#L2297
+int
+FileSync(File file, uint32 wait_event_info)
+{
+	pg_fsync(VfdCache[file].fd);
+}
+```
+
+Здесь мы можем увидеть то самое преимущество WAL: достаточно сделать единственную запись (в redo лог) и вернуть ответ пользователю.
+Данные будут сброшены на диск, либо в процессе работы (вытеснение грязных страниц), либо при восстановлении во время запуска.
 
 </spoiler>
 
