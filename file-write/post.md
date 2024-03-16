@@ -1,15 +1,5 @@
 # Как писать в файлы?
 
-Содержание:
-1. Уровни какие проходит запрос записи
-2. Системный вызов/ОС
-3. Файловая система
-4. Диск
-5. А как же рантайм
-    - трансляция запросов
-    - Рассказать про баг .NET 7
-6. Выводы
-
 # Введение
 
 Приветствую. 
@@ -552,7 +542,7 @@ typedef struct XLogRecord
 
 
 ```
-
+### TODO: не закончил тут 
 На этот счет у разных файловых систем есть разные мнения
 
 здесь про обновление метаданных, а потом/до данных
@@ -2125,15 +2115,42 @@ FileSync(File file, uint32 wait_event_info)
 
 Также, поверх WAL возможно реализовать транзакции, как в Postgres.
 
-# Мой случай
-
-Описать что использую сегментированный лог
-Атомарность записи в сектор не волнует
-Так как использую рафт, то 
-
 # Заключение
 
-Вроде бы простая задача - записать данные на диск, но слишком много подводных камней. 
-Чтобы быть точно уверенным нужно учитывать множество факторов.
+Все началось со статьи [Files Are Hard](https://danluu.com/file-consistency/).
+Тогда я понял зачем нужны чек-суммы, что данные после записи надо сбрасывать (`fsync`) и, вообще, файлы не так просты. 
+После, я решил копнуть поглубже и понял насколько глубока эта кроличья нора.
+Писать закончил с трудом, т.к. постоянно хотелось поискать еще каких-нибудь исследований, найти неизвестные факты и т.д.
 
-https://lwn.net/Articles/457667/
+Главный вывод из всей статьи - файловая абстракция протекает. 
+Если приложение работает с файлами и при этом данные важны, то необходимо понимать как устроена файловая запись и паттерны для работы с ней.
+В противном случае, вероятность потери данных или нарушения логики работы системы/приложения резко возрастают.
+
+Я прошелся по основным слоям, которые проходит запрос записи.
+Но некоторые темы не покрыты:
+- Поведение сетевых файловых систем
+- Описание устройства накопителей данных
+- Устройство и реализация файловых систем
+- Сравнение различных файловых систем
+- Кроссплатформенность (точнее говоря, каких гарантий можно достичь на различных платформах - ОС, рантайм, железо)
+- Баги в реализациях (они есть, например, TODO: ссылки на баги)
+
+Надеюсь, статья была полезна. 
+Полезные ссылки прилагаю:
+
+Файловые системы:
+- [Files Are Hard](https://danluu.com/file-consistency/)
+- [Filesystem Error Handling](https://danluu.com/filesystem-errors/)
+- [All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-pillai.pdf)
+- [Can Applications Recover from fsync Failures?](https://www.usenix.org/system/files/atc20-rebello.pdf)
+- [Ensuring data reaches disk](https://lwn.net/Articles/457667/)
+- [Specifying and Checking File System Crash-Consistency Models](https://www.cs.utexas.edu/~bornholt/papers/ferrite-asplos16.pdf)
+- [Model-Based Failure Analysis of Journaling File Systems](https://research.cs.wisc.edu/wind/Publications/sfa-dsn05.pdf)
+- [EIO: Error Handling is Occasionally Correct](https://www.usenix.org/legacy/event/fast08/tech/full_papers/gunawi/gunawi.pdf)
+
+Накопители:
+- [Storage subsystem performance: analysis and recipes](https://gudok.xyz/sspar/)
+- [The Life and Death of SSDs and HDDs: Similarities, Differences, and Prediction Models](https://arxiv.org/pdf/2012.12373.pdf)
+- [Large Scale Studies of Memory, Storage, and Network Failures in a Modern Data Center](https://arxiv.org/pdf/1901.03401.pdf)
+- [Investigating Power Outage Effects on Reliability of Solid-State Drives](https://arxiv.org/pdf/1805.00140.pdf)
+- [Backblaze Drive Stats for 2023](https://www.backblaze.com/blog/backblaze-drive-stats-for-2023/)
