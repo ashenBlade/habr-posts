@@ -4,38 +4,19 @@
 
 Приветствую. 
 
-TODO: ... Про пет-проект ...
+Год назад меня сильно увлекла тема отказоустойчивости приложений. Я начал изучать различные аспекты ее реализации в программах и больше всего меня заинтересовал процесс работы с диском. Ресурсов для изучения много, но они все разбросаны по сети и мне понадобилось время, чтобы сложить все кусочки пазла. Здесь я попытаюсь этот пазл собрать воедино, чтобы структуризировать полученные знания.
 
-Данные приложения я храню на диске, в файле. Казалось бы, просто вызови `write` и дождись окончания записи.
-Но немного исследовав эту тему, я понял, что не все так просто - существует большое количество подводных камней, которые надо учитывать, чтобы быть немного уверенным, что данные точно сохранены.
-
-Для начала представим путь, который проходят данные, перед тем как быть записанными на диск:
-
-TODO: блоки визуализации (Приложение -> ОС -> Файловая система -> Диск).
+Для начала разберем путь операции записи, начиная самого приложения.
 
 # Приложение
 
-Зависит от языка какие вызовы нужно сделать
-Есть буферризация
-Привести примеры различных ЯП
-А еще стандартную библиотеку C (как пример)
-Ну и мой пример
-
-Тут про fflush, Flush у BufferedStream (C#) и даже когда открывается файл, то внутри есть BufferedStrategy
-
-Как защититься/что делать: зависит от ЯП
-
----
-Все начинается с самого приложения. 
-Обычно у нас имеется интерфейс для работы с файлами. Это зависит от ЯП, но примеры:
+Все начинается в нашем коде. Обычно имеется интерфейс для работы с файлами. Это зависит от ЯП, но примеры:
 - `fwrite` - C
 - `std::fstream.write` - C++
 - `FileStream.Write` - C#
 - `FileOutputStream.Write` - Java
 - `open().write` - Python
 - `File.Write` - GO
-
-и другие.
 
 Это все средства предоставляемые языками программирования, для работы с файлами: запись, чтение и т.д.
 Их преимуществом является независимость от платформы, на которой мы работаем. 
@@ -148,7 +129,21 @@ TODO: добавить код
 - `sync()` - эта функция тоже синхронизирует содержимое буферов и дисков, только делает это для всех файлов, а не указанного.
 
 Как уже было сказано, `fdatasync` синхронизирует только содержимое, без метаданных как `fsync`, поэтому он выполняется быстрее.
+В etcd делается [явное различие](https://github.com/etcd-io/etcd/blob/6f55dfa26e1a359e47e1fb15af79951e97dbac39/client/pkg/fileutil/sync_linux.go#L32) между этими 2 вызовами:
 
+```go
+// Fsync is a wrapper around file.Sync(). Special handling is needed on darwin platform.
+func Fsync(f *os.File) error {
+	return f.Sync()
+}
+
+// Fdatasync is similar to fsync(), but does not flush modified metadata
+// unless that metadata is needed in order to allow a subsequent data retrieval
+// to be correctly handled.
+func Fdatasync(f *os.File) error {
+	return syscall.Fdatasync(int(f.Fd()))
+}
+```
 
 > Больше про эти системные вызовы описано в статье [Устойчивое хранение данных и файловые API Linux](https://habr.com/ru/companies/ruvds/articles/524172/).
 
@@ -158,6 +153,53 @@ TODO: добавить код
 - `NtFlushBuffersFileEx(fd, params)` - сброс страниц на диск, но только для файловых систем NT (NTFS, ReFS, FAT, exFAT).
 
 P.S. `NtFlushBuffersFileEx` [используется в Postgres](https://github.com/postgres/postgres/blob/874d817baa160ca7e68bee6ccc9fc1848c56e750/src/port/win32fdatasync.c#L40) как обертка для кроссплатформенного `fdatasync`.
+А для `fsync` - `_commit`
+
+```c++
+// https://github.com/postgres/postgres/blob/9acae56ce0b0812f3e940cf1f87e73e8d5784e78/src/include/port/win32_port.h#L85
+/* Windows doesn't have fsync() as such, use _commit() */
+#define fsync(fd) _commit(fd)
+
+// https://github.com/postgres/postgres/blob/874d817baa160ca7e68bee6ccc9fc1848c56e750/src/port/win32fdatasync.c#L23
+int
+fdatasync(int fd)
+{
+    // ...
+	status = pg_NtFlushBuffersFileEx(handle,
+									 FLUSH_FLAGS_FILE_DATA_SYNC_ONLY,
+									 NULL,
+									 0,
+									 &iosb);
+    // ...
+}
+```
+
+
+Также стоит упомянуть macOS. Она хоть и является POSIX совместимой, т.е. предоставляет системный вызов `fsync`, но одного его одного недостаточно.
+Для нее требуется дополнительный вызов `fcntl(F_FULLSYNC)`. Это также прописывается в [документации](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html):
+
+> For applications that require tighter guarantees about the integrity of their data, Mac OS X provides the F_FULLFSYNC fcntl.
+
+При разработке на macOS об этом стоит помнить, иначе [вероятность потерять данные высока](https://habr.com/ru/news/653527/).
+В etcd это поведение [учитывается](https://github.com/etcd-io/etcd/blob/6f55dfa26e1a359e47e1fb15af79951e97dbac39/client/pkg/fileutil/sync_darwin.go#L36):
+
+```go
+// Fsync on HFS/OSX flushes the data on to the physical drive but the drive
+// may not write it to the persistent media for quite sometime and it may be
+// written in out-of-order sequence. Using F_FULLFSYNC ensures that the
+// physical drive's buffer will also get flushed to the media.
+func Fsync(f *os.File) error {
+	_, err := unix.FcntlInt(f.Fd(), unix.F_FULLFSYNC, 0)
+	return err
+}
+
+// Fdatasync on darwin platform invokes fcntl(F_FULLFSYNC) for actual persistence
+// on physical drive media.
+func Fdatasync(f *os.File) error {
+	return Fsync(f)
+}
+```
+
 
 ## Говорим ОС, что синхронизация не нужна
 
@@ -338,9 +380,7 @@ void sample_function()
 
 </spoiler>
 
-### TODO: возможный код реализации fsync - https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/buffer.c#L769
-
-### TODO: про fcntl(F_FULLFSYNC) на mac сказать
+Я немного поресерчил исходники ядра и, возможно, нашел реализацию `fsync` [тут](https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/buffer.c#L769)
 
 # Файловая система
 
@@ -375,7 +415,6 @@ void sample_function()
 Было изучено поведение 3 файловых систем (ext3, reiserfs и jfs) при возникновении ошибки записи блока.
 Результат их работы приведен в следующей таблице. 
 
-
 ### TODO: таблица
 
 Можно заметить, что каждая из этих файловых систем может оставить содержимое файла (Data Block) в некорректном состоянии (DC, Data Corruption).
@@ -389,16 +428,17 @@ void sample_function()
 
 ### TODO: может в отдельную секцию вынести
 
+### TODO: баг файловой системы в конец
 Также сами разработчики могут ошибиться в реализации - версии 5.2 и 5.3 btrfs [не рекомендуется](https://bugs.archlinux.org/task/63733) использовать.
 
 Про log structured файловые системы исследований найти не смог.
 
 ## Про запись в файл
 
-Обобщая, файл в файловой системе представляется 2 компонентами - метаданные и блоки данных.
-При записи в файл надо задать вопрос - что обновлять вначале?
+Обобщая, файл состоит из 2 компонент - метаданные и блоки данных.
+При записи в файл надо понять что обновлять первым?
 
-Если сначала обновить метаданные, то после их обновления, в файле может появиться мусор:
+Если метаданные, то после их обновления, в файле может появиться мусор:
 1. Делаем запрос на дозапись в файл
 2. Файловая система обновляет метаданные - увеличивает длину файла
 3. Происходит отказ.
@@ -410,111 +450,112 @@ void sample_function()
 Например, можно использовать константу, чтобы проверять, что дальше действительно идут наши данные, а не мусор.
 Такой подход используют:
 - Postgres в начале заголовка страницы WAL выставляет magic number 
-```c++
-/*
- * Each page of XLOG file has a header like this:
- */
-#define XLOG_PAGE_MAGIC 0xD114	/* can be used as WAL version indicator */
-
-typedef struct XLogPageHeaderData
-{
-	uint16		xlp_magic;		/* magic value for correctness checks */
-	// ...
-} XLogPageHeaderData;
-```
-- Kafka [использует magic number](https://github.com/apache/kafka/blob/9bc9fae9425e4dac64ef078cd3a4e7e6e09cc45a/clients/src/main/java/org/apache/kafka/common/record/FileLogInputStream.java#L63) в качестве номера версии
-```java
-public class FileLogInputStream implements LogInputStream<FileLogInputStream.FileChannelRecordBatch> {
-    @Override
-    public FileChannelRecordBatch nextBatch() throws IOException {
-        // ...
-        
-        byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
-        final FileChannelRecordBatch batch;
-
-        if (magic < RecordBatch.MAGIC_VALUE_V2)
-            batch = new LegacyFileChannelRecordBatch(offset, magic, fileRecords, position, size);
-        else
-            batch = new DefaultFileChannelRecordBatch(offset, magic, fileRecords, position, size);
-        return batch;
-    }
-}
-```
-- А может быть не числом, а строкой, как в SQLite, причем как [осмысленной](https://github.com/sqlite/sqlite/blob/f79b0bdcbfb46164cfd665d256f2862bf3f42a7c/src/btree.c#L3267), так и [случайной](https://github.com/sqlite/sqlite/blob/f79b0bdcbfb46164cfd665d256f2862bf3f42a7c/src/pager.c#L1608)
-```c++
-// Заголовок журнала отката - несмысленная константа
-/*
-** Journal files begin with the following magic string.  The data
-** was obtained from /dev/random.  It is used only as a sanity check.
-*/
-static const unsigned char aJournalMagic[] = {
-  0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7,
-};
-
-static int readJournalHdr(
-  Pager *pPager,               /* Pager object */
-  int isHot,
-  i64 journalSize,             /* Size of the open journal file in bytes */
-  u32 *pNRec,                  /* OUT: Value read from the nRec field */
-  u32 *pDbSize                 /* OUT: Value of original database size field */
-){
-  int rc;                      /* Return code */
-  unsigned char aMagic[8];     /* A buffer to hold the magic header */
-  i64 iHdrOff;                 /* Offset of journal header being read */
-
-  /* Read in the first 8 bytes of the journal header. If they do not match
-  ** the  magic string found at the start of each journal header, return
-  ** SQLITE_DONE. If an IO error occurs, return an error code. Otherwise,
-  ** proceed.
-  */
-  if( isHot || iHdrOff!=pPager->journalHdr ){
-    rc = sqlite3OsRead(pPager->jfd, aMagic, sizeof(aMagic), iHdrOff);
-    if( rc ){
-      return rc;
-    }
-    if( memcmp(aMagic, aJournalMagic, sizeof(aMagic))!=0 ){
-      return SQLITE_DONE;
-    }
-  }
+  ```c++
+  /*
+   * Each page of XLOG file has a header like this:
+   */
+  #define XLOG_PAGE_MAGIC 0xD114	/* can be used as WAL version indicator */
   
-  // ...
-}
-
-// Заголовок файла БД - человекочитаемая строка
-#ifndef SQLITE_FILE_HEADER /* 123456789 123456 */
-#  define SQLITE_FILE_HEADER "SQLite format 3"
-#endif
-
-/*
-** The header string that appears at the beginning of every
-** SQLite database.
-*/
-static const char zMagicHeader[] = SQLITE_FILE_HEADER;
-
-static int lockBtree(BtShared *pBt){
-  // ...
-  if( nPage>0 ){
-    /* EVIDENCE-OF: R-43737-39999 Every valid SQLite database file begins
-    ** with the following 16 bytes (in hex): 53 51 4c 69 74 65 20 66 6f 72 6d
-    ** 61 74 20 33 00. */
-    if( memcmp(page1, zMagicHeader, 16)!=0 ){
-      goto page1_init_failed;
+  typedef struct XLogPageHeaderData
+  {
+      uint16		xlp_magic;		/* magic value for correctness checks */
+      // ...
+  } XLogPageHeaderData;
+  ```
+- Kafka [использует magic number](https://github.com/apache/kafka/blob/9bc9fae9425e4dac64ef078cd3a4e7e6e09cc45a/clients/src/main/java/org/apache/kafka/common/record/FileLogInputStream.java#L63) в качестве номера версии
+  ```java
+  public class FileLogInputStream implements LogInputStream<FileLogInputStream.FileChannelRecordBatch> {
+      @Override
+      public FileChannelRecordBatch nextBatch() throws IOException {
+          // ...
+          
+          byte magic = logHeaderBuffer.get(MAGIC_OFFSET);
+          final FileChannelRecordBatch batch;
+  
+          if (magic < RecordBatch.MAGIC_VALUE_V2)
+              batch = new LegacyFileChannelRecordBatch(offset, magic, fileRecords, position, size);
+          else
+              batch = new DefaultFileChannelRecordBatch(offset, magic, fileRecords, position, size);
+          return batch;
+      }
+  }
+  ```
+- А может быть не числом, а строкой, как в SQLite, причем как [осмысленной](https://github.com/sqlite/sqlite/blob/f79b0bdcbfb46164cfd665d256f2862bf3f42a7c/src/btree.c#L3267), так и [случайной](https://github.com/sqlite/sqlite/blob/f79b0bdcbfb46164cfd665d256f2862bf3f42a7c/src/pager.c#L1608)
+  ```c++
+  // Заголовок журнала отката - несмысленная константа
+  /*
+  ** Journal files begin with the following magic string.  The data
+  ** was obtained from /dev/random.  It is used only as a sanity check.
+  */
+  static const unsigned char aJournalMagic[] = {
+    0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7,
+  };
+  
+  static int readJournalHdr(
+    Pager *pPager,               /* Pager object */
+    int isHot,
+    i64 journalSize,             /* Size of the open journal file in bytes */
+    u32 *pNRec,                  /* OUT: Value read from the nRec field */
+    u32 *pDbSize                 /* OUT: Value of original database size field */
+  ){
+    int rc;                      /* Return code */
+    unsigned char aMagic[8];     /* A buffer to hold the magic header */
+    i64 iHdrOff;                 /* Offset of journal header being read */
+  
+    /* Read in the first 8 bytes of the journal header. If they do not match
+    ** the  magic string found at the start of each journal header, return
+    ** SQLITE_DONE. If an IO error occurs, return an error code. Otherwise,
+    ** proceed.
+    */
+    if( isHot || iHdrOff!=pPager->journalHdr ){
+      rc = sqlite3OsRead(pPager->jfd, aMagic, sizeof(aMagic), iHdrOff);
+      if( rc ){
+        return rc;
+      }
+      if( memcmp(aMagic, aJournalMagic, sizeof(aMagic))!=0 ){
+        return SQLITE_DONE;
+      }
     }
     
-// ...
-
-page1_init_failed:
-  pBt->pPage1 = 0;
-  return rc;
-}
-```
+    // ...
+  }
+  
+  // Заголовок файла БД - человекочитаемая строка
+  #ifndef SQLITE_FILE_HEADER /* 123456789 123456 */
+  #  define SQLITE_FILE_HEADER "SQLite format 3"
+  #endif
+  
+  /*
+  ** The header string that appears at the beginning of every
+  ** SQLite database.
+  */
+  static const char zMagicHeader[] = SQLITE_FILE_HEADER;
+  
+  static int lockBtree(BtShared *pBt){
+    // ...
+    if( nPage>0 ){
+      /* EVIDENCE-OF: R-43737-39999 Every valid SQLite database file begins
+      ** with the following 16 bytes (in hex): 53 51 4c 69 74 65 20 66 6f 72 6d
+      ** 61 74 20 33 00. */
+      if( memcmp(page1, zMagicHeader, 16)!=0 ){
+        goto page1_init_failed;
+      }
+      
+  // ...
+  
+  page1_init_failed:
+    pBt->pPage1 = 0;
+    return rc;
+  }
+  ```
 
 Дополнительно можно выделить заголовки начала файлов разных форматов, например, BOM, JPEG, PNG.
 
 Но это константа, которая не зависит от данных. 
+Чаще нужна для пометки границ данных. 
 Что будет, если мы успешно запишем ее (константу), а потом в середине записи данных произойдет отказ? 
 Часть данных будет записана, а другая нет. 
-Причем мы не нельзя сказать, какая именно часть была записана успешно - запись может начаться с последней страницы.
+Причем мы не нельзя сказать, какая именно часть была записана успешно - запись устройство может начать с последней страницы.
 
 Для подобных ситуаций используют чек-суммы, которые рассчитывают по всем записываемым данным. 
 Саму чек-сумму можно хранить как в начале, так и в конце.
@@ -522,7 +563,7 @@ page1_init_failed:
 - Страница для записи, скорее всего, уже будет в памяти, т.е. меньше вероятность промаха страницы (даже если записываем 4 байта, нужно загружать 4 Кб - страницу)
 - Меньше потенциальных позиционирований головки диска
 
-Если константа по большей части является простым маркером ("дальше есть данные"), то чек-сумма может помочь в обнаружении нарушения целостности, т.к. зависит от данных.
+Если константа по большей части является простым маркером ("дальше есть данные"), то чек-сумма может помочь в обнаружении нарушения целостности.
 Этот подход используют многие приложения.
 
 Для примера:
@@ -588,7 +629,7 @@ void function() {
 В исследовании [Specifying and Checking File System Crash-Consistency Models](https://www.cs.utexas.edu/~bornholt/papers/ferrite-asplos16.pdf) подобное было названо Crash-Consistency Model - модель согласованности при сбоях. 
 Дальше буду использовать это понятие.
 
-В исследовании [All File Systems Are Not Created Equal](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-pillai.pdf) выделили следующие операции:
+В исследовании [All File Systems Are Not Created Equal](https://www.usenix.org/system/files/conference/osdi14/osdi14-paper-pillai.pdf) выделили следующие "базовые" операции:
 - Перезапись чанка файла
 - Дозапись в файл
 - Переименование
@@ -599,11 +640,9 @@ void function() {
 ### TODO: скриншот таблицы
 ![Свойства файловых систем]()
 
-> Стоит сделать замечание, что таблица показывает _найденные воспроизводимые_ нарушения. 
-> Т.е. в реальности другие файловые системы тоже могут переупорядочивать операции.
+> Стоит сделать замечание, что это тесты, таблица показывает _найденные воспроизводимые_ нарушения - если бага не найдено, это не значит, что его нет
 
-Для простоты дальше я буду называть журналируемыми файловыми системами те, у которых есть какой-либо условный буфер, в который попадают операции прежде чем примениться.
-Это могут быть soft updates, log-structured файловая система, COW.
+Для простоты дальше я буду называть журналируемыми файловыми системами те, у которых есть какой-либо условный буфер, в который попадают операции прежде чем примениться - COW, log-structured, soft updates, журнал (всех под одну гербенку).
 
 ### Атомарность 
 
@@ -627,6 +666,7 @@ void function() {
 
 Также и в исследовании [Specifying and Checking File System Crash-Consistency Models](https://www.cs.utexas.edu/~bornholt/papers/ferrite-asplos16.pdf) было изучено поведение нескольких файловых систем в случае отказа.
 Была построена следующая таблица:
+
 ### TODO: сравнение файловых систем
 
 Закрашенные точки показывают, что какое-то поведение могло привести к нарушению целостности. 
@@ -649,13 +689,13 @@ void function() {
 
 > `rename` атомарен с точки зрения запущенных в данный момент процессов, но не дает гарантий атомарности в случае отказа. 
 
-Теперь все встает на свои места.
+Тогда все встает на свои места.
 
-<spoiler title="Важное упущение в исследовании касательно ARVR/ACVR">
+<spoiler title="Важное допущение в исследовании касательно ARVR/ACVR">
 
 В исследовании изучили поведение файловых систем для `ACVR`/`ARVR` и показали, что эти операции могут быть не атомарны. 
-Но, как мне кажется, была сделана критичная ошибка в самом тесте.
-Чтобы понять, какая посмотрим на сам тест (его описание):
+Далее, конечно, было объяснение, что так делать нельзя и надо бы вызывать `fsync`.
+Чтобы понять насколько это критичное допущение, посмотрим на сам тест (его описание):
 
 ```text
 # Atomic Replace Via Rename (ARVR)
@@ -722,8 +762,7 @@ P.S. ссылки на примеры взял [отсюда](https://unix.stack
 Мы не можем сказать, в какой последовательности они были выполнены, но _можем_ утверждать, что они были выполнены, а до этого момента, состояние просто неопределеное.
 
 Вообще, `fsync()` - не барьер записи, просто его можно так использовать. 
-Подобная тема уже поднималась - было предложение добавить новый системный вызов `fbarrier()`, который им бы и являлся, но Линус идею отверг, посчитав, что это лишняя трата времени.
-### TODO: ссылка на высказывание линуса про ненужность fbarrier
+Подобная тема уже поднималась - было предложение добавить новый системный вызов `fbarrier()`, который им бы и являлся, но Линус идею [отверг](https://lwn.net/Articles/326505/), посчитав, что это добавит лишнюю сложность.
 
 ## Примеры проблем
 
@@ -883,8 +922,8 @@ Blackbaze выпустили [отчет за 2023](https://www.backblaze.com/bl
 ## ECC
 
 HDD и SSD имеют встроенную поддержку ECC - Error Correction Code, Коды Исправления Ошибок:
-- HDD имеет поддержку разметки секторов согласно [Advanced Format](https://en.wikipedia.org/wiki/Advanced_Format), который позволяет хранить ECC для всего сектора (для этого нужна дополнительная поддержка со стороный ОС, которая есть сегодня практически везде, но в случае старых систем может не быть)
-- SSD тоже имеет подобную поддержку, но только для NAND технологии (используется в "быту" - обычные SSD, USB флешки, SD карты), но в NOR не так часто (используется в микроконтроллерах и в ситуациях, когда обновления происходят редко), т.к. последний по своему устройству более надежен. 
+- HDD имеет поддержку разметки секторов согласно [Advanced Format](https://en.wikipedia.org/wiki/Advanced_Format), который позволяет хранить ECC для всего сектора (для этого нужна дополнительная поддержка со стороны ОС - сегодня она есть практически везде, но в старых системах может отсутствовать)
+- SSD тоже имеет подобную поддержку, но только для NAND технологии (в "быту" - обычные SSD, USB флешки, SD карты), но в NOR не так часто (в микроконтроллерах и в ситуациях, когда обновления происходят редко), т.к. последний по своему устройству более надежен. 
 
 Стоит учитывать еще и то, что файловые системы знают [про Advanced Format и могут под него подстраиваться](https://wiki.archlinux.org/title/Advanced_Format#File_systems), но это за рамками статьи.
 
@@ -913,22 +952,87 @@ HDD и SSD имеют встроенную поддержку ECC - Error Correc
 Вспомним про `fsync` - он должен обеспечивать сброс всех данных на диск, т.е. возвращается только когда данные уже на диске.
 Если посмотреть man для `fsync` сейчас, то можно увидеть:
 
-> The fsync() implementations in older kernels and lesser used filesystems do not know how to flush disk caches.
-> In these cases disk caches need to be disabled using hdparm(8) or sdparm(8) to guarantee safe operation. 
+> The fsync() implementations in older kernels and lesser used filesystems do not know how to flush disk caches. In these cases disk caches need to be disabled using hdparm(8) or sdparm(8) to guarantee safe operation. 
 
 Т.е. в старых версиях ядра (судя по указанной ранее версии 2.2) `fsync` не знал как правильно сбрасывать кэш диска, как не знали и некоторые малоиспользуемые файловые системы.
 
 Если верить статье [Ensuring data reaches disk](https://lwn.net/Articles/457667/), то начиная с версии 2.6.35 ext3, ext4, xfs и btrfs могут быть смонтированы с флагом `barrier`, чтобы включить барьеры (сброс дискового кэша).
 По крайней мере, в man странице для [mount](https://man.linuxexplore.com/htmlman8/mount.8.html) эти файловые системы имеют флаг `barrier`.
 
-Я немного поискал в [исходниках Linux](https://github.com/torvalds/linux/tree/master/fs) файловые системы, которые не умеют выполнять fsync, но пришел к выводу, что `fsync` не реализован только в readonly файловых системах (например, [efs](https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/efs/dir.c#L13) и [isofs](https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/isofs/dir.c#L268) не регистрируют `fsync`).
+Я немного поискал в [исходниках Linux](https://github.com/torvalds/linux/tree/a4145ce1e7bc247fd6f2846e8699473448717b37/fs) файловые системы, которые не умеют выполнять fsync, но пришел к выводу, что `fsync` не реализован только в readonly файловых системах (например, [efs](https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/efs/dir.c#L13) и [isofs](https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/isofs/dir.c#L268) не регистрируют `fsync`).
+Также если файловая система не имеет своей логики сброса данных (например, не журналируемая), то всегда может использовать обобщенную реализацию `fsync` - с помощью комбинаций других системных вызовов:
+```c++
+// https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/block/bdev.c#L203
+/*
+ * Write out and wait upon all the dirty data associated with a block
+ * device via its mapping.  Does not take the superblock lock.
+ */
+int sync_blockdev(struct block_device *bdev)
+{
+	if (!bdev)
+		return 0;
+	return filemap_write_and_wait(bdev->bd_inode->i_mapping);
+}
+EXPORT_SYMBOL(sync_blockdev);
+
+// https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/mm/filemap.c#L779
+/**
+ * file_write_and_wait_range - write out & wait on a file range
+ * @file:	file pointing to address_space with pages
+ * @lstart:	offset in bytes where the range starts
+ * @lend:	offset in bytes where the range ends (inclusive)
+ *
+ * Write out and wait upon file offsets lstart->lend, inclusive.
+ *
+ * Note that @lend is inclusive (describes the last byte to be written) so
+ * that this function can be used to write to the very end-of-file (end = -1).
+ *
+ * After writing out and waiting on the data, we check and advance the
+ * f_wb_err cursor to the latest value, and return any errors detected there.
+ *
+ * Return: %0 on success, negative error code otherwise.
+ */
+int file_write_and_wait_range(struct file *file, loff_t lstart, loff_t lend)
+{
+	int err = 0, err2;
+	struct address_space *mapping = file->f_mapping;
+
+	if (lend < lstart)
+		return 0;
+
+	if (mapping_needs_writeback(mapping)) {
+		err = __filemap_fdatawrite_range(mapping, lstart, lend,
+						 WB_SYNC_ALL);
+		/* See comment of filemap_write_and_wait() */
+		if (err != -EIO)
+			__filemap_fdatawait_range(mapping, lstart, lend);
+	}
+	err2 = file_check_and_advance_wb_err(file);
+	if (!err)
+		err = err2;
+	return err;
+}
+EXPORT_SYMBOL(file_write_and_wait_range);
+
+// https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/fs/hfs/inode.c#L661
+static int hfs_file_fsync(struct file *filp, loff_t start, loff_t end,
+			  int datasync)
+{
+    // ...
+	file_write_and_wait_range(filp, start, end);
+	// ...	
+	sync_blockdev(sb->s_bdev);
+	// ...	
+	return ret;
+}
+```
 
 ## Гарантии записи
 
 В конце хочется поговорить о том, какие гарантии записи дают разные устройства. 
 Под этим я сейчас подразумеваю 2 вещи:
 - Атомарность записи
-- Powersafe Overwrite
+- PowerSafe OverWrite (PSOW)
 
 ### Атомарность записи
 
@@ -957,9 +1061,7 @@ HDD и SSD имеют встроенную поддержку ECC - Error Correc
 
 > В случае отказа или отключения питания во время записи диапазона байтов в файл, никакие данные за пределами этого диапазона не будут изменены.
 
-Я не нашел никаких исследований или статей, которые бы сказали какая файловая система или диск поддерживает PSOW.
-Но скорее всего это из-за того, что термин специфичен для разработчиков SQLite.
-Но они говорят, что, в практическом смысле, это свойство означает наличие батареи в накопителе на случай отключения электричества для безопасной записи последних данных секторы.
+В практическом смысле, это свойство означает наличие батареи в накопителе на случай отключения электричества для безопасной записи последних данных секторы.
 
 <spoiler title="Атомарность и PSOW - не пересекаются">
 
@@ -1052,8 +1154,6 @@ HDD и SSD имеют встроенную поддержку ECC - Error Correc
 
 </spoiler>
 
-### TODO: секции "что делать" удалить
-
 На этом можно было бы и закончить, но мы пропустили один довольно важный слой - среда выполнения.
 
 # Рантайм
@@ -1076,8 +1176,7 @@ HDD и SSD имеют встроенную поддержку ECC - Error Correc
 То же самое можем увидеть в .NET - у класса `FileStream` есть перегруженный метод `Flush(bool flushToDisk)`.
 Если ему передать значение `true`, то все данные будут записаны на диск:
 
-> Use this overload when you want to ensure that all buffered data in intermediate file buffers is written to disk.
-> When you call the Flush method, the operating system I/O buffer is also flushed.
+> Use this overload when you want to ensure that all buffered data in intermediate file buffers is written to disk. When you call the Flush method, the operating system I/O buffer is also flushed.
 
 Но стоит заметить, что ничего про `fsync` не сказано.
 Да, это платформозависимая деталь реализации, но если мы хотим точно убедиться в сохранности лучше проверить.
@@ -1168,11 +1267,7 @@ int32_t SystemNative_FSync(intptr_t fd)
 
 </spoiler>
 
-То есть, при указании `true`, должен произойти вызов `fsync`.
-Дальше я захотел проверить это в реальности. 
-Для этого написал следующий код и отследил его выполнение с помощью `strace`.
-
-### TODO: ссылка на код
+То есть, при указании `true`, должен произойти вызов `fsync`. Дальше я захотел проверить это в реальности. Для этого написал следующий код и отследил его выполнение с помощью `strace`.
 
 ```cs
 using var file = new FileStream("sample.txt", FileMode.OpenOrCreate);
@@ -1196,12 +1291,9 @@ close(19)                               = 0
 2. `lseek` - Указатель смещен в самое начала
 3. `pwrite64` - Записаны наши данные
 4. `fsync(19)` - Вызов `fsync`, сброс данных на диск
-5. `close(19` - Закрыли файл
+5. `close(19)` - Закрыли файл
 
-Вот и хорошо - `fsync` вызывается. 
-Но сейчас у меня версия .NET - 8.0.1.
-Мне стало интересно, а что будет на других версиях.
-Я выставил версию .NET 7, скомпилировал с теми же параметрами и запустил `strace` уже для него:
+Вот и хорошо - `fsync` вызывается. Но для запуска я использовал версию .NET 8.0.1. Мне стало интересно, а что будет на других версиях. Я выставил версию .NET 7 (7.0.11), скомпилировал с теми же параметрами и запустил `strace` уже для него:
 
 ```shell
 openat(AT_FDCWD, "/path/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
@@ -1211,8 +1303,7 @@ flock(19, LOCK_UN)                      = 0
 close(19)                               = 0
 ```
 
-В последних строках нет `fsync`!
-Более того, если вызвать `Flush(true)` еще раз, то он появится:
+В последних строках нет `fsync`! Более того, если вызвать `Flush(true)` еще раз, то он появится:
 ```shell
 openat(AT_FDCWD, "/home/ash-blade/Projects/habr-posts/file-write/src/FileWrite.FsyncCheckNet7/bin/Release/net7.0/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
 lseek(19, 0, SEEK_CUR)                  = 0
@@ -1222,12 +1313,12 @@ flock(19, LOCK_UN)                      = 0
 close(19)                               = 0
 ```
 
-В итоге, я пришел к выводу, что первый вызов `Flush(true)` по каким-то причинам игнорируется, а последующие успешно вызывают `fsync`.
+В итоге, я пришел к выводу, что первый `Flush(true)` по каким-то причинам игнорируется, а последующие успешно вызывают `fsync`.
 
 Также стоит поговорить о возможностях, предоставляемых самим языком.
 Например, `fsync` может (и должен) вызывать на директориях, чтобы убедиться в создании или удалении файлов, поэтому нам необходимо получить файловый дескриптор директории.
 
-Тут я опять пожалуюсь на C# - понятия дескриптор для директории тут нет. 
+Тут я опять пожалуюсь на C# - понятия дескриптор для директории тут нет (наследие Windows). 
 А получить дескриптор директории обычными способами нельзя - у класса `Directory` нет метода `Open` или какого-нибудь наподобие `Sync`, а если передать в `FileStream` директорию, даже с указанием ReadOnly режима, то возникнет исключение `UnauthorizedAccessException`.
 
 Я нашел обходной путь: с помощью импорта функции `open` получаем дескриптор директории, а после создаем `SafeFileHandle`, в который его и передаем. 
@@ -1256,37 +1347,27 @@ close(19)                               = 0
 
 # Паттерны файловых операций
 
-О чем рассказать:
-- Создание инициализированного файла - create via rename
-- Обновление небольшого файла - update via rename
-- Обновление большого файла - undo/redo log
-- Удаление/создание/перемещение файла - выполняем действие и fsync директории
-
-Про другие ситуации:
-- Сегментированный лог
-
-### TODO: посмотреть про атомарность rename (он атомарен только для пользователя, но что если отказ)
-
-После рассмотрения возможных сбоев и ошибок, которые могут возникнуть на каждом слое, рассмотрим некоторые паттерны работы с файлами.
+После рассмотрения возможных сбоев и ошибок, рассмотрим как с ними можно бороться.
 
 ## Создание нового файла
 
-Жизненный цикл файла начинается с его создания.
-Когда файл создается, то он изначально пуст.
-Если нам и нужен пустой файл, то дальше можно не читать.
+Жизнь файла начинается с его создания.
+Вспомним, что просто создать файл нельзя - его на диске может и не быть к моменту возвращения функции создания.
+Поэтому, если нам нужно создать файл, то после `creat` вызываем `fsync`:
+1. `creat("/dir/data")` - Создаем файл с данными
+2. `fsync("/dir")` - Актуализируем содержимое директории файла
 
-А теперь представим, что файл уже должен быть проинициализирован.
-Как мы уже видели последовательность "создать файл", "записать данные", "закрыть" не работает, так как в случае отказа в файле может быть мусор или окажется пустым или вообще его не окажется в директории.
+Изначально, файл пуст. Но что если файл уже должен быть проинициализирован? Как мы уже видели последовательность "создать файл", "записать данные", "закрыть" не работает, так как при отказе в файле может быть мусор, окажется пустым или, вообще, не существовать.
 
-В подобных ситуациях используют упомянутый ранее паттерн `Atomic Create Via Rename`.
+Для создания полностью инициализированных файлов используют паттерн `Atomic Create Via Rename`.
 Имя говорит само за себя - для создания нового файла мы используем операцию переименования.
 
 Алгоритм для этого следующий:
 1. `creat("/dir/data.tmp")` - Создаем временный файл
 2. `write("/dir/data.tmp", new_data)` - Записываем в этот файл необходимые данные
-3. `fsync("/dir/data.tmp")` - Сбрасываем необходимые данные в файл
+3. `fsync("/dir/data.tmp")` - Сбрасываем данные временного файла
 4. `rename("/dir/data.tmp", "/dir/data")` - Переименовываем временный файл в целевой
-5. `fsync("/dir")` - Сбрасываем содержимое данных файла
+5. `fsync("/dir")` - Актуализируем содержимое директории файла
 
 В качестве примера - создание нового файла лога в [etcd](https://github.com/etcd-io/etcd/blob/4527093b166da6fb1d803649d7c0d7aef7d9b878/server/storage/wal/wal.go#L716):
 
@@ -1299,15 +1380,12 @@ func (w *WAL) cut() error {
 	fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
 
     // 1. Создание временного файла
-	
-	// create a temp wal file with name sequence + 1, or truncate the existing one
 	newTail, err := w.fp.Open()
 	if err != nil {
 		return err
 	}
 
     // 2. Записываем данные во временный файл
-    
 	// update writer and save the previous crc
 	w.locks = append(w.locks, newTail)
 	prevCrc := w.encoder.crc.Sum32()
@@ -1315,15 +1393,12 @@ func (w *WAL) cut() error {
 	if err != nil {
 		return err
 	}
-
 	if err = w.saveCrc(prevCrc); err != nil {
 		return err
 	}
-
 	if err = w.encoder.encode(&walpb.Record{Type: MetadataType, Data: w.metadata}); err != nil {
 		return err
 	}
-
 	if err = w.saveState(&w.state); err != nil {
 		return err
 	}
@@ -1335,56 +1410,39 @@ func (w *WAL) cut() error {
 		return err
 	}
 
-	off, err = w.tail().Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-
     // 4. Переименовываем временный файл в целевой
 	if err = os.Rename(newTail.Name(), fpath); err != nil {
 		return err
 	}
 	
 	// 5. Сбрасываем содержимое директории на диск
-	start := time.Now()
 	if err = fileutil.Fsync(w.dirFile); err != nil {
 		return err
 	}
-	walFsyncSec.Observe(time.Since(start).Seconds())
 
 	// reopen newTail with its new path so calls to Name() match the wal filename format
 	newTail.Close()
-
 	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
-		return err
-	}
-	if _, err = newTail.Seek(off, io.SeekStart); err != nil {
 		return err
 	}
 
 	w.locks[len(w.locks)-1] = newTail
-
 	prevCrc = w.encoder.crc.Sum32()
 	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
 	if err != nil {
 		return err
 	}
 
-	w.lg.Info("created a new WAL segment", zap.String("path", fpath))
 	return nil
 }
 ```
 
-Дополнительными комментариями я отметил соответствие описанных шагов в алгоритме и того, что выполняется в коде.
-Шаги - одни и те же и в той же последовательности.
-
+Дополнительными комментариями я отметил соответствие описанных шагов в алгоритме и того, что выполняется в коде. Шаги - одни и те же и в той же последовательности.
 Также, в конце файл заново открывается, но это необходимо для того, чтобы получать актуальное название файла, а не временное (с которым создали), и на целостность не влияет.
 
 ## Изменение файла
 
-Файл у нас есть. 
-Теперь в него необходимо внести изменения.
-Тут 2 варианта.
+Файл у нас есть. Теперь в него необходимо внести изменения. Тут 2 варианта.
 
 ### Изменение небольшого файла
 
@@ -1506,33 +1564,24 @@ Status SetCurrentFile(Env* env, const std::string& dbname,
 
 ### Изменение большого файла
 
-Но что делать, если файл большой? 
-Или самой памяти мало?
+Но что делать, если файл большой или памяти на диске мало?
 
-Вспомним с чего начинали - простая перезапись файла.
-Но теперь доработаем эту операцию так, чтобы она стала отказоустойчивой.
-Данный пример я взял из статьи [Files Are Hard](https://danluu.com/file-consistency/) и, по факту, просто перескажу ее.
-
-При записи в файл может случиться отказ и тогда, возможно, весь файл повредиться. 
-Вспомним, что может случиться:
+Вспомним с чего начинали - простая перезапись файла. Но теперь доработаем эту операцию так, чтобы она стала отказоустойчивой. Данный пример я взял из статьи [Files Are Hard](https://danluu.com/file-consistency/). 
+При записи в файл может случиться отказ и тогда, возможно, весь файл повредится. Вспомним, что может случиться:
 - Операции переупорядочиваются
 - Записаться может только часть данных
 - В файле может появиться мусор
 - Целостность содержимого может быть нарушена (даже после успешной записи)
 
-Для предоставления отказоустойчивости используется лог:
+Для предоставления отказоустойчивости используется лог операций:
 - undo (rollback) - откат изменений
 - redo (write ahead log, wal) - завершение операций
 
-Немного подробнее про применение этих логов в базах данных можно почитать [тут](http://www.cburch.com/cs/340/reading/log/index.html).
-
-Теперь - как делать отказоустойчивое изменение данных файла
+Немного подробнее про применение этих логов в базах данных можно почитать [тут](http://www.cburch.com/cs/340/reading/log/index.html). Теперь - как делать отказоустойчивое изменение данных файла
 
 #### Undo лог
 
-Undo лог хранит в себе данные, которые необходимы для отката операций.
-В случае перезаписи файла, он может хранить в себе полные участки файла, которые нужно записать обратно.
-Например, если мы хотим записать новые данные (`new_data`) начиная с 10 байта (`start`) длиной в 15 байтов (`length`), то в этот лог будут записаны байты с 10 по 15 из текущего, еще не измененного файла (`old_data`).
+Undo лог хранит в себе данные, которые необходимы для отката операций. В случае перезаписи файла, он хранит в себе полные участки файла, которые нужно записать обратно. Например, если мы хотим записать новые данные (`new_data`) начиная с 10 байта (`start`) длиной в 15 байтов (`length`), то в этот лог будут записаны байты с 10 по 15 из текущего, еще не измененного файла (`old_data`).
 
 Алгоритм записи данных будет следующим:
 
@@ -1555,22 +1604,20 @@ Undo лог хранит в себе данные, которые необход
 - Отказ перед началом записи данных в сам файл - вызываем `fsync` для файла undo лога и самой директории, после этого можно быть уверенным, что файл на диске
 - Удаление самого файла undo лога - в конце вызываем `fsync` для директории, чтобы undo лог был действительно удален, иначе могут возникнуть проблемы.
 
-Как производить восстановление теперь, наверное, стало понятно:
+Как производить восстановление, наверное, стало понятно:
 1. Проверяем наличие undo лога
    - Undo лог присутствует
    - Он не пуст
    - Все чек-суммы корректные
 2. Если undo лог проверен:
    1. Применяем к целевому файлу хранящуюся откат (к самому файлу с данными - команду из undo лога)
-   2. Сбрасываем изменения на диск
+   2. Сбрасываем изменения на диск (целевой файл)
    3. Удаляем undo лог
-   4. Сбрасываем изменения на диск
+   4. Сбрасываем изменения на диск (директория)
 
-Даже если в процессе восстановления произойдет сбой, то это не должно нарушить целостность данных, т.к. откат должен быть идемпотентен (стоит еще учитывать PSOW и атомарность сегмента, см. выше).
+Даже если в процессе восстановления произойдет сбой, то это не должно нарушить целостность данных, т.к. откат должен быть идемпотентен (стоит еще учитывать PSOW и атомарность сегмента, см. выше). 
 
-Но удаление файла более затратная операция чем та же запись, т.к. надо обновить не только данные в директории, но и, возможно, пометить страницы чистыми для очищения места на диске.
-
-В SQLite используется журнал (undo лог) и в качестве оптимизации можно использовать 2 опции:
+Но удаление файла более затратная операция чем та же запись, т.к. надо обновить не только данные в директории, но и, возможно, пометить страницы чистыми для очищения места на диске. В SQLite используется журнал (undo лог) и в качестве оптимизации можно использовать 2 опции:
 - Обрезать файл до 0 - `PRAGMA journal_mode=TRUNCATE`
 - Занулять заголовок журнала - `PRAGMA journal_mode=PERSIST`
 
@@ -1838,8 +1885,7 @@ static int full_fsync(int fd, int fullSync, int dataOnly){
 
 #### Redo лог
 
-Redo лог работает по аналогичной схеме. 
-Разница в том, что записываем в этот лог не старые, а новые данные, и после выполнения операции не удаляем. 
+Redo лог работает по аналогичной схеме. Разница в том, что записываем в этот лог не старые, а новые данные, и после выполнения операции не удаляем:
 
 1. `creat("/dir/redo.log")` - Создаем файл redo лога
 2. `write("/dir/redo.log", "[check_sum, start, length, new_data]")` - Записываем в него данные из исходного файла, которые собираемся изменить:
@@ -1856,27 +1902,17 @@ Redo лог работает по аналогичной схеме.
 
 Преимуществом redo лога можно считать, то, что ответ о завершенной операции пользователю можно отправлять как только мы успешно сделали запись в redo логе (шаг 5), т.к. изменения либо будут применены сейчас, либо при восстановлении после перезагрузки.
 
-Стоит также заметить, что постоянное создание и удаление файлов - операция затратная. 
-Для оптимизации, можно просто добавлять новые записи, которые потом надо будет просто применить при перезагрузке.
-Нужно операции коммитить, чтобы лишний раз их не применять. 
-Закоммитить записи можно с помощью с помощью специальной записи, которая добавляется в конец лога (получается каждая запись в логе может быть либо операцией, либо коммитом).
-Также можно специальным образом изменить заголовок записи операции, например, хранить флаг коммита и занулять его при завершении операции или занулять заголовок, как бы говоря, что операция применена (как в SQLite при `PRAGMA journal_mode=PERSIST`).
-
-Вот мы и пришли к WAL - Write Ahead Log. 
-По факту, это и есть тот самый redo лог.
+Стоит также заметить, что постоянное создание и удаление файлов - операция затратная. Для оптимизации, можно просто добавлять новые записи, которые потом надо будет просто применить при перезагрузке. Нужно операции коммитить, чтобы лишний раз их не применять. Закоммитить записи можно с помощью с помощью специальной записи, которая добавляется в конец лога (получается каждая запись в логе может быть либо операцией, либо коммитом). Также можно специальным образом изменить заголовок записи операции, например, хранить флаг коммита и занулять его при завершении операции или занулять заголовок, как бы говоря, что операция применена (как в SQLite при `PRAGMA journal_mode=PERSIST`). Вот мы и пришли к WAL - Write Ahead Log.
 
 <spoiler title="WAL в Postgres">
 
-Redo лог часто встречается в базах данных.
-Он есть в [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/managing-the-redo-log.html), [MySQL](https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html), [Postgres](https://www.postgresql.org/docs/current/runtime-config-wal.html) или [SQLite](https://www.sqlite.org/wal.html).
-Поэтому в качестве примера, рассмотрим как происходит работа с WAL в Postgres.
+Redo лог часто встречается в базах данных. Он есть в [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/managing-the-redo-log.html), [MySQL](https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html), [Postgres](https://www.postgresql.org/docs/current/runtime-config-wal.html) или [SQLite](https://www.sqlite.org/wal.html). Поэтому в качестве примера, рассмотрим как происходит работа с WAL в Postgres.
 
 Пример разделен на 2 части:
 1. Вызов `COMMIT` - сохранение данных в WAL
 2. Сброс грязных страниц на диск (вытеснение) - сброс данных в файл БД
 
-Уже здесь мы можем увидеть то самое преимущество WAL: достаточно сделать единственную запись (в redo лог), вернуть ответ пользователю и продолжить работать с грязными страницами в памяти.
-Сама грязная страница будет сброшена в файл БД потом, например, при очередном запуске чекпоинтера или при восстановлении после сбоя.
+Уже здесь мы можем увидеть то самое преимущество WAL: достаточно сделать единственную запись (в redo лог), вернуть ответ пользователю и продолжить работать с грязными страницами в памяти. Сама грязная страница будет сброшена в файл БД потом, например, при очередном запуске чекпоинтера или при восстановлении после сбоя.
 
 ```c++
 // 1. Вызов COMMIT
@@ -2074,15 +2110,11 @@ FileSync(File file, uint32 wait_event_info)
 
 ## Сегментированный лог + снапшот
 
-Раз поговорили про WAL, то стоит и рассказать про сегментированный лог.
-[Сегментированный лог](https://martinfowler.com/articles/patterns-of-distributed-systems/segmented-log.html) - это паттерн представления единого "логического" лога в виде нескольких "физических" сегментов:
+Раз поговорили про WAL, то стоит и рассказать про сегментированный лог. [Сегментированный лог](https://martinfowler.com/articles/patterns-of-distributed-systems/segmented-log.html) - это паттерн представления единого "логического" лога в виде нескольких "физических" сегментов:
 - Раньше - единственный жирный файл, который хранил в себе все.
 - Теперь - множество небольших (в сравнении в единственным файлом) сегментов.
 
-Но сам по себе сегментированный лог имеет не так много преимуществ, в сравнении с единственным файлом.
-Вот тут приходит снапшот - слепок состояния приложения, к которому применили определенные команды из лога.
-
-Вот эта иллюстрация из статьи про Raft визуализирует отношения между логом и снапшотом:
+Но сам по себе сегментированный лог имеет не так много преимуществ, в сравнении с единственным файлом. Вот тут приходит снапшот - слепок состояния приложения, к которому применили определенные команды из лога. Вот эта иллюстрация из статьи про Raft визуализирует отношения между логом и снапшотом:
 
 #### TODO: иллюстрация 12 из In Search Of Understandable Consesnsus
 
@@ -2097,8 +2129,7 @@ FileSync(File file, uint32 wait_event_info)
 - Когда поступает команда для изменения состояния - записываем ее в наш лог (запись в redo лог обсуждалась)
 - Создание новых сегментов лога - через `Atomic Create Via Rename`
 
-Если у нас не сегментированный лог, а _монолог_ (название придумал сам), то освобождение места (удаление примененных команд или их сжатие) будет затруднительно, т.к. отказоустойчивое изменение потребует копирования всех записей из лога и последующего `ARVR`.
-При большом размере лога, эта операция может занять много времени и ресурсов, но, в случае с сегментированным, достаточно просто удалить/сжать покрываемые снапшотом сегменты. 
+Если у нас не сегментированный лог, а _монолог_ (название придумал сам), то освобождение места (удаление примененных команд или их сжатие) будет затруднительно, т.к. отказоустойчивое изменение потребует копирования всех записей из лога и последующего `ARVR`. При большом размере лога, эта операция может занять много времени и ресурсов, но, в случае с сегментированным, достаточно просто удалить/сжать покрываемые снапшотом сегменты. 
 
 Некоторые примеры:
 - Postgres: WAL представляется в виде нескольких [сегментов](https://habr.com/ru/companies/otus/articles/717684/)
@@ -2116,26 +2147,18 @@ FileSync(File file, uint32 wait_event_info)
 
 # Заключение
 
-Все началось со статьи [Files Are Hard](https://danluu.com/file-consistency/).
-Тогда я понял зачем нужны чек-суммы, что данные после записи надо сбрасывать (`fsync`) и, вообще, файлы не так просты. 
-После, я решил копнуть поглубже и понял насколько глубока эта кроличья нора.
-Писать закончил с трудом, т.к. постоянно хотелось поискать еще каких-нибудь исследований, найти неизвестные факты и т.д.
+Все началось со статьи [Files Are Hard](https://danluu.com/file-consistency/). Тогда я понял зачем нужны чек-суммы, что данные после записи надо сбрасывать (`fsync`) и, вообще, файлы не так просты. После, я решил копнуть поглубже и понял насколько глубока эта кроличья нора. Писать закончил с трудом, т.к. постоянно хотелось поискать еще каких-нибудь исследований, найти неизвестные факты и т.д. Главный вывод из всей статьи - файловая абстракция протекает. Если приложение работает с файлами и при этом данные важны, то необходимо понимать как устроена файловая запись и паттерны для работы с ней. В противном случае, вероятность потери данных или нарушения логики работы системы/приложения резко возрастают.
 
-Главный вывод из всей статьи - файловая абстракция протекает. 
-Если приложение работает с файлами и при этом данные важны, то необходимо понимать как устроена файловая запись и паттерны для работы с ней.
-В противном случае, вероятность потери данных или нарушения логики работы системы/приложения резко возрастают.
-
-Я прошелся по основным слоям, которые проходит запрос записи.
-Но некоторые темы не покрыты:
+Я прошелся по основным слоям, которые проходит запрос записи, но некоторые темы не покрыты:
 - Поведение сетевых файловых систем
 - Описание устройства накопителей данных
 - Устройство и реализация файловых систем
 - Сравнение различных файловых систем
 - Кроссплатформенность (точнее говоря, каких гарантий можно достичь на различных платформах - ОС, рантайм, железо)
 - Баги в реализациях (они есть, например, TODO: ссылки на баги)
+- Поведение внутри эмуляторов (Cygwin, WSL) или виртуальных машин (VMWare, VirtualBox)
 
-Надеюсь, статья была полезна. 
-Полезные ссылки прилагаю:
+Надеюсь, статья была полезна. Полезные ссылки прилагаю:
 
 Файловые системы:
 - [Files Are Hard](https://danluu.com/file-consistency/)
