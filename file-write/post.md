@@ -440,7 +440,7 @@ void sample_function()
 Вроде бы вот таблетка от проблем - выбирай файловую систему с журналом (или другим механизмом) и радуйся жизни. Но нет. Исследование [Model-Based Failure Analysis of Journaling File Systems](https://research.cs.wisc.edu/wind/Publications/sfa-dsn05.pdf) показало, что даже журналируемые файловые системы могут оставить систему в некорректном состоянии. Было изучено поведение 3 файловых систем (ext3, reiserfs и jfs) при возникновении ошибки записи блока. Результат их работы приведен в следующей таблице. 
 
 ### TODO: таблица
-![Ошибки в журналируемых файловых системах](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/img/model-based-failure-analysis-figure-2.png)
+![Ошибки в журналируемых файловых системах](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/model-based-failure-analysis-figure-2.png)
 
 Можно заметить, что каждая из этих файловых систем может оставить содержимое файла (Data Block) в некорректном состоянии (DC, Data Corruption). То есть, на журналирование полагаться не стоит.
 
