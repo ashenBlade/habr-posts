@@ -2,7 +2,7 @@ using BenchmarkDotNet.Attributes;
 
 namespace FileWrite.Benchmarks;
 
-public class BufferedVsUnbufferedWriteBenchmarks
+public class AlignedWriteBenchmarks
 {
     public const string FileName = "sample.txt";
     private const int IterationsCount = 1024 * 16;
@@ -15,8 +15,9 @@ public class BufferedVsUnbufferedWriteBenchmarks
     public void GlobalSetup()
     {
         _fileStream = new FileStream(FileName, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, bufferSize: 0, FileOptions.WriteThrough);
-        _bufferedStream = new BufferedStream(_fileStream, 2 * 4 * 1024);
-        _chunk = new byte[1024 * 4];
+        const int sectorSize = 512;
+        _bufferedStream = new BufferedStream(_fileStream, sectorSize * 8);
+        _chunk = new byte[sectorSize];
         var random = new Random(42);
         random.NextBytes(_chunk);
     }
@@ -51,7 +52,6 @@ public class BufferedVsUnbufferedWriteBenchmarks
         {
             _bufferedStream.Write(_chunk);
         }
-        
         _bufferedStream.Flush();
     }
 }

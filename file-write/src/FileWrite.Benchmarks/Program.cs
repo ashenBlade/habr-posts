@@ -1,4 +1,5 @@
 ﻿using BenchmarkDotNet.Running;
 using FileWrite.Benchmarks;
 
-BenchmarkRunner.Run<BufferedVsUnbufferedWriteBenchmarks>();
+BenchmarkRunner.Run<AlignedWriteBenchmarks>();
+BenchmarkRunner.Run<UnalignedWriteBenchmarks>();
