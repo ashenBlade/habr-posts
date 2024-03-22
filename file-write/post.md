@@ -621,7 +621,7 @@ void function() {
 - [Java](https://www.cs.umd.edu/~pugh/java/memoryModel/jsr133.pdf) 
 - [Python](https://peps.python.org/pep-0583/)
 - [Go](https://go.dev/ref/mem)
-- [Rust](https://doc.rust-lang.org/nomicon/atomics.html
+- [Rust](https://doc.rust-lang.org/nomicon/atomics.html)
 - [AMD64](https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24592.pdf)
 
 Но оставим ЯП на потом. Сейчас важно понять, что для файловых систем тоже можно определить подобные правила переупорядочивания.
