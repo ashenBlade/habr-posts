@@ -1216,7 +1216,7 @@ close(19)                               = 0
 
 В последних строках нет `fsync`! Более того, если вызвать `Flush(true)` еще раз, то он появится:
 ```shell
-openat(AT_FDCWD, "/home/ash-blade/Projects/habr-posts/file-write/src/FileWrite.FsyncCheckNet7/bin/Release/net7.0/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
+openat(AT_FDCWD, "/path/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
 lseek(19, 0, SEEK_CUR)                  = 0
 pwrite64(19, "hello, world", 12, 0)     = 12
 fsync(19)                               = 0
@@ -1252,6 +1252,13 @@ lseek(19, 0, SEEK_CUR)                  = 0
 fsync(19)                               = 0
 close(19)                               = 0
 ```
+
+## Итог
+
+В результате, мы имеем то, что каждый слой, участвующий в процессе выполнения записи имеет свои подводные камни, которые стоит учитывать. Все они могут привести к нарушению целостности, образованию мусора, потере данных и других не очень приятных исходов.
+На этой диаграмме показан рассмотренный стек вызовов и эти самые детали.
+
+![Стек вызовов операции записи](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/write-call-stack.png)
 
 # Паттерны файловых операций
 
