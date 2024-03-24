@@ -1320,17 +1320,17 @@ func (w *WAL) cut() error {
 
 	// atomically move temp wal file to wal file
     
-    // 3. Сбрасываем данные файла на диск
+    // 3-4. Сбрасываем данные файла на диск
 	if err = w.sync(); err != nil {
 		return err
 	}
 
-    // 4. Переименовываем временный файл в целевой
+    // 5. Переименовываем временный файл в целевой
 	if err = os.Rename(newTail.Name(), fpath); err != nil {
 		return err
 	}
 	
-	// 5. Сбрасываем содержимое директории на диск
+	// 6. Сбрасываем содержимое директории на диск
 	if err = fileutil.Fsync(w.dirFile); err != nil {
 		return err
 	}
