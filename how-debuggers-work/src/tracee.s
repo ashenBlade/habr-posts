@@ -9,17 +9,24 @@ message: .asciz "%ld + %ld = %ld\n"
 main:
     # Alignment 
     subq $8, %rsp
+    
+    pushq %rdi
+    pushq %rsi
+
+    movq $5, %rdi
+    movq $1, %rsi
+    movq $48, %rax
+    syscall
+
+    popq %rsi
+    popq %rdi
 
     # \if (argc != 3) return 1;
     movq %rdi, %rax
     movq %rsi, %rbx
     cmpl $3, %edi
-    jz args_passed
-    addq $8, %rsp
-    movq $1, %rax
-    ret
+    jnz main_error_exit
     
-args_passed:
     # long left = parse_number(argv, 1)
     pushq %rdi
     pushq %rsi
@@ -29,7 +36,7 @@ args_passed:
     popq %rsi
     popq %rdi
 
-    pushq %rax
+    pushq %rax # left
 
     # long right = parse_number(argv, 2)
     pushq %rdi
@@ -40,7 +47,7 @@ args_passed:
     popq %rsi
     popq %rdi
 
-    pushq %rax
+    pushq %rax # right
 
     # long result = sum(left, right)
     pushq %rsi
@@ -53,20 +60,44 @@ args_passed:
     popq %rdi
     popq %rsi
 
+    pushq %rax # sum
+
+    # raise(SIGCHLD)
+
+    # In signal handler, stack will look like this
+    # | ..... |
+    # |-------|
+    # | left  |
+    # |-------| <-------- %rsp - 24
+    # | right |
+    # |-------| <-------- %rsp - 16
+    # |  sum  |
+    # |-------| <-------- %rsp - 8
+    # | %rdi  |
+    # |-------| <-------- %rsp
+    # 
+    # We use SIGCHLD, because it ignored by default
+
+    pushq %rdi
+    movq $17, %rdi
+    call raise
+    popq %rdi
+
     # printf(message, left, right, result)
     leaq message(%rip), %rdi
-    popq %rsi 
-    popq %rdx 
-    movq %rax, %rcx 
+    popq %rcx # sum
+    popq %rdx # right
+    popq %rsi # left
     call printf
 
-    int $3
-
     # return 0
-    popq %rsi
-    popq %rdi
     addq $8, %rsp
     movq $0, %rax
+    ret
+
+main_error_exit:
+    addq $8, %rsp
+    movq $1, %rax
     ret
 
 # long sum(long left, long right)
