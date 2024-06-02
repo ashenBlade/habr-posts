@@ -26,79 +26,36 @@ static void tracee_main(int argc, char **argv)
     exit(EXIT_FAILURE);
 }
 
-static const char *rbp_addr_filename = "./rbp_addr_test";
-
-static int
-obtain_rbp_address(long *addr)
-{
-    int fd = open(rbp_addr_filename, O_RDONLY);
-    if (fd == -1)
-    {
-        if (errno == ENOENT)
-        {
-            return -1;
-        }
-
-        perror("open");
-        exit(1);
-    }
-
-    *addr = 0;
-    if (read(fd, (void *)addr, sizeof(long)) == -1)
-    {
-        perror("read");
-        exit(1);
-    }
-
-    if (close(fd) == -1)
-    {
-        perror("close");
-        exit(1);
-    }
-
-    if (unlink(rbp_addr_filename) == -1)
-    {
-        perror("unlink");
-        exit(1);
-    }
-
-    return 0;
-}
-
 static int perform_action(pid_t child_pid)
 {
     /*
-     * Stack:
-     * | ....  <--- %rbp
-     * | left  <--- %rbp - 8
-     * | right <--- %rbp - 16
-     * | sum   <--- %rbp - 24
+     * Registers
+     * | left  <--- %rsi
+     * | right <--- %rdx
+     * | sum   <--- %rcx
      */
-    long rbp_addr;
-    if (obtain_rbp_address(&rbp_addr) == -1)
-    {
-        return 0;
-    }
 
-    long right_addr = rbp_addr - 16;
-    errno = 0;
-    long right_data = ptrace(PTRACE_PEEKDATA, child_pid, (void *)right_addr, NULL);
-    if (errno != 0)
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, child_pid, NULL, &regs) == -1)
     {
-        perror("ptrace(1)");
+        perror("ptrace");
         return -1;
     }
 
-    if (right_data != 3)
+    if (regs.rdx != 3)
     {
         return 0;
     }
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTRAP);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    
+    regs.rdx = 0;
 
-    right_data = 0;
-
-    if (ptrace(PTRACE_POKEDATA, child_pid, (void *)right_addr, (void *)right_data) == -1)
+    if (ptrace(PTRACE_SETREGS, child_pid, NULL,  &regs)  ==  -1)
     {
-        perror("ptrace(2)");
+        perror("ptrace");
         return -1;
     }
 
@@ -127,9 +84,15 @@ static void tracer_main(pid_t child_pid)
             exit(EXIT_SUCCESS);
         }
 
-        if (perform_action(child_pid) == -1)
+        if (WSTOPSIG(wstatus) == SIGTRAP)
         {
-            break;
+            /* 
+             * Остановились из-за точки останова
+             */
+            if (perform_action(child_pid) == -1)
+            {
+                break;
+            }
         }
 
         if (ptrace(PTRACE_CONT, child_pid, NULL, NULL) == -1)
