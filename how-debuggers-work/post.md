@@ -2243,12 +2243,360 @@ TODO: код
 
 </spoiler>
 
+TODO: разница между O0 и Og
+
 ## Исследуем gdb
 
-- Обзор архитектуры
-- Как step in/out/over реализованы
-- Замечание по поводу отступов (не соблюдаются)
-- Детали реализации интересные
+Теперь давайте посмотрим на то, как работают настоящие отладчики. Сделаем это на примере gdb.
+
+### Структура файлов
+
+gdb использует множество библиотек для своей работы. Все они содержатся внутри репозитория. Пройдемся по основным:
+
+- libbfd (Binary File Descriptor) - обработка объектных файлов различного формата (ELF, a.out, IEEE 695, mach-o ...)
+- libopcodes - библиотека для дизассемблирования инструкций
+- cpu - множество файлов описывающих особенности некоторых архитектур ЦП. Файлы имеют расширения `.cpu` и `.opc`, хотя исходный код `Scheme` и `C` соответственно (в комментарии на 1 строке указан исходный код).
+- gas - ассебмлер GNU
+- gprof - профилировщик GNU
+- libintl - библиотека для интернационализации (основана на gettext)
+- ld - линковщик GNU
+- libdecnumber - библиотека для работы с десятичными числами (32/64/128 битных)
+- libiberty - библиотека, содержащая множество вспомогательных функций, которые используются во многих проектах GNU (например, реализация `random` или `sha`)
+- libreadline - библиотека, содержащая множество функций для реализации интерактивной командной строки (история, автодополнение, буферизация...)
+- sim - симулятор некоторых ЦП (при запуске gdb в режиме симуляции)
+- zlib - библиотека для сжатия
+- binutils - набор различных утилит для работы с объектными и исполняемыми файлами (ld, gas, grpof, nm, objdump ...)
+- gold - линковщик для ELF файлов с упором на скорость
+- elfcpp - библиотека для чтения и записи ELF файлов
+
+### Архитектура
+
+TODO: формат отладки SOM
+
+TODO: ссылка на event-loop файл
+
+Архитектура GDB - событийно-ориентированная. Для обработки событий используется цикл событий.
+Его реализация располагается в [`event-loop.c`]().
+Всего есть 3 типа событий (в скобках указана функция обработчик типа события):
+
+- Таймауты событий (`poll_timers`)
+- Файловые дескрипторы (`gdb_wait_for_event`)
+- Асинхронные события (`check_async_event_handlers`)
+
+TODO: уточнить
+Работа с командной строкой ведется как с файловым дескриптором.
+
+В проекте существует огромное количество файлов и каждый файл отвечает за свою функциональность.
+Каждый такой файл можно считать отдельным модулем со своими интерфейсом и состоянием.
+Их достаточно много и для автоматизации существует инфраструктура - каждый модуль определяет глобальную функцию `_initialize_XXX` (где XXX - название какой-либо фукциональности) и в момент сборки (через make) создается функция `initialize_files`, которая поочередно вызывает все эти функции.
+Например, в файле `breakpoint.c` находится функционал для работы с точками останова и для его инициализации существует функция `_initialize_breakpoint`.
+
+Для выполнения команд существует своя инфраструктура. Все команды регистрируются в едином реестре.
+Регистрация команды выполняется с помощью функции `add_cmd`, причем у функции команды должна быть следующая сигнатура:
+
+```c
+void cmd_simple_func_ftype (const char *args, int from_tty);
+```
+
+Каждой команде помимо ее аргументов отдается флаг `from_tty` - исполняется ли в интерактивном терминале.
+
+Можно заметить, что все команды - это функции, не методы класса, и передаются только аргументы команды.
+Это потому что состояние хранится в глобальных переменных, либо получается через публичный интерфейс (но также хранится в `static` переменных).
+
+В терминах gdb отлаживаемый процесс называется inferrior. Причина этого в том, что отлаживаться может не только процесс, но и core-dump или симулируемый процесс (не настоящий).
+
+gdb должен быть максимально кросс-платформенным и поддерживать самые разнообразные форматы отладки и объектных файлов.
+Это достигается с помощью абстракций.
+
+Так, `gdbarch` - структура, которая представляет целевую платформу. Она хранит в себе не только состояние (например, размер переменной `long double`), но и функции взаимодействия (например, для получения `PC` регистра).
+Каждая поддерживаемая архитектура реализует все необходимые функции. Если указатель на функцию `NULL`, значит функциональность не реализована/поддерживается.
+Например, для функции `skip_main_prologue` нашел поддерживаемые архитектуры: x86_64, x86, FR-V, RS/6000, ARM.
+
+Для расширяемости многие части реализованы в виде интерфейса (в C стиле - структура с указателями).
+Многие из таких имеют суффикс `ops`.
+Например, есть интерфейсы для:
+
+- Точек останова - `breakpoint_ops` (поставить точку останова)
+- Отлаживаемого процесса - `target_ops` (продолжить выполнение, присоединиться)
+- Скриптового языка - `extension_language_script_ops` (GDB, python)
+- Динамических библиотек - `solib_ops` (открытие, адрес загрузки)
+- Чисел с плавающей точкой - `target_float_ops` (мат. операции, приведение к строке, приведение к другому типу)
+- Записи трейса - `trace_file_write_ops` (открытие/закрытие файла, запись)
+- Вычисления адреса символа - `symbol_computed_ops` (описание расположения, получение значения)
+
+Есть много других, но о них не буду говорить.
+
+<spoiler title="О стиле кода">
+
+TODO: про отступы, стиль кода, смешение C и C++
+
+</spoiler>
+
+Моя машина - Linux, x86_64. Для нее будут использованы следующие ops/функции:
+
+- `svr4_so_ops` - взаимодействие с динамическими библиотеками SVR4
+- `code_breakpoint_ops` - дефолтный интерфейс создания точек останова
+- `amd64_linux_XXX` - семейство функций для работы с платформой - регистры, стек ... (находятся в `amd64-linux-tdep.c`)
+- `i386_gdbarch_tdep` - структура с платформо-зависимыми функциями (включает в себя `amd64_linux_XXX` функции выше)
+
+Теперь, рассмотрим то, как реализуется функциональность написанная ранее.
+
+### Точки останова
+
+Начнем с точек останова.
+
+В gdb имеется общая структура `breakpoint`. Она может представлять не только точки останова, но трейспоинты ([tracepoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Tracepoints.html)), и вотчпоинты ([watchpoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Set-Watchpoints.html)).
+Дополнительно, они разделяются на `Software` и `Hardware` - последние реализуются с помощью поддержки железа (как можно догадаться). Например, с их помощью можно реализовать отслеживание изменения какого-либо участка памяти (data breakpoint).
+
+В перечислении `bp_loc_type` хранятся различаемые типы точек останова:
+
+```c
+enum bp_loc_type
+{
+  bp_loc_software_breakpoint,
+  bp_loc_hardware_breakpoint,
+  bp_loc_software_watchpoint,
+  bp_loc_hardware_watchpoint,
+  bp_loc_tracepoint,
+  bp_loc_other
+};
+```
+
+Чтобы поставить точку останова необходимо вызвать большое количество функций.
+По большей части это все абстракции.
+
+Но логика выставления точки останова практически такая же как написали мы: находим адрес инструкции, читаем старое значение, заменяем первый байт на `0xCC`, записываем и сохраняем старое значение.
+TODO: ссылка
+Эта логика хранится в [`default_memory_insert_breakpoint`](gdb/mem-break.c)
+
+<spoiler title="default_memory_insert_breakpoint">
+
+```c++
+/* Insert a breakpoint on targets that don't have any better
+   breakpoint support.  We read the contents of the target location
+   and stash it, then overwrite it with a breakpoint instruction.
+   BP_TGT->placed_address is the target location in the target
+   machine.  BP_TGT->shadow_contents is some memory allocated for
+   saving the target contents.  It is guaranteed by the caller to be
+   long enough to save BREAKPOINT_LEN bytes (this is accomplished via
+   BREAKPOINT_MAX).  */
+
+int
+default_memory_insert_breakpoint (struct gdbarch *gdbarch,
+				  struct bp_target_info *bp_tgt)
+{
+  CORE_ADDR addr = bp_tgt->placed_address;
+  const unsigned char *bp;
+  gdb_byte *readbuf;
+  int bplen;
+  int val;
+
+  /* Determine appropriate breakpoint contents and size for this address.  */
+  bp = gdbarch_sw_breakpoint_from_kind (gdbarch, bp_tgt->kind, &bplen);
+
+  /* Save the memory contents in the shadow_contents buffer and then
+     write the breakpoint instruction.  */
+  readbuf = (gdb_byte *) alloca (bplen);
+  val = target_read_memory (addr, readbuf, bplen);
+  if (val == 0)
+    {
+      /* These must be set together, either before or after the shadow
+	 read, so that if we're "reinserting" a breakpoint that
+	 doesn't have a shadow yet, the breakpoint masking code inside
+	 target_read_memory doesn't mask out this breakpoint using an
+	 unfilled shadow buffer.  The core may be trying to reinsert a
+	 permanent breakpoint, for targets that support breakpoint
+	 conditions/commands on the target side for some types of
+	 breakpoints, such as target remote.  */
+      bp_tgt->shadow_len = bplen;
+      memcpy (bp_tgt->shadow_contents, readbuf, bplen);
+
+      val = target_write_raw_memory (addr, bp, bplen);
+    }
+
+  return val;
+}
+```
+
+</spoiler>
+
+> Также стоит отметить, что точки останова выставляются лениво - только после продолжения выполнения (команда `continue`).
+> До этого изменения просто накапливаются.
+
+Но перед тем как переходить к следующему шагу, надо рассмотреть то, как происходит работа с памятью отлаживаемого процесса.
+Здесь также используется своя инфраструктура.
+Функции `target_read_raw_memory` и `target_write_raw_memory` можно назвать интерфейсом этой инфраструктуры - чтение и запись, соответственно.
+Платформо-зависимые функции хранятся в `target_ops` (см. выше). Здесь нам интересна функция/поле `to_xfer_partial`.
+Функции которые занимаются чтением/записью памяти имеют в себе `xfer` (`X transFER`) - потому что в ядре своем имеется одна и та же функция, а ее логика зависит от передаваемых аргументов.
+
+gdb хранит внутри вебя кэш памяти процесса. Когда происходит запрос на чтение или запись, то вначале информация ищется в нем.
+Этот кэш называется 
+
+Теперь вопрос - как ведется работа с памятью в процессе? В своем отладчике я использовал `ptrace`. Это рабочий подход, но если потребуется прочитать большой участок памяти, то могут возникнуть проблемы с производительностью.
+Эта задача решается тем, что мы читаем из файла памяти процесса - `/proc/<PID>/mem`.
+Для чтения/записи используются `pread64` и `pwrite64` соответственно (либо обычные `read`/`write` если отсутствуют).
+
+Сама функция для чтения/записи памяти из файла:
+
+<spoiler title="linux_proc_xfer_memory_partial_fd">
+
+```c++
+/* Helper for linux_proc_xfer_memory_partial and
+   proc_mem_file_is_writable.  FD is the already opened /proc/pid/mem
+   file, and PID is the pid of the corresponding process.  The rest of
+   the arguments are like linux_proc_xfer_memory_partial's.  */
+
+static enum target_xfer_status
+linux_proc_xfer_memory_partial_fd (int fd, int pid,
+				   gdb_byte *readbuf, const gdb_byte *writebuf,
+				   ULONGEST offset, LONGEST len,
+				   ULONGEST *xfered_len)
+{
+  ssize_t ret;
+
+  gdb_assert (fd != -1);
+
+  /* Use pread64/pwrite64 if available, since they save a syscall and
+     can handle 64-bit offsets even on 32-bit platforms (for instance,
+     SPARC debugging a SPARC64 application).  But only use them if the
+     offset isn't so high that when cast to off_t it'd be negative, as
+     seen on SPARC64.  pread64/pwrite64 outright reject such offsets.
+     lseek does not.  */
+#ifdef HAVE_PREAD64
+  if ((off_t) offset >= 0)
+    ret = (readbuf != nullptr
+	   ? pread64 (fd, readbuf, len, offset)
+	   : pwrite64 (fd, writebuf, len, offset));
+  else
+#endif
+    {
+      ret = lseek (fd, offset, SEEK_SET);
+      if (ret != -1)
+	ret = (readbuf != nullptr
+	       ? read (fd, readbuf, len)
+	       : write (fd, writebuf, len));
+    }
+
+  if (ret == -1)
+    {
+      linux_nat_debug_printf ("accessing fd %d for pid %d failed: %s (%d)",
+			      fd, pid, safe_strerror (errno), errno);
+      return TARGET_XFER_E_IO;
+    }
+  else if (ret == 0)
+    {
+      /* EOF means the address space is gone, the whole process exited
+	 or execed.  */
+      linux_nat_debug_printf ("accessing fd %d for pid %d got EOF",
+			      fd, pid);
+      return TARGET_XFER_EOF;
+    }
+  else
+    {
+      *xfered_len = ret;
+      return TARGET_XFER_OK;
+    }
+}
+```
+
+</spoiler>
+
+> У этого подхода есть преимущество - мы можем продолжить читать память даже если какой-то поток будет уничтожен.
+> Более того - это файл, значит мы можем читать память даже тогда, когда все потоки запущены (`ptrace` такое не допускает)
+
+Но это возможно только если `/proc/<PID>/mem` файл доступен для записи. Для устаревших ядер (в документации указывается ядро RHEL6) происходит откат к `ptrace` реализации.
+
+Логика чтения с помощью `ptrace` заключена в функции `inf_ptrace_peek_poke`.
+Она довольно проста - последовательно вызываем `ptrace` пока буфер не окажется нужной длины.
+Единственное, что хочется отметить - `ptrace` обернут своей функцией `gdb_ptrace`.
+
+<spoiler title="inf_ptrace_peek_poke">
+
+```c++
+/* Transfer data via ptrace into process PID's memory from WRITEBUF, or
+   from process PID's memory into READBUF.  Start at target address ADDR
+   and transfer up to LEN bytes.  Exactly one of READBUF and WRITEBUF must
+   be non-null.  Return the number of transferred bytes.  */
+
+static ULONGEST
+inf_ptrace_peek_poke (ptid_t ptid, gdb_byte *readbuf,
+		      const gdb_byte *writebuf,
+		      ULONGEST addr, ULONGEST len)
+{
+  ULONGEST n;
+  unsigned int chunk;
+
+  /* We transfer aligned words.  Thus align ADDR down to a word
+     boundary and determine how many bytes to skip at the
+     beginning.  */
+  ULONGEST skip = addr & (sizeof (PTRACE_TYPE_RET) - 1);
+  addr -= skip;
+
+  for (n = 0;
+       n < len;
+       n += chunk, addr += sizeof (PTRACE_TYPE_RET), skip = 0)
+    {
+      /* Restrict to a chunk that fits in the current word.  */
+      chunk = std::min (sizeof (PTRACE_TYPE_RET) - skip, len - n);
+
+      /* Use a union for type punning.  */
+      union
+      {
+	PTRACE_TYPE_RET word;
+	gdb_byte byte[sizeof (PTRACE_TYPE_RET)];
+      } buf;
+
+      /* Read the word, also when doing a partial word write.  */
+      if (readbuf != NULL || chunk < sizeof (PTRACE_TYPE_RET))
+	{
+	  errno = 0;
+	  buf.word = gdb_ptrace (PT_READ_I, ptid,
+				 (PTRACE_TYPE_ARG3)(uintptr_t) addr, 0);
+	  if (errno != 0)
+	    break;
+	  if (readbuf != NULL)
+	    memcpy (readbuf + n, buf.byte + skip, chunk);
+	}
+      if (writebuf != NULL)
+	{
+	  memcpy (buf.byte + skip, writebuf + n, chunk);
+	  errno = 0;
+	  gdb_ptrace (PT_WRITE_D, ptid, (PTRACE_TYPE_ARG3)(uintptr_t) addr,
+		  buf.word);
+	  if (errno != 0)
+	    {
+	      /* Using the appropriate one (I or D) is necessary for
+		 Gould NP1, at least.  */
+	      errno = 0;
+	      gdb_ptrace (PT_WRITE_I, ptid, (PTRACE_TYPE_ARG3)(uintptr_t) addr,
+			  buf.word);
+	      if (errno != 0)
+		break;
+	    }
+	}
+    }
+
+  return n;
+}
+```
+
+</spoiler>
+
+<spoiler title="Другой вариант чтения памяти">
+
+TODO: тут про process_vm_readv/process_vm_writev
+
+process_vm_writev - не поддерживает запись в RO секции (например, чтобы поставить точку останова)
+
+/proc/pid/mem - доступ даже если 
+
+</spiler>
+
+### Step in/out/over
+
+### Детали реализации интересные
+
+- Отступы
 
 # Особенности управляемых языков
 
