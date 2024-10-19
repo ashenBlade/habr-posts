@@ -2341,9 +2341,190 @@ TODO: про отступы, стиль кода, смешение C и C++
 
 Теперь, рассмотрим то, как реализуется функциональность написанная ранее.
 
+### Старт
+
+Для начала, рассмотрим что происходит на старте: запуск процесса и чтение символов.
+
+Первым идет чтение символов запускаемого файла - как основные, так и отладочные.
+Я компилирую в ELF, поэтому для его чтения используется функция `elf_symfile_read`.
+
+Для чтения отладочных символов DWARF используется `cooked_index_worker`.
+Точнее это интерфейс, который реализуют 2 основных класса и каждый ответственнен за свою секцию:
+
+- `cooked_index_debug_names` - `.debug_names`
+- `cooked_index_debug_info` - `.debug_info`, `.debug_types` ...
+
+Первый - читает все строки из `.debug_names` секции.
+Более интересен второй, так как в `.debug_info` и `.debug_types` содержится основная отладочная информация - DIE.
+
+Логика обработки `.debug_info` (со всеми его DIE) содержится в методе `index_dies` класса `cooked_indexer`.
+Там находится большой `while` цикл, проходящийся по всем DIE и рекурсивно спускающийся к дочерним.
+Например, вот кусок обработки `DW_TAG_subprogram`:
+
+<spoiler title="Обработка DW_TAG_subprogram">
+
+```c++
+const gdb_byte *
+cooked_indexer::index_dies (cutu_reader *reader,
+			    const gdb_byte *info_ptr,
+			    const cooked_index_entry *parent_entry,
+			    bool fully)
+{
+  const gdb_byte *end_ptr = (reader->buffer
+			     + to_underlying (reader->cu->header.sect_off)
+			     + reader->cu->header.get_length_with_initial ());
+
+  while (info_ptr < end_ptr)
+    {
+      sect_offset this_die = (sect_offset) (info_ptr - reader->buffer);
+      unsigned int bytes_read;
+      const abbrev_info *abbrev = peek_die_abbrev (*reader, info_ptr,
+						   &bytes_read);
+      info_ptr += bytes_read;
+      if (abbrev == nullptr)
+	break;
+
+      const char *name = nullptr;
+      parent_map::addr_type defer {};
+      cooked_index_flag flags = IS_STATIC;
+      sect_offset sibling {};
+      const cooked_index_entry *this_parent_entry = parent_entry;
+
+      info_ptr = scan_attributes (reader->cu->per_cu, reader, info_ptr,
+				  info_ptr, abbrev, &name, &linkage_name,
+				  &flags, &sibling, &this_parent_entry,
+				  &defer, &is_enum_class, false);
+      /* ... */
+      if (abbrev->has_children)
+	{
+	  switch (abbrev->tag)
+	    {
+	    /* ... */
+	    case DW_TAG_subprogram:
+	      if ((m_language == language_fortran
+		   || m_language == language_ada)
+		  && this_entry != nullptr)
+		{
+		  info_ptr = recurse (reader, info_ptr, this_entry, true);
+		  continue;
+		}
+	      break;
+	    }
+	}
+      /* ... */
+    }
+
+  return info_ptr;
+}
+```
+
+Обратите внимание на функцию `recurse`. Она рекурсивно вызывает тот же метод `index_dies`, но в отличие от первого запуска уже передает указатель на родителя:
+
+```c++
+const gdb_byte *
+cooked_indexer::recurse (cutu_reader *reader,
+			 const gdb_byte *info_ptr,
+			 const cooked_index_entry *parent_entry,
+			 bool fully)
+{
+  info_ptr = index_dies (reader, info_ptr, parent_entry, fully);
+
+  if (parent_entry != nullptr)
+    {
+      /* Both start and end are inclusive, so use both "+ 1" and "- 1" to
+	 limit the range to the children of parent_entry.  */
+      parent_map::addr_type start
+	= parent_map::form_addr (parent_entry->die_offset + 1,
+				 reader->cu->per_cu->is_dwz);
+      parent_map::addr_type end
+	= parent_map::form_addr (sect_offset (info_ptr - 1 - reader->buffer),
+				 reader->cu->per_cu->is_dwz);
+      m_die_range_map->add_entry (start, end, parent_entry);
+    }
+
+  return info_ptr;
+}
+```
+
+</spoiler>
+
+Также стоит обратить внимание и на то как читаются отладочные символы.
+В больших программах отладочной информации много и прочитать их все в 1 поток может занять большое количество времени.
+Поэтому здесь вступает в работу фоновая многопоточная обработка.
+
+В фоновом потоке запукается основная функция чтения отладочных символов.
+Если говорим о gdb, то это значит, что между моментом его запуска (или указания исполняемого файла) до момента когда символы необходимы (сам запуск) может пройти время.
+Поэтому чтобы впустую не останавливать работу эта часть переклаывается на фоновый поток и, когда происходит запуск (все отложенные операции надо применить), просто дожидаемся когда этот фоновый воркер закончит работу.
+
+Но это еще не все. Для большей оптимизации эта работа распараллеливается.
+У нас есть множество CU, которые между собой не связаны. Это и есть точка распараллеливания.
+Но будет плохо если 1 поток возьмет 2 CU по 100Мб, а другой тоже 2, но по 1Мб.
+Поэтому для распределения CU используется их размер - каждому выделяется примерно равное количество CU по размеру (сумма размеров CU / количество потоков).
+
+<spoiler title="Иллюстрация">
+
+В комментариях я нашел такую интересную иллюстрацию того как организовано чтение отладочных символов с точки зрения работы кода.
+
+```c++
+/* The main index of DIEs.
+
+   The index is created by multiple threads.  The overall process is
+   somewhat complicated, so here's a diagram to help sort it out.
+
+   The basic idea behind this design is (1) to do as much work as
+   possible in worker threads, and (2) to start the work as early as
+   possible.  This combination should help hide the effort from the
+   user to the maximum possible degree.
+
+   . Main Thread                |       Worker Threads
+   ============================================================
+   . dwarf2_initialize_objfile
+   . 	      |
+   .          v
+   .     cooked index ------------> cooked_index_worker::start
+   .          |                           / | \
+   .          v                          /  |  \
+   .       install                      /   |	\
+   .  cooked_index_functions        scan CUs in workers
+   .          |               create cooked_index_shard objects
+   .          |                           \ | /
+   .          v                            \|/
+   .    return to caller                    v
+   .                                 initial scan is done
+   .                                state = MAIN_AVAILABLE
+   .                              "main" name now available
+   .                                        |
+   .                                        |
+   .   if main thread calls...              v
+   .   compute_main_name         cooked_index::set_contents
+   .          |                           / | \
+   .          v                          /  |  \
+   .   wait (MAIN_AVAILABLE)          finalization
+   .          |                          \  |  /
+   .          v                           \ | /        
+   .        done                      state = FINALIZED
+   .                                        |
+   .                                        v
+   .                              maybe write to index cache
+   .                                  state = CACHE_DONE
+   .
+   .
+   .   if main thread calls...
+   .   any other "quick" API
+   .          |
+   .          v
+   .   wait (FINALIZED)
+   .          |
+   .          v
+   .    use the index
+*/
+```
+
+</spoiler>
+
 ### Точки останова
 
-Начнем с точек останова.
+Перейдем к точкам останова.
 
 В gdb имеется общая структура `breakpoint`. Она может представлять не только точки останова, но трейспоинты ([tracepoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Tracepoints.html)), и вотчпоинты ([watchpoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Set-Watchpoints.html)).
 Дополнительно, они разделяются на `Software` и `Hardware` - последние реализуются с помощью поддержки железа (как можно догадаться). Например, с их помощью можно реализовать отслеживание изменения какого-либо участка памяти (data breakpoint).
@@ -2593,6 +2774,8 @@ process_vm_writev - не поддерживает запись в RO секци�
 </spiler>
 
 ### Step in/out/over
+
+
 
 ### Детали реализации интересные
 
