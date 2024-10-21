@@ -2763,22 +2763,165 @@ inf_ptrace_peek_poke (ptid_t ptid, gdb_byte *readbuf,
 
 </spoiler>
 
-<spoiler title="Другой вариант чтения памяти">
+Кроме этих способов есть еще один - системные вызовы `process_vm_readv` и `process_vm_writev`.
+Они позволяют читать и писать в адресное пространство другого процесса, причем передать за раз можно несколько буферов (для передачи используется вектор, `v` в названии).
+Но его использование отклонили из-за нескольких проблем:
 
-TODO: тут про process_vm_readv/process_vm_writev
-
-process_vm_writev - не поддерживает запись в RO секции (например, чтобы поставить точку останова)
-
-/proc/pid/mem - доступ даже если 
-
-</spiler>
+1. `process_vm_writev` не позволяет записывать в RO страницы. Это критический недостаток, так как именно таким способом и ставятся точки останова.
+2. `process_vm_*v` может вызвать гонку в моменты, когда дочерний процесс вызывает какой-либо `exec`, так как адресное пространство будет изменено.
 
 TODO: amd64_analyze_prologue - определение пролога функции своими руками, amd64_skip_prologue - пропуск пролога
-
 
 <spoiler title="Различные точки останова">
 
 TODO: про различные точки останова: longjmp, watchpoint, momentary и т.д.
+
+В gdb существует большое количество типов точек останова.
+Хоть они все и делают одно и то же (останавливают работу дочернего процесса), различается метод их обработки.
+Их виды описаны в перечислении `bptype`:
+
+```c++
+/* Type of breakpoint.  */
+
+enum bptype
+  {
+    bp_none = 0,		/* Eventpoint has been deleted */
+    bp_breakpoint,		/* Normal breakpoint */
+    bp_hardware_breakpoint,	/* Hardware assisted breakpoint */
+    bp_single_step,		/* Software single-step */
+    bp_until,			/* used by until command */
+    bp_finish,			/* used by finish command */
+    bp_watchpoint,		/* Watchpoint */
+    bp_hardware_watchpoint,	/* Hardware assisted watchpoint */
+    bp_read_watchpoint,		/* read watchpoint, (hardware assisted) */
+    bp_access_watchpoint,	/* access watchpoint, (hardware assisted) */
+    bp_longjmp,			/* secret breakpoint to find longjmp() */
+    bp_longjmp_resume,		/* secret breakpoint to escape longjmp() */
+
+    /* Breakpoint placed to the same location(s) like bp_longjmp but used to
+       protect against stale DUMMY_FRAME.  Multiple bp_longjmp_call_dummy and
+       one bp_call_dummy are chained together by related_breakpoint for each
+       DUMMY_FRAME.  */
+    bp_longjmp_call_dummy,
+
+    /* An internal breakpoint that is installed on the unwinder's
+       debug hook.  */
+    bp_exception,
+    /* An internal breakpoint that is set at the point where an
+       exception will land.  */
+    bp_exception_resume,
+
+    /* Used by wait_for_inferior for stepping over subroutine calls,
+       and for skipping prologues.  */
+    bp_step_resume,
+
+    /* Used by wait_for_inferior for stepping over signal
+       handlers.  */
+    bp_hp_step_resume,
+
+    /* Used to detect when a watchpoint expression has gone out of
+       scope.  These breakpoints are usually not visible to the user.
+
+       This breakpoint has some interesting properties:
+
+       1) There's always a 1:1 mapping between watchpoints
+       on local variables and watchpoint_scope breakpoints.
+
+       2) It automatically deletes itself and the watchpoint it's
+       associated with when hit.
+
+       3) It can never be disabled.  */
+    bp_watchpoint_scope,
+
+    /* The breakpoint at the end of a call dummy.  See bp_longjmp_call_dummy it
+       is chained with by related_breakpoint.  */
+    bp_call_dummy,
+
+    /* A breakpoint set on std::terminate, that is used to catch
+       otherwise uncaught exceptions thrown during an inferior call.  */
+    bp_std_terminate,
+
+    /* Some dynamic linkers (HP, maybe Solaris) can arrange for special
+       code in the inferior to run when significant events occur in the
+       dynamic linker (for example a library is loaded or unloaded).
+
+       By placing a breakpoint in this magic code GDB will get control
+       when these significant events occur.  GDB can then re-examine
+       the dynamic linker's data structures to discover any newly loaded
+       dynamic libraries.  */
+    bp_shlib_event,
+
+    /* Some multi-threaded systems can arrange for a location in the 
+       inferior to be executed when certain thread-related events occur
+       (such as thread creation or thread death).
+
+       By placing a breakpoint at one of these locations, GDB will get
+       control when these events occur.  GDB can then update its thread
+       lists etc.  */
+
+    bp_thread_event,
+
+    /* On the same principal, an overlay manager can arrange to call a
+       magic location in the inferior whenever there is an interesting
+       change in overlay status.  GDB can update its overlay tables
+       and fiddle with breakpoints in overlays when this breakpoint 
+       is hit.  */
+
+    bp_overlay_event, 
+
+    /* Master copies of longjmp breakpoints.  These are always installed
+       as soon as an objfile containing longjmp is loaded, but they are
+       always disabled.  While necessary, temporary clones of bp_longjmp
+       type will be created and enabled.  */
+
+    bp_longjmp_master,
+
+    /* Master copies of std::terminate breakpoints.  */
+    bp_std_terminate_master,
+
+    /* Like bp_longjmp_master, but for exceptions.  */
+    bp_exception_master,
+
+    bp_catchpoint,
+
+    bp_tracepoint,
+    bp_fast_tracepoint,
+    bp_static_tracepoint,
+    /* Like bp_static_tracepoint but for static markers.  */
+    bp_static_marker_tracepoint,
+
+    /* A dynamic printf stops at the given location, does a formatted
+       print, then automatically continues.  (Although this is sort of
+       like a macro packaging up standard breakpoint functionality,
+       GDB doesn't have a way to construct types of breakpoint from
+       elements of behavior.)  */
+    bp_dprintf,
+
+    /* Event for JIT compiled code generation or deletion.  */
+    bp_jit_event,
+
+    /* Breakpoint is placed at the STT_GNU_IFUNC resolver.  When hit GDB
+       inserts new bp_gnu_ifunc_resolver_return at the caller.
+       bp_gnu_ifunc_resolver is still being kept here as a different thread
+       may still hit it before bp_gnu_ifunc_resolver_return is hit by the
+       original thread.  */
+    bp_gnu_ifunc_resolver,
+
+    /* On its hit GDB now know the resolved address of the target
+       STT_GNU_IFUNC function.  Associated bp_gnu_ifunc_resolver can be
+       deleted now and the breakpoint moved to the target function entry
+       point.  */
+    bp_gnu_ifunc_resolver_return,
+  };
+```
+
+Некоторые из них мы будем использовать:
+
+- `bp_single_step`
+- `bp_step_resume`
+- `bp_finish`
+
+Первые 2 для реализации step over и step in, а 3 - для step out.
 
 </spoiler>
 
@@ -2960,6 +3103,8 @@ finish_forward (struct finish_command_fsm *sm, const frame_info_ptr &frame)
 
 Если посмотреть в нее, то можно заметить уже знакомый шаблон: проверяем `typedef`, а затем выводим в соответствии с типом (gdb использует внутренние типы, общие для многих ЯП, как например, массив или целое число).
 
+<spoiler title="c_value_print_inner">
+
 ```c++
 void
 c_value_print_inner (struct value *val, struct ui_file *stream, int recurse,
@@ -3010,6 +3155,8 @@ c_value_print_inner (struct value *val, struct ui_file *stream, int recurse,
     }
 }
 ```
+
+</spoiler>
 
 Из интересного - обнаружение `main` - входной точки. В случае step out это важно, так как выходить за пределы `main` нет смысла.
 За это отвечает функция `inside_main_func`. Ее логика проста: получаем название входной точки (символ) и проверяем, что текущий фрейм не этой функции.
