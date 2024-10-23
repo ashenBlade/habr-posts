@@ -3094,11 +3094,409 @@ finish_forward (struct finish_command_fsm *sm, const frame_info_ptr &frame)
 ```
 
 Когда точка останова выставлена, то процесс продолжает работу, и после остановки удаляется.
-Из комментария (или кто работал с gdb знает) понятно, что по окончании необходимо вывести возвращаемое значение.
+
+Из интересного - обнаружение `main` - входной точки. В случае step out это важно, так как выходить за пределы `main` нет смысла.
+За это отвечает функция `inside_main_func`. Ее логика проста: получаем название входной точки (символ) и проверяем, что текущий фрейм не этой функции.
+2-ая часть проста - надо проверить адрес. Но 1-ая часть не тривиальна, так как в разных ЯП разное название входной точки.
+Но это решается просто - функция `main_name` возвращает символ входной точки.
+В начале проверяется, что есть символы специфичные для ЯП: `__gnat_ada_main_program_name` (ADA), `D main` (D), `main.main` (go), `_p__M0_main_program` или `pascal_main_program` (Pascal).
+Если не нашлись, то используется стандартный `main`.
+
+### Отображение значений
+
 Так как значения типов зависят от языка, то и за отображение ответственнен он (ЯП).
+Другая важная функциональность - вывод состояния (значения переменных, адресов памяти и т.д.).
+В gdb есть 2 команды для печати:
+
+- `x` - скалярное значение по переданному адресу
+- `print` - вычисление выражение и вывод результата в соответствии с его реальным типом
+
+Они разные, но в конечном счете обе используют одни и те же функции, только с разными аргументами.
+Можно выделить 2 функции:
+
+- `value_print_scalar_formatted`
+- `value_print`
+
+Вначале рассмотрим 1 функцию. Она выводит в лог скалярное значение.
+Максимальная типизация - указание размера числа и знаковость.
+Спускаясь ниже по стеку вызовов, за саму печать разных форматов чисел используются разные функции:
+
+- `print_XXX_chars` - число указанной длинны в указанном XXX основании, например, `print_hex_chars`
+- `print_floating` - число с плавающей точкой
+- `print_address` - адрес
+
+Многие из этих функций достойны внимания.
+
+- `print_octal_chars` - выводит число в восьмеричной системе. Загвоздка заключается в том, что каждая цифра представляется 3 битами - не кратно 4.
+  Поэтому было принято решение - разлить логику на циклы по 3 шага. В каждом происходит перенос оставшихся бит на следующий шаг. Таким образом, за 3 шага мы обрабатываем 24 бита = 3 байта.
+
+<spoiler title="print_octal_chars">
+
+```c++
+   void
+print_octal_chars (struct ui_file *stream, const gdb_byte *valaddr,
+		   unsigned len, enum bfd_endian byte_order)
+{
+  const gdb_byte *p;
+  unsigned char octa1, octa2, octa3, carry;
+  int cycle;
+
+  /* Octal is 3 bits, which doesn't fit.  Yuk.  So we have to track
+   * the extra bits, which cycle every three bytes:
+   *
+   * Byte side:       0            1             2          3
+   *                         |             |            |            |
+   * bit number   123 456 78 | 9 012 345 6 | 78 901 234 | 567 890 12 |
+   *
+   * Octal side:   0   1   carry  3   4  carry ...
+   *
+   * Cycle number:    0             1            2
+   *
+   * But of course we are printing from the high side, so we have to
+   * figure out where in the cycle we are so that we end up with no
+   * left over bits at the end.
+   */
+#define BITS_IN_OCTAL 3
+#define HIGH_ZERO     0340
+#define LOW_ZERO      0034
+#define CARRY_ZERO    0003
+#define HIGH_ONE      0200
+#define MID_ONE       0160
+#define LOW_ONE       0016
+#define CARRY_ONE     0001
+#define HIGH_TWO      0300
+#define MID_TWO       0070
+#define LOW_TWO       0007
+
+  /* For 32 we start in cycle 2, with two bits and one bit carry;
+     for 64 in cycle in cycle 1, with one bit and a two bit carry.  */
+
+  cycle = (len * HOST_CHAR_BIT) % BITS_IN_OCTAL;
+  carry = 0;
+
+  gdb_puts ("0", stream);
+  bool seen_a_one = false;
+  for (p = valaddr + len - 1;
+       p >= valaddr;
+       p--)
+    {
+      switch (cycle)
+        {
+	  case 0:
+	    /* Carry out, no carry in */
+
+	    octa1 = (HIGH_ZERO & *p) >> 5;
+	    octa2 = (LOW_ZERO & *p) >> 2;
+	    carry = (CARRY_ZERO & *p);
+	    emit_octal_digit (stream, &seen_a_one, octa1);
+	    emit_octal_digit (stream, &seen_a_one, octa2);
+	    break;
+
+	  case 1:
+	    /* Carry in, carry out */
+            octa1 = (carry << 1) | ((HIGH_ONE & *p) >> 7);
+	    octa2 = (MID_ONE & *p) >> 4;
+	    octa3 = (LOW_ONE & *p) >> 1;
+	    carry = (CARRY_ONE & *p);
+	    emit_octal_digit (stream, &seen_a_one, octa1);
+	    emit_octal_digit (stream, &seen_a_one, octa2);
+	    emit_octal_digit (stream, &seen_a_one, octa3);
+	    break;
+
+	  case 2:
+	    /* Carry in, no carry out */
+
+	    octa1 = (carry << 2) | ((HIGH_TWO & *p) >> 6);
+	    octa2 = (MID_TWO & *p) >> 3;
+	    octa3 = (LOW_TWO & *p);
+	    carry = 0;
+	    emit_octal_digit (stream, &seen_a_one, octa1);
+	    emit_octal_digit (stream, &seen_a_one, octa2);
+	    emit_octal_digit (stream, &seen_a_one, octa3);
+	    break;
+
+	  default:
+	    error (_("Internal error in octal conversion;"));
+	}
+
+      cycle++;
+      cycle = cycle % BITS_IN_OCTAL;
+    }
+}
+```
+
+</spoiler>
+
+- `print_decimal_chars` - эта функция выводит число в десятичном представлении.
+  В ней используется достаточно интересный алгоритм - он переводит в десятичное представление шестандцатеричное любой длины (то есть не только кратное 2 - short, int, long).
+
+<spoiler title="print_decimal_chars">
+
+В идее этого алгоритма, то что число представляется в виде потока байт, а сам байт - это 2 шестнадцатеричных числа.
+Все что нам нужно - это пройтись по всем этим числам и сконвертировать.
+
+Для хранения результирующего числа используется вектор.
+Количество цифр мы уже можем оценить - оно точно не больше чем количество шестнадцатеричных умноженное в 2 раза (так как шестнадцатеричное число может быть больше 10).
+Поэтому, этот вектор сразу инициализируем этим количеством.
+Сам этот вектор будет хранить цифры нашего десятичного числа.
+
+Теперь переходим к самой идее.
+Здесь используется примерно тот же алгоритм, что и при обычном переводе числа из 16-ого основания в 10-е.
+Работа происходит итерациями. На каждой итерации мы проходимся по всем полубайтам (шестнадцатеричным цифрам) исходного числа от MSB до LSB.
+
+Как мы добавим *шестнадцатеричное* число к *десятичному*?
+Переведем его в десятичное основание и сложим.
+Но наше число хранится в виде вектора цифр - нам придется также раскладывать число по разрядам и складывать.
+Это накладно поэтому используется другой подход.
+
+Мы берем очередной полубайт и складываем его с нашей *первой цифрой*.
+А затем лавинно переносим в следующий разряд переполнение.
+
+Еще одна важная деталь - мы проходим от MSB до LSB.
+Если мы будем просто складывать числа и делать простой перенос, то знание о разрядах потеряется.
+То есть, просто складывая мы не получим корректного ответа, если в числе будет больше 1 байта.
+Для учета разряда в алгоритме сделан такой подход: перед тем как переходить к следующему полубайту предыдущее число сдвигается на 1 разряд (умножается на 16).
+Если мы умножим каждую цифру в десятичном числе на 16, то мы сдвинем влево шестнадцатеричное на 1 разряд (припишем справа `0`).
+А теперь магия - если к этому числу добавить очередной полубайт, то получится то же самое число до этого разряда.
+
+Таким образом, в конце каждой итерации у нас на руках десятичное представление для шестнадцатеричного числа до N разряда (с начала).
+Как только мы доходим до 0 разряда, то алгоритм завершен.
+
+Чтобы лучше понять, рассмотрим такой пример - перевод числа `4D2` (это десятичное 1234).
+В шагах я буду указывать что находится в векторе цифр:
+
+| Цифра (итерация) | Вектор      |
+| ---------------- | ----------- |
+| 4                | 4 0 0 0     |
+| D                | 64 0 0 0    |
+|                  | 77 0 0 0    |
+|                  | 7 7 0 0     |
+| 2                | 112 112 0 0 |
+|                  | 114 112 0 0 |
+|                  | 4 123 0 0   |
+|                  | 4 3 12 0    |
+|                  | 4 3 2 1     |
+
+Можете заметить, что в конце каждой итерации мы получаем десятичные числа для числа до определенного разряда (если обрезать):
+
+- 4 - 4
+- 4D - 77
+- 4D2 - 1234
+
+P.S. цифры в векторе в обратном порядке
+
+```c++
+void
+print_decimal_chars (struct ui_file *stream, const gdb_byte *valaddr,
+		     unsigned len, bool is_signed,
+		     enum bfd_endian byte_order)
+{
+#define TEN             10
+#define CARRY_OUT(  x ) ((x) / TEN)	/* extend char to int */
+#define CARRY_LEFT( x ) ((x) % TEN)
+#define SHIFT( x )      ((x) << 4)
+#define LOW_NIBBLE(  x ) ( (x) & 0x00F)
+#define HIGH_NIBBLE( x ) (((x) & 0x0F0) >> 4)
+
+  const gdb_byte *p;
+  int carry;
+  int decimal_len;
+  int i, j, decimal_digits;
+  int dummy;
+  int flip;
+
+  gdb::byte_vector negated_bytes;
+  if (is_signed
+      && maybe_negate_by_bytes (valaddr, len, byte_order, &negated_bytes))
+    {
+      gdb_puts ("-", stream);
+      valaddr = negated_bytes.data ();
+    }
+
+  /* Base-ten number is less than twice as many digits
+     as the base 16 number, which is 2 digits per byte.  */
+
+  decimal_len = len * 2 * 2;
+  std::vector<unsigned char> digits (decimal_len, 0);
+
+  /* Ok, we have an unknown number of bytes of data to be printed in
+   * decimal.
+   *
+   * Given a hex number (in nibbles) as XYZ, we start by taking X and
+   * decimalizing it as "x1 x2" in two decimal nibbles.  Then we multiply
+   * the nibbles by 16, add Y and re-decimalize.  Repeat with Z.
+   *
+   * The trick is that "digits" holds a base-10 number, but sometimes
+   * the individual digits are > 10.
+   *
+   * Outer loop is per nibble (hex digit) of input, from MSD end to
+   * LSD end.
+   */
+  decimal_digits = 0;		/* Number of decimal digits so far */
+  p = (byte_order == BFD_ENDIAN_BIG) ? valaddr : valaddr + len - 1;
+  flip = 0;
+  while ((byte_order == BFD_ENDIAN_BIG) ? (p < valaddr + len) : (p >= valaddr))
+    {
+      /*
+       * Multiply current base-ten number by 16 in place.
+       * Each digit was between 0 and 9, now is between
+       * 0 and 144.
+       */
+      for (j = 0; j < decimal_digits; j++)
+	{
+	  digits[j] = SHIFT (digits[j]);
+	}
+
+      /* Take the next nibble off the input and add it to what
+       * we've got in the LSB position.  Bottom 'digit' is now
+       * between 0 and 159.
+       *
+       * "flip" is used to run this loop twice for each byte.
+       */
+      if (flip == 0)
+	{
+	  /* Take top nibble.  */
+
+	  digits[0] += HIGH_NIBBLE (*p);
+	  flip = 1;
+	}
+      else
+	{
+	  /* Take low nibble and bump our pointer "p".  */
+
+	  digits[0] += LOW_NIBBLE (*p);
+	  if (byte_order == BFD_ENDIAN_BIG)
+	    p++;
+	  else
+	    p--;
+	  flip = 0;
+	}
+
+      /* Re-decimalize.  We have to do this often enough
+       * that we don't overflow, but once per nibble is
+       * overkill.  Easier this way, though.  Note that the
+       * carry is often larger than 10 (e.g. max initial
+       * carry out of lowest nibble is 15, could bubble all
+       * the way up greater than 10).  So we have to do
+       * the carrying beyond the last current digit.
+       */
+      carry = 0;
+      for (j = 0; j < decimal_len - 1; j++)
+	{
+	  digits[j] += carry;
+
+	  /* "/" won't handle an unsigned char with
+	   * a value that if signed would be negative.
+	   * So extend to longword int via "dummy".
+	   */
+	  dummy = digits[j];
+	  carry = CARRY_OUT (dummy);
+	  digits[j] = CARRY_LEFT (dummy);
+
+	  if (j >= decimal_digits && carry == 0)
+	    {
+	      /*
+	       * All higher digits are 0 and we
+	       * no longer have a carry.
+	       *
+	       * Note: "j" is 0-based, "decimal_digits" is
+	       *       1-based.
+	       */
+	      decimal_digits = j + 1;
+	      break;
+	    }
+	}
+    }
+
+  /* Ok, now "digits" is the decimal representation, with
+     the "decimal_digits" actual digits.  Print!  */
+
+  for (i = decimal_digits - 1; i > 0 && digits[i] == 0; --i)
+    ;
+
+  for (; i >= 0; i--)
+    {
+      gdb_printf (stream, "%1d", digits[i]);
+    }
+}
+```
+
+</spoiler>
+
+- `print_floating` - выводит число с плавающей точкой. Здесь интересно то, что для работы с плавающей точкой используется интерфейс - `target_float_ops`.
+   На моей машине используется формат float IEEE 754 одинарной точности, поэтому для работы с ней используется структура `floatformat`.
+   Для вывода значения используется 3 шага: 1) создается строку форматирования, 2) конвертируем в формат float исполняемой машины и 3) выводим с помощью `printf`.
+
+- `print_binary_chars` - выводит двоичное представление числа. Здесь все просто - проходим по всем битам и выводим.
+  Но даже здесь есть интересная часть - обнаружение ниббла без всех нулей.
+  Если такой встретился, то мы должны вывести его весь. Причина этого куска проста - нибблы равные 0000 отображаются просто как 0 (чтобы уменьшить занимаемое место)
+
+<spoiler title="print_binary-char">
+
+```c++
+void
+print_binary_chars (struct ui_file *stream, const gdb_byte *valaddr,
+		    unsigned len, enum bfd_endian byte_order, bool zero_pad,
+		    const struct value_print_options *options)
+{
+  const gdb_byte *p;
+  unsigned int i;
+  int b;
+  bool seen_a_one = false;
+  const char *digit_separator = nullptr;
+
+  /* Declared "int" so it will be signed.
+     This ensures that right shift will shift in zeros.  */
+
+  const int mask = 0x080;
+
+  if (options->nibblesprint)
+    digit_separator = current_language->get_digit_separator();
+
+  for (p = valaddr + len - 1;
+     p >= valaddr;
+     p--)
+  {
+    for (i = 0; i < (HOST_CHAR_BIT * sizeof (*p)); i++)
+      {
+        if (options->nibblesprint && seen_a_one && i % 4 == 0)
+  	  gdb_putc (*digit_separator, stream);
+
+        if (*p & (mask >> i))
+  	  b = '1';
+        else
+  	  b = '0';
+
+        if (zero_pad || seen_a_one || b == '1')
+  	  gdb_putc (b, stream);
+        else if (options->nibblesprint)
+  	{
+          /* Обнаружение не нулевого ниббла */
+  	  if ((0xf0 & (mask >> i) && (*p & 0xf0))
+  	      || (0x0f & (mask >> i) && (*p & 0x0f)))
+  	    gdb_putc (b, stream);
+  	}
+
+        if (b == '1')
+  	  seen_a_one = true;
+      }
+  }
+
+  /* When not zero-padding, ensure that something is printed when the
+     input is 0.  */
+  if (!zero_pad && !seen_a_one)
+    gdb_putc ('0', stream);
+}
+```
+
+</spoiler>
+
+Когда дело доходит до `print` ситуация иная. Ему на вход поступает выражение из родного ЯП.
+Его нужно не только вычислить (для получения результата), но и понять тип для его корректного отображения.
+
 ЯП представляется базовым классом `language_defn` - от него наследуются все конкретные ЯП.
-Например, для C это будет класс `c_language`.
-В этом классе нам интересен метод `value_print`. Он печатает в переданный поток значение.
+Например, для C это будет класс `c_language`. Также есть и для ADA, D, rust и др.
+В этом классе нам интересен метод `value_print`. Он печатает переданное значение.
 Для языка C реализация есть в функции `c_value_print_inner`.
 
 Если посмотреть в нее, то можно заметить уже знакомый шаблон: проверяем `typedef`, а затем выводим в соответствии с типом (gdb использует внутренние типы, общие для многих ЯП, как например, массив или целое число).
@@ -3158,12 +3556,125 @@ c_value_print_inner (struct value *val, struct ui_file *stream, int recurse,
 
 </spoiler>
 
-Из интересного - обнаружение `main` - входной точки. В случае step out это важно, так как выходить за пределы `main` нет смысла.
-За это отвечает функция `inside_main_func`. Ее логика проста: получаем название входной точки (символ) и проверяем, что текущий фрейм не этой функции.
-2-ая часть проста - надо проверить адрес. Но 1-ая часть не тривиальна, так как в разных ЯП разное название входной точки.
-Но это решается просто - функция `main_name` возвращает символ входной точки.
-В начале проверяется, что есть символы специфичные для ЯП: `__gnat_ada_main_program_name` (ADA), `D main` (D), `main.main` (go), `_p__M0_main_program` или `pascal_main_program` (Pascal).
-Если не нашлись, то используется стандартный `main`.
+Как выводятся целые числа (TYPE_CODE_INT, TYPE_CODE_CHAR) знаем - `value_print_scalar_formatted` (вызывается внутри).
+Рассмотрим то, как выводится структура (TYPE_CODE_STRUCT).
+
+За ее отображение отвечает функция `cp_print_value_fields`.
+Отображение полей структуры можно грубо описать циклом по каждому полю: выводим название поля и его значение.
+Для представления типов используется структура `type`. Она хранит в себе всю информацию о типе, который представляет.
+Поля структуры (у типа) хранятся в виде массива и доступ к ним происходит аналогично - по индексу.
+Само поле представляется структурой `field`. У нее есть интересующий нас метод - `name`, он возвращает название поля.
+
+Но для получения поля структуры используется не `type` и не `field` - структура `value`.
+Это структура, которая представляет какое-либо значение, но о своем типе не знает.
+И в нем нам нужен метод `primitive_field` - он позволяет получить значение (другой `value`) поля. Но так как `value` о своем типе не знает, то мы его передаем (сам тип родительской структуры).
+Если посмотреть на реализацию `primitive_field`, то можно увидеть уже знакомые шаги:
+
+- Получаем тип родителя и поля
+- Проверяем их `typedef`
+- Находим смещение поля относительно структуры
+- Читаем значение поля
+
+<spoiler title="primitive_field">
+
+```c++
+struct value *
+value::primitive_field (LONGEST offset, int fieldno, struct type *arg_type)
+{
+  struct value *v;
+  struct type *type;
+  int unit_size = gdbarch_addressable_memory_unit_size (arch ());
+
+  arg_type = check_typedef (arg_type);
+  type = arg_type->field (fieldno).type ();
+
+  check_typedef (type);
+
+  if (arg_type->field (fieldno).bitsize ())
+    {
+      /* Упакованная структура */
+    }
+  else if (fieldno < TYPE_N_BASECLASSES (arg_type))
+    {
+      /* Поле базового класса */
+    }
+  else if (NULL != TYPE_DATA_LOCATION (type))
+    {
+      /* Динамическое поле */
+    }
+  else
+    {
+      /* Обычное поле */
+      offset += (arg_type->field (fieldno).loc_bitpos ()
+		 / (HOST_CHAR_BIT * unit_size));
+
+      if (this->lval () == lval_register && lazy ())
+	fetch_lazy ();
+
+      if (lazy ())
+	v = value::allocate_lazy (type);
+      else
+	{
+	  v = value::allocate (type);
+	  contents_copy_raw (v, v->embedded_offset (),
+			     embedded_offset () + offset,
+			     type_length_units (type));
+	}
+      v->set_offset (this->offset () + offset + embedded_offset ());
+    }
+  v->set_component_location (this);
+  return v;
+}
+```
+
+Далее, для вывода значения используется функция `common_val_print`.
+Но как уже ранее было сказано, значения (их отображение и интерпретация) часто зависят от ЯП, поэтому в реальности вывод значения делегируется самому ЯП - методу `value_print` класса `language_defn`.
+Таким образом, мы входим в рекурсию.
+
+</spoiler>
+
+### Цепочка вызовов
+
+Теперь перейдем к backtrace, отображении цепочки вызовов до текущей функции.
+Здесь все просто - вся логика это просто цикл, в котором мы идем к каждому предыдущему фрейму и отображаем информацию о нем.
+Это реализуется в цикле:
+
+```c++
+static void
+backtrace_command_1 (const frame_print_options &fp_opts,
+		     const backtrace_cmd_options &bt_opts,
+		     const char *count_exp, int from_tty)
+
+{
+  frame_info_ptr fi;
+  int count;
+  int py_start = 0, py_end = 0;
+  enum ext_lang_bt_status result = EXT_LANG_BT_ERROR;
+  
+  /* ... */
+
+  if (bt_opts.no_filters || result == EXT_LANG_BT_NO_FILTERS)
+    {
+      frame_info_ptr trailing;
+      
+      /* ... */
+
+      for (fi = trailing; fi && count--; fi = get_prev_frame (fi))
+	{
+	  print_frame_info (fp_opts, fi, 1, LOCATION, 1, 0);
+	  if ((flags & PRINT_LOCALS) != 0)
+	    print_frame_local_vars (fi, false, NULL, NULL, 1, gdb_stdout);
+
+	  trailing = fi;
+	}
+      
+      /* ... */
+
+    }
+}
+```
+
+За отображение информации о фрейме (часть `print_frame_info`) отвечает функция `print_frame`.
 
 ### Детали реализации интересные
 
