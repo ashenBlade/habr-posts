@@ -4145,7 +4145,310 @@ void BreakpointInfo::clear(Method* method) {
 
 ### Шаги
 
+Чтобы понять, как устроены шаги в исходном коде, стоит вспомнить, что архитектура отладки многоуровневая:
 
+1. JVM
+2. Агенты
+3. JDWP
+4. Клиенты
+
+Из всего этого не рассматривали только 2 - агентов. Агентами называют подключаемые библиотеки, которые работают вместе с JVM.
+Агенты могут свободно взаимодействовать с JVM.
+Их можно и написать самим, но нам сейчас важен агент `jdk.jdwp.agent` - агент, реализующий протокол JDWP.
+
+Но зачем это нужно знать?
+Дело в том, что в JVM TI предоставляет возможно выполнить только SINGLE_STEP - 1 инструкцию байт-кода.
+Поэтому реализовывать логику шагов (step XXX) нужно самим. Вот тут и помогает агент `jdk.jdwp.agent`.
+
+> Это поведение можно сравнить и с `ptrace`: JVM как ОС предоставляет возможность выполнить 1 инструкцию, а мы как пользователи (агент) придаем смысл этим шагам.
+
+В JDWP для шагов также есть команда, но только одна.
+Ее поведение различается в зависимости от аргументов (каждый аргумент имеет определенные константные значения):
+
+- `depth` - поведение шага
+  - `INTO = 0` - step into
+  - `OVER = 1` - step over
+  - `OUT = 2` - step out
+- `size` - гранулярность единицы выполнения
+  - `MIN = 0` - шагнуть как можно меньше (часто это просто 1 инструкция байт-кода)
+  - `LINE = 1` - шагнуть до следующей строки исходного кода (если этой информации нет, то `MIN`)
+
+Если `size = LINE`, то эта команда принимает уже знакомые очертания `step IN(TO)`, `step OVER` и `step OUT`.
+
+Сами шаги - это асинхронные события. Поэтому, когда в JVM отправляем SINGLE_STEP, то ответ приходит в виде события (когда шаг окончен).
+В общем, step XXX реализованы через *постоянную отправку SINGLE_STEP* и отслеживания текущего положения. Очень похоже на реализацию gdb, но тут есть большая разница в одном моменте - обработка вызова функции. В gdb, когда мы запросили `step over` и была вызвана функция - мы ставим точку останова на адресе возврата. В JVM (как минимум в `jdk.jdwp.agent`) сделано иначе - мы *отслеживаем удаление фрейма*. Для этого используется отдельное событие `FramePop`
+
+Таким образом, реализации шагов следующие (представим, что знаем где границы текущей строки):
+
+- `step in`
+  - выполняем SINGLE_STEP пока:
+    - не будет вызвана другая функция (отслеживаем по количеству фреймов)
+    - либо не изменится текущая строка
+- `step over`
+  - выполняем SINGLE_STEP пока не изменится текущая строка
+  - если была вызвана функция, то подписываемся на событие удаления фрейма (NotifyFramePop) - продолжим когда вернемся обратно
+- `step out`
+  - подписываемся на событие удаления фрейма (NotifyFramePop)
+
+Это все реализовано не 1 функцией, а несколькими - для нескольких событий.
+Например, в функции `stepControl_handleStep` - логика при получении события окончания `SINGLE_STEP`, а в `handleFramePopEvent` - при получении события удаления фрейма. Также есть обработчики для `JVMTI_EVENT_EXCEPTION_CATCH` и `JVMTI_EVENT_METHOD_ENTRY` - бросок исключения и вызов метода.
+
+<spoiler title="stepControl_handleStep">
+
+```c++
+jboolean
+stepControl_handleStep(JNIEnv *env, jthread thread,
+                       jclass clazz, jmethodID method)
+{
+    jboolean completed = JNI_FALSE;
+    StepRequest *step;
+    jint currentDepth;
+    jint fromDepth;
+    jvmtiError error;
+    char *classname;
+
+    classname = NULL;
+    stepControl_lock();
+
+    step = threadControl_getStepRequest(thread);
+    if (step == NULL) {
+        EXIT_ERROR(AGENT_ERROR_INVALID_THREAD, "getting step request");
+    }
+
+    /*
+     * Сейчас нет обрабатываемых шагов
+     */
+    if (!step->pending) {
+        goto done;
+    }
+
+    /*
+     * Если нужно выполнить STEP INTO 1 инструкции, то все уже готово
+     */
+    if (step->depth == JDWP_STEP_DEPTH(INTO) &&
+        step->granularity == JDWP_STEP_SIZE(MIN)) {
+        completed = JNI_TRUE;
+        goto done;
+    }
+
+    /*
+     * Функция, для который был вызыван STEP уже завершилась
+     */
+    if (step->frameExited) {
+        completed = JNI_TRUE;
+        goto done;
+    }
+
+    currentDepth = getFrameCount(thread);
+    fromDepth = step->fromStackDepth;
+
+    if (fromDepth > currentDepth) {
+        /*
+         * Скорее всего, не получили уведомление об удалении фрейма
+         */
+        completed = JNI_TRUE;
+    } else if (fromDepth < currentDepth) {
+        /* Провалились в вызов другой функции */
+        if (   step->depth == JDWP_STEP_DEPTH(INTO)
+            && (!eventFilter_predictFiltering(step->stepHandlerNode, clazz,
+                                          (classname = getClassname(clazz))))
+            && hasLineNumbers(method) ) {
+
+            /* STEP INTO завершается, если по пути была вызвана функция */
+            completed = JNI_TRUE;
+        } else {
+            /*
+             * Нужно продолжить выполнение в функции, на которой начали шаги.
+             * Подписываемся на событие FramePop, а после продолжим выполнение.
+             * Можно заметить, что здесь обрабатывается step into - скорее всего
+             * вызываемый метод нужно обойти стороной (не прошел фильтр)
+             */
+            disableStepping(thread);
+
+            if (step->depth == JDWP_STEP_DEPTH(INTO)) {
+                step->methodEnterHandlerNode =
+                    eventHandler_createInternalThreadOnly(
+                                       EI_METHOD_ENTRY,
+                                       handleMethodEnterEvent, thread);
+                if (step->methodEnterHandlerNode == NULL) {
+                    EXIT_ERROR(AGENT_ERROR_INVALID_EVENT_TYPE,
+                                "installing event method enter handler");
+                }
+            }
+
+            error = JVMTI_FUNC_PTR(gdata->jvmti,NotifyFramePop)
+                        (gdata->jvmti, thread, 0);
+            if (error == JVMTI_ERROR_DUPLICATE) {
+                error = JVMTI_ERROR_NONE;
+            } else if (error != JVMTI_ERROR_NONE) {
+                EXIT_ERROR(error, "setting up notify frame pop");
+            }
+        }
+        jvmtiDeallocate(classname);
+        classname = NULL;
+    } else {
+        /*
+         * Остались в той же функции
+         */
+        if (step->granularity == JDWP_STEP_SIZE(MIN)) {
+            /* Если нужно выполнить 1 инструкцию, то все уже сделано */
+            completed = JNI_TRUE;
+        } else {
+            /* Закончить step in/over можно только если строка изменилась */
+            if (step->fromLine != -1) {
+                jint line = -1;
+                jlocation location;
+                jmethodID method;
+                WITH_LOCAL_REFS(env, 1) {
+                    jclass clazz;
+                    error = getFrameLocation(thread,
+                                        &clazz, &method, &location);
+                    if ( isMethodObsolete(method)) {
+                        method = NULL;
+                        location = -1;
+                    }
+                    if (error != JVMTI_ERROR_NONE || location == -1) {
+                        EXIT_ERROR(error, "getting frame location");
+                    }
+                    if ( method == step->method ) {
+                        log_debugee_location("stepControl_handleStep: checking line loc",
+                                thread, method, location);
+                        line = findLineNumber(thread, location,
+                                      step->lineEntries, step->lineEntryCount);
+                    }
+                    if (line != step->fromLine) {
+                        completed = JNI_TRUE;
+                    }
+                } END_WITH_LOCAL_REFS(env);
+            } else {
+                /* 
+                 * Случай, если нативная функция вызвала Java функцию.
+                 * В таком случае, просто завершаем шаг, т.к. не можем
+                 * корректно обработать различные события
+                 */
+                completed = JNI_TRUE;
+            }
+        }
+    }
+done:
+    if (completed) {
+        completeStep(env, thread, step);
+    }
+    stepControl_unlock();
+    return completed;
+}
+```
+
+</spoiler>
+
+<spoiler title="handleFramePopEvent">
+
+```c++
+static void
+handleFramePopEvent(JNIEnv *env, EventInfo *evinfo,
+                    HandlerNode *node,
+                    struct bag *eventBag)
+{
+    StepRequest *step;
+    jthread thread = evinfo->thread;
+
+    stepControl_lock();
+
+    step = threadControl_getStepRequest(thread);
+    if (step == NULL) {
+        EXIT_ERROR(AGENT_ERROR_INVALID_THREAD, "getting step request");
+    }
+
+    if (step->pending) {
+        /*
+         * Note: current depth is reported as *before* the pending frame
+         * pop.
+         */
+        jint currentDepth;
+        jint fromDepth;
+        jint afterPopDepth;
+
+        currentDepth = getFrameCount(thread);
+        fromDepth = step->fromStackDepth;
+        afterPopDepth = currentDepth-1;
+
+        /*
+         * If we are exiting the original stepping frame, record that
+         * fact here. Once the next step event comes in, we can safely
+         * stop stepping there.
+         */
+        if (fromDepth > afterPopDepth ) {
+            step->frameExited = JNI_TRUE;
+        }
+
+        if (step->depth == JDWP_STEP_DEPTH(OVER)) {
+            /*
+             * Either
+             * 1) the original stepping frame is about to be popped
+             *    [fromDepth == currentDepth]. Re-enable stepping to
+             *    reach a point where we can stop.
+             * 2) a method called from the stepping frame has returned
+             *    (during which we had stepping disabled)
+             *    [fromDepth == currentDepth - 1]. Re-enable stepping
+             *    so that we can continue instructions steps in the
+             *    original stepping frame.
+             * 3) a method further down the call chain has notified
+             *    of a frame pop [fromDepth < currentDepth - 1]. This
+             *    *might* represent case (2) above if the stepping frame
+             *    was calling a native method which in turn called a
+             *    java method. If so, we must enable stepping to
+             *    ensure that we get control back after the intervening
+             *    native frame is popped (you can't get frame pop
+             *    notifications on native frames). If the native caller
+             *    calls another Java method before returning,
+             *    stepping will be disabled again and another frame pop
+             *    will be awaited.
+             *
+             *    If it turns out that this is not case (2) with native
+             *    methods, then the enabled stepping is benign and
+             *    will be disabled again on the next step event.
+             *
+             * Note that the condition not covered above,
+             * [fromDepth > currentDepth] shouldn't happen since it means
+             * that too many frames have been popped. For robustness,
+             * we enable stepping in that case too, so that the errant
+             * step-over can be stopped.
+             *
+             */
+            LOG_STEP(("handleFramePopEvent: starting singlestep, depth==OVER"));
+            enableStepping(thread);
+        } else if (step->depth == JDWP_STEP_DEPTH(OUT) &&
+                   fromDepth > afterPopDepth) {
+            /*
+             * The original stepping frame is about to be popped. Step
+             * until we reach the next safe place to stop.
+             */
+            LOG_STEP(("handleFramePopEvent: starting singlestep, depth==OUT && fromDepth > afterPopDepth (%d>%d)",fromDepth, afterPopDepth));
+            enableStepping(thread);
+        } else if (step->methodEnterHandlerNode != NULL) {
+            /* We installed a method entry event handler as part of a step into operation. */
+            JDI_ASSERT(step->depth == JDWP_STEP_DEPTH(INTO));
+            if (fromDepth >= afterPopDepth) {
+                /*
+                 * We've popped back to the original stepping frame without finding a place to stop.
+                 * Resume stepping in the original frame.
+                 */
+                LOG_STEP(("handleFramePopEvent: starting singlestep, have methodEnter handler && depth==INTO && fromDepth >= afterPopDepth (%d>=%d)", fromDepth, afterPopDepth));
+                enableStepping(thread);
+                (void)eventHandler_free(step->methodEnterHandlerNode);
+                step->methodEnterHandlerNode = NULL;
+            } else {
+                LOG_STEP(("handleFramePopEvent: starting singlestep, have methodEnter handler && depth==INTO && fromDepth < afterPopDepth (%d<%d)", fromDepth, afterPopDepth));
+            }
+        }
+        LOG_STEP(("handleFramePopEvent: finished"));
+    }
+
+    stepControl_unlock();
+}
+```
+
+</spoiler>
 
 ## Python
 
