@@ -4448,6 +4448,82 @@ handleFramePopEvent(JNIEnv *env, EventInfo *evinfo,
 }
 ```
 
+TODO: fullspeed, fastmode, slowmode - это че?
+
+<spoiler title="fullspeed режим">
+
+В процессе исследования кода нашел упоминание о режиме [fullspeed debugging](https://docs.oracle.com/javase/8/docs/technotes/guides/jpda/enhancements1.4.html#fsd).
+Это специальный режим выполнения кода и важен он во время отладки.
+Вспомните, что код может либо интерпретироваться, либо компилироваться. Но, как мы сможем отладить машинные инструкции, если работать умеем только с байт-кодом?
+
+Раньше (до версии 1.4) если было необходимо отлаживать программу, то единственный способ ее выполнения - интерпретация.
+Эту проблему рашает fullspeed режим.
+
+Работает он просто - если нужно поставить точку останова куда-то, то эта часть только интерпретируется, не компилируется.
+У класса потока есть отдельный флаг, который отслеживает этот `interpretation-only` режим:
+
+```c++
+class JavaThread: public Thread {
+  /* ... */
+private:
+  // Used by the interpreter in fullspeed mode for frame pop, method
+  // entry, method exit and single stepping support. This field is
+  // only set to non-zero at a safepoint or using a direct handshake
+  // (see EnterInterpOnlyModeClosure).
+  // It can be set to zero asynchronously to this threads execution (i.e., without
+  // safepoint/handshake or a lock) so we have to be very careful.
+  // Accesses by other threads are synchronized using JvmtiThreadState_lock though.
+  int               _interp_only_mode;
+
+ public:
+  // used by the interpreter for fullspeed debugging support (see above)
+  static ByteSize interp_only_mode_offset() { return byte_offset_of(JavaThread, _interp_only_mode); }
+  bool is_interp_only_mode()                { return (_interp_only_mode != 0); }
+  int get_interp_only_mode()                { return _interp_only_mode; }
+  int set_interp_only_mode(int val)         { return _interp_only_mode = val; }
+  void increment_interp_only_mode()         { ++_interp_only_mode; }
+  void decrement_interp_only_mode()         { --_interp_only_mode; }
+  
+  /* ... */
+}
+```
+
+За переход в `iterpretation-only` режим отвечает класс `EnterInterpOnlyModeClosure`.
+В нем есть такой комментарий, описывающий как работает этот режим:
+
+```c++
+class EnterInterpOnlyModeClosure {
+ public:
+  void do_thread(Thread* th) {
+    JavaThread* jt = JavaThread::cast(th);
+    JvmtiThreadState* state = jt->jvmti_thread_state();
+
+    // invalidate_cur_stack_depth is called in enter_interp_only_mode
+    state->enter_interp_only_mode();
+
+    Continuation::set_cont_fastpath_thread_state(jt);
+
+    if (jt->has_last_Java_frame()) {
+      // If running in fullspeed mode, single stepping is implemented
+      // as follows: first, the interpreter does not dispatch to
+      // compiled code for threads that have single stepping enabled;
+      // second, we deoptimize all compiled java frames on the thread's stack when
+      // interpreted-only mode is enabled the first time for a given
+      // thread (nothing to do if no Java frames yet).
+      ResourceMark resMark;
+      for (StackFrameStream fst(jt, false /* update */, false /* process_frames */); !fst.is_done(); fst.next()) {
+        if (fst.current()->can_be_deoptimized()) {
+          Deoptimization::deoptimize(jt, *fst.current());
+        }
+      }
+    }
+    _completed = true;
+  }
+};
+```
+
+Можно заметить, что логика довольно проста - проходимся по всем фреймам потока и переводим его в байт-код (деоптимизируем).
+
 </spoiler>
 
 ## Python
