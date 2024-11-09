@@ -4044,12 +4044,12 @@ void DebuggerStepper::TrapStepOut(ControllerStackInfo *info, bool fForceTraditio
                 \    |--------------|
                 /           |
  comm channel -(            |  <--------------- JDWP - Java Debug Wire Protocol
-                \           |
-                     |--------------|
-                     | front-end    |
-                     |--------------|  <------- JDI - Java Debug Interface
-                     |      UI      |
-                     |--------------|
+                | \              |
+                | -------------- |
+                | front-end      |
+                | -------------- | <------- JDI - Java Debug Interface |
+                | UI             |
+                | -------------- |
 
 ```
 
@@ -4615,7 +4615,7 @@ def trace_dispatch(self, frame, event, arg):
   - модуль - используем вспомогательный модуль `runpy` для получения кода модуля
 - `Pdb._run` - выполняем цель
 - `Bdb.run` - отлаживаем переданное выражение (`run` - функция для отладки выражений)
-  - Если передали простую строку (как в `target.code` для скрипта), то компилируем (`compile('exec(compile(fp.read()!r, path, "exec"))', '<string>', 'exec')`)
+  - `compile(cmd)` - комплируем код, если передали простую строку (как в `target.code` для скрипта)
   - `sys.settrace(self.trace_dispatch)` - регистрируем колбэк для отладки
   - `exec(cmd)` - выполняем переданный код
 
@@ -4623,10 +4623,176 @@ def trace_dispatch(self, frame, event, arg):
 
 ### Точки останова
 
+Точку останова представляет класс `Breakpoint`. Это простой дата-класс, без логики.
+
+Хранение точек останова разделено:
+
+- В `Pdb` хранится словарь файл -> номер строки где поставлена точка останова
+- В `Breakpoint` хранится статический словарь `breaks`: файл + номер строки -> список объектов `Breakpoint`.
+
+Точка останова зависит от номера строки, поэтому в `trace_dispatch` за проверку точек останова ответственна функция `dispatch_line`.
+Проверка находится в функции `break_here` и осуществляется так:
+
+1. Проверяем, что в `Pdb` эта точка останова зарегистрирована
+2. Получаем список всех точек останова находящихся на этой строке
+   1. Пропускаем неактивные
+   2. Пропускаем те, что не принадлежат функции (например, точка останова на объявлении функции (`def`))
+   3. Пропускаем игнорируемые (счетчик `ignore`)
+   4. С помощью `eval` проверяем условие
+3. Если найденная точка останова временная - удаляем
+
+Шаг 2 реализован в функции `effective`, что говорит само за себя - находим *действующую* точку останова.
+
+<spoiler title="break_here">
+
+```python
+def break_here(self, frame):
+    """Return True if there is an effective breakpoint for this line.
+
+    Check for line or function breakpoint and if in effect.
+    Delete temporary breakpoints if effective() says to.
+    """
+    filename = self.canonic(frame.f_code.co_filename)
+    if filename not in self.breaks:
+        return False
+    lineno = frame.f_lineno
+    if lineno not in self.breaks[filename]:
+        # The line itself has no breakpoint, but maybe the line is the
+        # first line of a function with breakpoint set by function name.
+        lineno = frame.f_code.co_firstlineno
+        if lineno not in self.breaks[filename]:
+            return False
+
+    # flag says ok to delete temp. bp
+    (bp, flag) = effective(filename, lineno, frame)
+    if bp:
+        self.currentbp = bp.number
+        if (flag and bp.temporary):
+            self.do_clear(str(bp.number))
+        return True
+    else:
+        return False
+```
+
+</spoiler>
+
+<spoiler title="effective">
+
+```python
+def effective(file, line, frame):
+    """Return (active breakpoint, delete temporary flag) or (None, None) as
+       breakpoint to act upon.
+
+       The "active breakpoint" is the first entry in bplist[line, file] (which
+       must exist) that is enabled, for which checkfuncname is True, and that
+       has neither a False condition nor a positive ignore count.  The flag,
+       meaning that a temporary breakpoint should be deleted, is False only
+       when the condiion cannot be evaluated (in which case, ignore count is
+       ignored).
+
+       If no such entry exists, then (None, None) is returned.
+    """
+    possibles = Breakpoint.bplist[file, line]
+    for b in possibles:
+        if not b.enabled:
+            continue
+        if not checkfuncname(b, frame):
+            continue
+        # Count every hit when bp is enabled
+        b.hits += 1
+        if not b.cond:
+            # If unconditional, and ignoring go on to next, else break
+            if b.ignore > 0:
+                b.ignore -= 1
+                continue
+            else:
+                # breakpoint and marker that it's ok to delete if temporary
+                return (b, True)
+        else:
+            # Conditional bp.
+            # Ignore count applies only to those bpt hits where the
+            # condition evaluates to true.
+            try:
+                val = eval(b.cond, frame.f_globals, frame.f_locals)
+                if val:
+                    if b.ignore > 0:
+                        b.ignore -= 1
+                        # continue
+                    else:
+                        return (b, True)
+                # else:
+                #   continue
+            except:
+                # if eval fails, most conservative thing is to stop on
+                # breakpoint regardless of ignore count.  Don't delete
+                # temporary, as another hint to user.
+                return (b, False)
+    return (None, None)
+```
+
+</spoiler>
+
 ### Шаги
 
-TODO: 
-- проглоссарий в Doc рассказать
+За шаги отвечают методы того же `Bdb`:
+
+- `set_next` - step over
+- `set_step` - step in
+- `set_return` - step out
+
+Но если посмотреть, то можно увидеть, что все они реализуются тем, что просто выставляют определенные значения полей:
+
+- `stopframe` - фрейм, на котором надо остановиться
+- `returnframe` - фрейм, на котором надо остановиться при *выходе*
+- `stoplineno` - номер строки, на которой надо остановиться (остановиться на строке не меньшей, чем указано)
+
+Таким образом, нужное поведение достигается различной комбинацией этих параметров:
+
+|                     | stopframe        | returnframe   | stoplineno |
+| ------------------- | ---------------- | ------------- | ---------- |
+| step over           | текущий фрейм    | None          | 0          |
+| step in             | None             | None          | 0          |
+| step out            | предыдущий фрейм | текущий фрейм | 0          |
+| step out (корутина) | текущий фрейм    | None          | -1         |
+
+После при вызове колбэка определяем нужно ли останавливаться. В этой таблице более-менее все ясно кроме последней строки.
+Причина в деталях реализации: итерирование реализовано с помощью `while` цикла, который бросает исключение `StopIteration` по окончании. Генераторы - это сопрограммы, также итеративно возвращают значения, но и им новые значения также можно передать (с помощью `send`). Реализованы аналогично, но бросают `GeneratorExit` при окончании.
+Логическое окончание их работы наступает не тогда, когда их фрейм изменился, а тогда, когда было выброшено соответствующее исключение. Поэтому отследить их окончание с помощью `return` нельзя. Но мы можем отлеживать исключения - для них есть отдельные события и свой обработчик - `dispatch_exception`. В нем и проверяется подобная ситуация.
+
+<spoiler title="dispatch_exception">
+
+```python
+GENERATOR_AND_COROUTINE_FLAGS = CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR
+
+def dispatch_exception(self, frame, arg):
+    """Invoke user function and return trace function for exception event.
+
+    If the debugger stops on this exception, invoke
+    self.user_exception(). Raise BdbQuit if self.quitting is set.
+    Return self.trace_dispatch to continue tracing in this scope.
+    """
+    if self.stop_here(frame):
+        # When stepping with next/until/return in a generator frame, skip
+        # the internal StopIteration exception (with no traceback)
+        # triggered by a subiterator run with the 'yield from' statement.
+        if not (frame.f_code.co_flags & GENERATOR_AND_COROUTINE_FLAGS
+                and arg[0] is StopIteration and arg[2] is None):
+            self.user_exception(frame, arg)
+            if self.quitting: raise BdbQuit
+    # Stop at the StopIteration or GeneratorExit exception when the user
+    # has set stopframe in a generator by issuing a return command, or a
+    # next/until command at the last statement in the generator before the
+    # exception.
+    elif (self.stopframe and frame is not self.stopframe
+            and self.stopframe.f_code.co_flags & GENERATOR_AND_COROUTINE_FLAGS
+            and arg[0] in (StopIteration, GeneratorExit)):
+        self.user_exception(frame, arg)
+        if self.quitting: raise BdbQuit
+
+    return self.trace_dispatch
+```
+
+</spoiler>
 
 ## JavaScript
 
