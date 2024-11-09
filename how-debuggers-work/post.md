@@ -4528,6 +4528,106 @@ class EnterInterpOnlyModeClosure {
 
 ## Python
 
+Дальше мы будем препарировать Python, точнее его интерпретатор CPython.
+Он сильно отличается от предыдущих. И не только тем, что он только интерпретируемый.
+
+Главное отличие - как реализована отладка, точнее отладчик.
+Отладчик Python реализован в Python: точки останова, шаги, вычисления выражений - это все в самом языке.
+Встроенный модуль `bdb` содержит 2 класса:
+
+- `Bdb` - базовый класс отладчика: шаги, трейсинг, вычисление выражений, запуск/останов
+- `Breakpoint` - класс точки останова: создание, удаление, (де)активация
+
+Замечание: я не говорил, что отладчик *полностью* реализован в Python. На самом деле весь отладчик реализован поверх единственной функции из модуля `sys` - `settrace`.
+Эта функция сохраняет колбек, который будет вызываться при любом интересном событии интерпретатора:
+
+- Вызов/начало/продолжение/возвращение функции
+- Исполнение новой строки (исходного) кода
+- Исполнение новой инструкции (байт-кода)
+- Обработка исключений
+- Корутины
+
+Как можно догадаться, работа отладчика заключается в том, чтобы корректно обработать эти события.
+Этим и занимается метод `Bdb.trace_dispatch` (он и регистрируется в `sys.settrrace`):
+
+<spoiler title="Bdb.trace_dispatch">
+
+```python
+def trace_dispatch(self, frame, event, arg):
+    """Dispatch a trace function for debugged frames based on the event.
+
+    This function is installed as the trace function for debugged
+    frames. Its return value is the new trace function, which is
+    usually itself. The default implementation decides how to
+    dispatch a frame, depending on the type of event (passed in as a
+    string) that is about to be executed.
+
+    The event can be one of the following:
+        line: A new line of code is going to be executed.
+        call: A function is about to be called or another code block
+                is entered.
+        return: A function or other code block is about to return.
+        exception: An exception has occurred.
+        c_call: A C function is about to be called.
+        c_return: A C function has returned.
+        c_exception: A C function has raised an exception.
+
+    For the Python events, specialized functions (see the dispatch_*()
+    methods) are called.  For the C events, no action is taken.
+
+    The arg parameter depends on the previous event.
+    """
+    if self.quitting:
+        return # None
+    if event == 'line':
+        return self.dispatch_line(frame)
+    if event == 'call':
+        return self.dispatch_call(frame, arg)
+    if event == 'return':
+        return self.dispatch_return(frame, arg)
+    if event == 'exception':
+        return self.dispatch_exception(frame, arg)
+    if event == 'c_call':
+        return self.trace_dispatch
+    if event == 'c_exception':
+        return self.trace_dispatch
+    if event == 'c_return':
+        return self.trace_dispatch
+    print('bdb.Bdb.dispatch: unknown debugging event:', repr(event))
+    return self.trace_dispatch
+```
+
+</spoiler>
+
+> Если посмотреть на код, то можно заметить, что некоторый события возвращают функции.
+> Это не спроста: колбек функция должна возвращать функцию, которая будет использоваться для трассировки нового `scope`'а.
+> То есть, есть глобальная функция трассировщик, которая в зависимости от окружения, может переопределить поведение следующего трассировщика.
+
+Последний вопрос - как это все запустить? Когда мы отлаживаем код, то не вставляем явных вызовов `sys.set_trace` (это функция, запускающая отладчик).
+Ответ тоже простой - отдельный модуль `pdb`.
+
+Главное что в нем есть - класс `Pdb`, интерактивный отладчик. Он наследуется от `Bdb` и использует его функциональность (так обычно и создают отладчики).
+Идя ниже по стеку вызовов находим то, как реализуется отладка (стек вызовов):
+
+- `pdb.main` - получаем цель для выполнения (модуль/скрипт)
+- `target.code` - получаем код цели (сейчас получаем строку):
+  - скрипт - читаем файл и компилируем его: `exec(compile(fp.read()!r, path, 'exec'))` (это простая строка!)
+  - модуль - используем вспомогательный модуль `runpy` для получения кода модуля
+- `Pdb._run` - выполняем цель
+- `Bdb.run` - отлаживаем переданное выражение (`run` - функция для отладки выражений)
+  - Если передали простую строку (как в `target.code` для скрипта), то компилируем (`compile('exec(compile(fp.read()!r, path, "exec"))', '<string>', 'exec')`)
+  - `sys.settrace(self.trace_dispatch)` - регистрируем колбэк для отладки
+  - `exec(cmd)` - выполняем переданный код
+
+Вот так и реализуется отладка. На этом этапе уже должно стать понятно, как реализуются всякие step XXX, точки останова и т.д., но для полноты картины рассмотрим.
+
+### Точки останова
+
+### Шаги
+
+TODO: 
+- проглоссарий в Doc рассказать
+
 ## JavaScript
 
 # Другие платформы
