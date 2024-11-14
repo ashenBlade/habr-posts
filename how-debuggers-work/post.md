@@ -3696,6 +3696,8 @@ backtrace_command_1 (const frame_print_options &fp_opts,
 
 ## C\#
 
+TODO: структура события добавить код (а то он один без структуры события)
+
 В директории `src/coreclr/debug` - все экспортируемые платформой сущности, используемые для отладки.
 Директория `di` - debug interface. В ней содержится публичный интерфейс.
 
@@ -4795,6 +4797,207 @@ def dispatch_exception(self, frame, arg):
 </spoiler>
 
 ## JavaScript
+
+Последним будем рассматривать NodeJS в качестве рантайма JavaScript.
+Но NodeJS основан на движке V8, поэтому мы скорее будем рассматривать V8. Поэтому я мои слова будут справедливы для любого рантайма, основанного на V8.
+
+Если движок встраивается, то разработчики для взаимодействия с отладчиком используют Inspector Protocol - протокол взаимодействия с отладчиком. Например, им пользуется Dev Tools в Chrome, но конечный пользователь им (протоколом) не пользуется.
+
+TODO:
+- V8DebuggerAgentImpl - есть функции stepOver, stepInto, stepOut, setbreakpoint и т.д. <-- искать
+
+Для начала опишу сам протокол инспектора.
+Во-первых, все команды предсталяются в виде JSON объектов примерно такой структуры:
+
+```json
+{
+    // Номер-идентификатор сообщения для отслеживания
+    "seq": "number",
+    // Тип сообщения: запрос, ответ, событие
+    "type": "request | response | event",
+    // Если type === 'request'
+    // Название команды
+    "command": "string",
+    // Объект из именованых пар: название - значение аргумента
+    "arguments": {
+        "argName": "value"
+    },
+    // Если type === 'response'
+    // Ответ на какой запрос
+    "request_seq": "number",
+    // Выполнявшаяся команда
+    "command": "string",
+    // Успешно или нет выполнилось
+    "success": "boolean",
+    // Возвращаемое значение (в зависимости от команды)
+    "body": "object",
+    // Сообщение об ошибке, если !success
+    "message": "string",
+    // Флаг того, что VM приостановлена командой
+    "running": "boolean",
+    // Идентификаторы связных объектов (такое объекты имеют поле handle, на которое и идет ссылка)
+    "refs": [],
+    // Если type === 'event'
+    // Название события
+    "event": "string",
+    // Данные события
+    "body": "object"
+}
+```
+
+Транспорт не оговаривается, но к инспектору обычно подключаются через HTTP, а в NodeJS через веб-сокеты (если запустить node с флагом `--inspect`, то будет выведен URL с веб-сокетом).
+
+Но это вопрос представления объекта сообщения. Другой момент - как он кодируется. Если отправляем по HTTP, то кодировка ему на откуп (текстовый/бинарный), но вот внутри все сериализованные сообщения представляются в кодировке CBOR - Concise Binary Object Representation (RFC 8949). Если очень коротко - это бинарный JSON: есть аналогичные литералы (true, false, null, undefined) и типы (строки, числа, объекты, массивы), нет строгой схемы. Он даже имеет CWT - аналог JWT, но для CBOR.
+
+Строгой спецификации протокола я не нашел (возможно ее и нет), но все сообщения, используемые протоколом описываются в файле `js_protocol.pdl` (в репозитории V8), специальном формате, используемом для Chrome DevTools.
+
+Также я файл в репозитории `bugger-v8-client` - [PROTOCOL.md](https://github.com/buggerjs/bugger-v8-client/blob/master/PROTOCOL.md) (последний коммит 9 лет назад). Он в более человеческом ~~щадящем~~ виде описывает протокол.
+
+Теперь, перейдем к архитектуре отладчика.
+
+Архитектура отладки 2 уровневая - Клиент и Бэкэнд. Если посмотреть поближе на реализацию, то увидим большое количество абстракций:
+
+- `V8Inspector`
+- `V8InspectorSession`
+- `UberDispatcher`
+- `DomainDispatcher`
+- `FronendChannel`
+- `Backend`/`Frontend`
+
+Замечу, что 1) есть еще абстракции и 2) для каждой может быть несколько реализаций.
+Поэтому, чтобы было проще, опишу в 2 словах кто за что отвечает и как это работает:
+
+`V8Inspector` - это интерфейс к движку V8. Главное что нам от него надо - доступ к `V8InspectorSession`, основному классу взаимодействия. Его можно получить через метод `connect`. Когда мы его получили, то все сообщения протокола отправляем ему.
+
+В самом `V8InspectorSession` нам нужен только 1 метод - `dispatchProtcolMessage`.
+Все что делает этот метод - перенаправляет сообщение уже объекту `UberDispatcher`.
+
+Ненадолго вернемся к протоколу. Все команды разделены по доменам (`Domain`). Можно сказать, это просто области различной функциональности. Название каждой команды в начале имеет название ее домена. Например, `Debugger.stepOver` - команда step over для отладчика, а `Profiler.startPreciseCoverage` - начало сбора информации о покрытии кода.
+
+Так вот, задача `UberDispatcher` - это найти домен, которому принадлежит команда и отправить ее.
+Каждый такой домен (его обработчиу) - класс `DomainDispatcher` (его инстанс).
+Когда команда доходит до него, то она выполняется.
+
+Последний этап - отправка ответа. Здесь стоит заметить, что `UberDispatcher` отправляет команды в 1 сторону, обратно ничего не возвращает. Это вполне сходится с асинхронной природой команд для отладчика (видели такое и раньше).
+
+Но как же отправляются ответы клиенту? Здесь мы приходим к последней абстракции - `FrontendChannel`.
+Из названия становится понятно, что это канал взаимодействия с фронтэндом (кто встраивает).
+Для взаимодействия с фронтэндом со стороны бэкэнда есть 2 основных метода: `SendProtocolResponse` и `sendProtocolNotification` (ответ и событие).
+
+И вот мы подошли к финишной черте. Единственная абстракция, про которую мы не говорили - `Backend`. Это интерфейс для работы с рантаймом. Если посмотреть на его объявление, то можно заметить, что все его методы похожи на сгенерированный кодкакого-нибудь API: принимаемые аргументы указываются жестко (байтность, опциональность и т.д.), а возвращает объект класса `Response`.
+
+> В реально так и есть - этот класс (как и много других описанных ранее классов) - продукт кодогенерации.
+> Поэтому ссылок на них нет, только здесь могу код показать.
+
+<spoiler title="Backend">
+
+```c++
+class  Backend {
+public:
+    virtual ~Backend() { }
+
+    virtual DispatchResponse continueToLocation(std::unique_ptr<protocol::Debugger::Location> in_location, Maybe<String> in_targetCallFrames) = 0;
+    virtual DispatchResponse disable() = 0;
+    virtual DispatchResponse enable(Maybe<double> in_maxScriptsCacheSize, String* out_debuggerId) = 0;
+    virtual DispatchResponse evaluateOnCallFrame(const String& in_callFrameId, const String& in_expression, Maybe<String> in_objectGroup, Maybe<bool> in_includeCommandLineAPI, Maybe<bool> in_silent, Maybe<bool> in_returnByValue, Maybe<bool> in_generatePreview, Maybe<bool> in_throwOnSideEffect, Maybe<double> in_timeout, std::unique_ptr<protocol::Runtime::RemoteObject>* out_result, Maybe<protocol::Runtime::ExceptionDetails>* out_exceptionDetails) = 0;
+    virtual DispatchResponse getPossibleBreakpoints(std::unique_ptr<protocol::Debugger::Location> in_start, Maybe<protocol::Debugger::Location> in_end, Maybe<bool> in_restrictToFunction, std::unique_ptr<protocol::Array<protocol::Debugger::BreakLocation>>* out_locations) = 0;
+    virtual DispatchResponse getScriptSource(const String& in_scriptId, String* out_scriptSource, Maybe<Binary>* out_bytecode) = 0;
+    virtual DispatchResponse disassembleWasmModule(const String& in_scriptId, Maybe<String>* out_streamId, int* out_totalNumberOfLines, std::unique_ptr<protocol::Array<int>>* out_functionBodyOffsets, std::unique_ptr<protocol::Debugger::WasmDisassemblyChunk>* out_chunk) = 0;
+    virtual DispatchResponse nextWasmDisassemblyChunk(const String& in_streamId, std::unique_ptr<protocol::Debugger::WasmDisassemblyChunk>* out_chunk) = 0;
+    virtual DispatchResponse getWasmBytecode(const String& in_scriptId, Binary* out_bytecode) = 0;
+    virtual DispatchResponse getStackTrace(std::unique_ptr<protocol::Runtime::StackTraceId> in_stackTraceId, std::unique_ptr<protocol::Runtime::StackTrace>* out_stackTrace) = 0;
+    virtual DispatchResponse pause() = 0;
+    virtual DispatchResponse pauseOnAsyncCall(std::unique_ptr<protocol::Runtime::StackTraceId> in_parentStackTraceId) = 0;
+    virtual DispatchResponse removeBreakpoint(const String& in_breakpointId) = 0;
+    virtual DispatchResponse restartFrame(const String& in_callFrameId, Maybe<String> in_mode, std::unique_ptr<protocol::Array<protocol::Debugger::CallFrame>>* out_callFrames, Maybe<protocol::Runtime::StackTrace>* out_asyncStackTrace, Maybe<protocol::Runtime::StackTraceId>* out_asyncStackTraceId) = 0;
+    virtual DispatchResponse resume(Maybe<bool> in_terminateOnResume) = 0;
+    virtual DispatchResponse searchInContent(const String& in_scriptId, const String& in_query, Maybe<bool> in_caseSensitive, Maybe<bool> in_isRegex, std::unique_ptr<protocol::Array<protocol::Debugger::SearchMatch>>* out_result) = 0;
+    virtual DispatchResponse setAsyncCallStackDepth(int in_maxDepth) = 0;
+    virtual DispatchResponse setBlackboxPatterns(std::unique_ptr<protocol::Array<String>> in_patterns) = 0;
+    virtual DispatchResponse setBlackboxedRanges(const String& in_scriptId, std::unique_ptr<protocol::Array<protocol::Debugger::ScriptPosition>> in_positions) = 0;
+    virtual DispatchResponse setBreakpoint(std::unique_ptr<protocol::Debugger::Location> in_location, Maybe<String> in_condition, String* out_breakpointId, std::unique_ptr<protocol::Debugger::Location>* out_actualLocation) = 0;
+    virtual DispatchResponse setInstrumentationBreakpoint(const String& in_instrumentation, String* out_breakpointId) = 0;
+    virtual DispatchResponse setBreakpointByUrl(int in_lineNumber, Maybe<String> in_url, Maybe<String> in_urlRegex, Maybe<String> in_scriptHash, Maybe<int> in_columnNumber, Maybe<String> in_condition, String* out_breakpointId, std::unique_ptr<protocol::Array<protocol::Debugger::Location>>* out_locations) = 0;
+    virtual DispatchResponse setBreakpointOnFunctionCall(const String& in_objectId, Maybe<String> in_condition, String* out_breakpointId) = 0;
+    virtual DispatchResponse setBreakpointsActive(bool in_active) = 0;
+    virtual DispatchResponse setPauseOnExceptions(const String& in_state) = 0;
+    virtual DispatchResponse setReturnValue(std::unique_ptr<protocol::Runtime::CallArgument> in_newValue) = 0;
+    virtual DispatchResponse setScriptSource(const String& in_scriptId, const String& in_scriptSource, Maybe<bool> in_dryRun, Maybe<bool> in_allowTopFrameEditing, Maybe<protocol::Array<protocol::Debugger::CallFrame>>* out_callFrames, Maybe<bool>* out_stackChanged, Maybe<protocol::Runtime::StackTrace>* out_asyncStackTrace, Maybe<protocol::Runtime::StackTraceId>* out_asyncStackTraceId, String* out_status, Maybe<protocol::Runtime::ExceptionDetails>* out_exceptionDetails) = 0;
+    virtual DispatchResponse setSkipAllPauses(bool in_skip) = 0;
+    virtual DispatchResponse setVariableValue(int in_scopeNumber, const String& in_variableName, std::unique_ptr<protocol::Runtime::CallArgument> in_newValue, const String& in_callFrameId) = 0;
+    virtual DispatchResponse stepInto(Maybe<bool> in_breakOnAsyncCall, Maybe<protocol::Array<protocol::Debugger::LocationRange>> in_skipList) = 0;
+    virtual DispatchResponse stepOut() = 0;
+    virtual DispatchResponse stepOver(Maybe<protocol::Array<protocol::Debugger::LocationRange>> in_skipList) = 0;
+
+};
+```
+
+</spoiler>
+
+Этот интерфейс реализует класс `V8DebuggerAgentImpl`. Если посмотреть на его реализацию, то увидим, что и он на самом деле просто обертка над другим объектом. Но на этот раз последним - `V8Debugger`. Внутри него и содержится логика отладки.
+
+Например, вот реализация метода `stepOverStatement`:
+
+<spoiler title=V8Debugger::stepOverStatement>
+
+```c++
+void V8Debugger::stepOverStatement(int targetContextGroupId) {
+  DCHECK(isPaused());
+  DCHECK(targetContextGroupId);
+  m_targetContextGroupId = targetContextGroupId;
+  v8::debug::PrepareStep(m_isolate, v8::debug::StepOver);
+  continueProgram(targetContextGroupId);
+}
+```
+
+</spoiler>
+
+Собирая все вместе, можно построить такой график взаимодействия с отладчиком
+
+```text
+                                    V8Inspector
+                                         |
+                                         |
+                                         | connect()
+                                         |
+                                         |
+              dispatch(msg)              V
+   Frontend  ------------------> V8InspectorSession
+    (клиент)                             |
+      ^                                  | 
+      |                                  | dispatch(msg)
+      |                                  | 
+      |                                  V
+      |                           UberDispatcher
+      |                                  |
+      |                                  |
+      |                                  | 
+      |                                  | dispatch(msg)
+      |                                  |
+      |         SendResponse()           V
+FrontendChannel <--------------- DomainDispatcher
+                                      ^     |
+                                      |     |
+                                      |     | invoke function
+                                      |     |
+                                      |     V
+                                      Backend   
+                                      ^     |
+                                      |     |
+                                      |     |
+                                      |     |
+                                      |     V
+                                     V8Debugger
+                                       (магия)
+```
+
+Теперь, переходим к рассмотрению реализации функциональность отладчика.
+
+### Точки останова
+
+
+
+### Шаги
 
 # Другие платформы
 
