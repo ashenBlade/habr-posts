@@ -4995,7 +4995,139 @@ FrontendChannel <--------------- DomainDispatcher
 
 ### Точки останова
 
+В установке точки останова принимает участие еще один важный объект (`V8Debugger` здесь не участвует, `Backend` отправляет запрос описанным далее объектам): `Script`.
 
+`Script` - это еще одна абстракция (интерфейс). Почему становится ясно, когда понимаешь, что V8 может выполнять не только JS, но и WASM, а способы выставления точек останова в них могут различаться.
+
+Поэтому за выставление точек останова ответственнен сам скрипт. И эта логика содержится в его методе `SetBreakPoint`.
+
+И в нем есть объект другого класса - `Debug`. Этот класс ответственнен за работу с точками останова.
+
+Перед выставлением точки останова необходимо подготовить окружение. Речь идет о байт-коде V8. Поведение не сильно отличается от, например, Java: выстраиваем функции (создаем обычные функции из inline), деоптимизация, получение байт-кода.
+
+Когда эта процедура закончена, то мы сохраняем точку останова в отдельном массиве, а после выставляем уже в коде.
+Само выставление точки останова находится в методе `ApplyDebugBreak`:
+
+<spoiler title="ApplyDebugBreak">
+
+```c++
+void BytecodeArrayIterator::ApplyDebugBreak() {
+  // Get the raw bytecode from the bytecode array. This may give us a
+  // scaling prefix, which we can patch with the matching debug-break
+  // variant.
+  uint8_t* cursor = cursor_ - prefix_size_;
+  interpreter::Bytecode bytecode = interpreter::Bytecodes::FromByte(*cursor);
+  if (interpreter::Bytecodes::IsDebugBreak(bytecode)) return;
+  interpreter::Bytecode debugbreak =
+      interpreter::Bytecodes::GetDebugBreak(bytecode);
+  *cursor = interpreter::Bytecodes::ToByte(debugbreak);
+}
+```
+
+</spoiler>
+
+Можно заметить, что здесь мы себя ведем точно также, как и с обычными машинными инструкциями - перетираем инструкцию точкой останова. Разве что, мы дополнительно проверяем, что там уже стоит точка останова.
+
+Когда мы хотим удалить точку останова, то делаем аналогичные вещи:
+
+<spoiler title="ClearBreakPoint">
+
+
+```c++
+void BreakIterator::ClearDebugBreak() {
+  DCHECK(GetDebugBreakType() >= DEBUGGER_STATEMENT);
+  Tagged<BytecodeArray> bytecode_array =
+      debug_info_->DebugBytecodeArray(isolate());
+  Tagged<BytecodeArray> original =
+      debug_info_->OriginalBytecodeArray(isolate());
+  bytecode_array->set(code_offset(), original->get(code_offset()));
+}
+```
+
+</spoiler>
+
+> Примечание: в коде используется класс `BreakIterator`. Это итератор по точкам останова.
+> Выставление точек останова реализовано не кусками, а единым целым - удаляются и выставляются все одновременно.
+
+<spoiler title="А что с WASM">
+
+Я обронил слово, что для WASM будет другая логика. Теперь, опишу почему. За него отвечает класс `WasmScript` (наследуется от `Script`).
+
+Он переопределяет нужный нам метод `SetBreakPoint`. И если посмотреть на реализацию, то она состоит из 3 простых шагов: находим модуль, находим место для точки останова и выставляем ее.
+
+```c++
+// static
+bool WasmScript::SetBreakPoint(DirectHandle<Script> script, int* position,
+                               DirectHandle<BreakPoint> break_point) {
+  DCHECK_NE(kOnEntryBreakpointPosition, *position);
+
+  // Find the function for this breakpoint.
+  const wasm::WasmModule* module = script->wasm_native_module()->module();
+  int func_index = GetContainingWasmFunction(module, *position);
+  if (func_index < 0) return false;
+  const wasm::WasmFunction& func = module->functions[func_index];
+  int offset_in_func = *position - func.code.offset();
+
+  int breakable_offset = FindNextBreakablePosition(script->wasm_native_module(),
+                                                   func_index, offset_in_func);
+  if (breakable_offset == 0) return false;
+  *position = func.code.offset() + breakable_offset;
+
+  return WasmScript::SetBreakPointForFunction(script, func_index,
+                                              breakable_offset, break_point);
+}
+```
+
+Если опустимся ниже, то найдем как выставляются точки останова в WASM:
+
+```c++
+class DebugInfo {
+    /* ... */
+    void SetBreakpoint(int func_index, int offset, Isolate* isolate) {
+        // Get the set of previously set breakpoints, to check later whether a new
+        // breakpoint was actually added.
+        std::vector<int> all_breakpoints = FindAllBreakpoints(func_index);
+
+        auto& isolate_data = per_isolate_data_[isolate];
+        std::vector<int>& breakpoints =
+            isolate_data.breakpoints_per_function[func_index];
+        auto insertion_point =
+            std::lower_bound(breakpoints.begin(), breakpoints.end(), offset);
+        if (insertion_point != breakpoints.end() && *insertion_point == offset) {
+            // The breakpoint is already set for this isolate.
+            return;
+        }
+        breakpoints.insert(insertion_point, offset);
+
+        // Find the insertion position within {all_breakpoints}.
+        insertion_point = std::lower_bound(all_breakpoints.begin(),
+                                           all_breakpoints.end(), offset);
+        bool breakpoint_exists =
+            insertion_point != all_breakpoints.end() && *insertion_point == offset;
+        // If the breakpoint was already set before, then we can just reuse the old
+        // code. Otherwise, recompile it. In any case, rewrite this isolate's stack
+        // to make sure that it uses up-to-date code containing the breakpoint.
+        WasmCode* new_code;
+        if (breakpoint_exists) {
+        new_code = native_module_->GetCode(func_index);
+        } else {
+        all_breakpoints.insert(insertion_point, offset);
+        int dead_breakpoint =
+            DeadBreakpoint(func_index, base::VectorOf(all_breakpoints), isolate);
+        new_code = RecompileLiftoffWithBreakpoints(
+            func_index, base::VectorOf(all_breakpoints), dead_breakpoint);
+        }
+        UpdateReturnAddresses(isolate, new_code, isolate_data.stepping_frame);
+    }
+    /* ... */
+}
+```
+
+Можно заметить, что если мы поставили точку останова, то приходится перекомпилировать весь модуль. Даже с учетом того, что используется кэш, это не самый быстрый вариант.
+
+> Если что, Liftoff - это компилятор WASM в V8
+
+</spoiler>
 
 ### Шаги
 
