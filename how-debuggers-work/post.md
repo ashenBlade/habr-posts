@@ -5129,7 +5129,330 @@ class DebugInfo {
 
 </spoiler>
 
+Теперь, когда выполнение доходит до точки останова рантайм об этом узнает и вызовет обработчик `Runtime_DebugBreakOnBytecode`. Сама логика обработки точки останова находится в том же классе `Debug`, методе `Break`.
+
+Вот кусок этого метода, ответственный за обработку точек останова:
+
+<spoiler title="Debug::Break">
+
+```c++
+void Debug::Break(JavaScriptFrame* frame,
+                  DirectHandle<JSFunction> break_target) {
+  RCS_SCOPE(isolate_, RuntimeCallCounterId::kDebugger);
+  // Just continue if breaks are disabled or debugger cannot be loaded.
+  if (break_disabled()) return;
+
+  // Enter the debugger.
+  DebugScope debug_scope(this);
+  DisableBreak no_recursive_break(this);
+
+  // Return if we fail to retrieve debug info.
+  Handle<SharedFunctionInfo> shared(break_target->shared(), isolate_);
+  if (!EnsureBreakInfo(shared)) return;
+  PrepareFunctionForDebugExecution(shared);
+
+  Handle<DebugInfo> debug_info(TryGetDebugInfo(*shared).value(), isolate_);
+
+  // Find the break location where execution has stopped.
+  BreakLocation location = BreakLocation::FromFrame(debug_info, frame);
+  const bool hitInstrumentationBreak =
+      IsBreakOnInstrumentation(debug_info, location);
+  bool shouldPauseAfterInstrumentation = false;
+  if (hitInstrumentationBreak) {
+    debug::DebugDelegate::ActionAfterInstrumentation action =
+        OnInstrumentationBreak();
+    switch (action) {
+      case debug::DebugDelegate::ActionAfterInstrumentation::kPause:
+        shouldPauseAfterInstrumentation = true;
+        break;
+      case debug::DebugDelegate::ActionAfterInstrumentation::
+          kPauseIfBreakpointsHit:
+        shouldPauseAfterInstrumentation = false;
+        break;
+      case debug::DebugDelegate::ActionAfterInstrumentation::kContinue:
+        return;
+    }
+  }
+
+  // Find actual break points, if any, and trigger debug break event.
+  ClearMutedLocation();
+  bool has_break_points;
+  bool scheduled_break =
+      scheduled_break_on_function_call() || shouldPauseAfterInstrumentation;
+  MaybeHandle<FixedArray> break_points_hit =
+      CheckBreakPoints(debug_info, &location, &has_break_points);
+  if (!break_points_hit.is_null() || break_on_next_function_call() ||
+      scheduled_break) {
+    StepAction lastStepAction = last_step_action();
+    debug::BreakReasons break_reasons;
+    if (scheduled_break) {
+      break_reasons.Add(debug::BreakReason::kScheduled);
+    }
+    // If it's a debugger statement, add the reason and then mute the location
+    // so we don't stop a second time.
+    bool is_debugger_statement = IsBreakOnDebuggerStatement(shared, location);
+    if (is_debugger_statement) {
+      break_reasons.Add(debug::BreakReason::kDebuggerStatement);
+    }
+
+    // Clear all current stepping setup.
+    ClearStepping();
+    // Notify the debug event listeners.
+    OnDebugBreak(!break_points_hit.is_null()
+                     ? break_points_hit.ToHandleChecked()
+                     : isolate_->factory()->empty_fixed_array(),
+                 lastStepAction, break_reasons);
+
+    if (is_debugger_statement) {
+      // Don't pause here a second time
+      SetMutedLocation(shared, location);
+    }
+    return;
+  }
+  /* ... */
+}
+```
+
+</spoiler>
+
+<spoiler title="Кодогенерация">
+
+Из интересного - интерфес рантайма. Если мы в режиме интерпретатора, то у каждого байт-кода есть своя функция обработчик. И название функции обработчки создается с помощью макроса `IGNITION_HANDLER`. Например, обработчик байт-кода `DebugBreak0` определяется так:
+
+```c++
+IGNITION_HANDLER(Name, InterpreterAssembler) {
+    TNode<Context> context = GetContext();
+    TNode<Object> accumulator = GetAccumulator();
+    TNode<PairT<Object, Smi>> result_pair = CallRuntime<PairT<Object, Smi>>(
+        Runtime::kDebugBreakOnBytecode, context, accumulator);
+    TNode<Object> return_value = Projection<0>(result_pair);
+    TNode<IntPtrT> original_bytecode = SmiUntag(Projection<1>(result_pair));
+    SetAccumulator(return_value);
+    DispatchToBytecodeWithOptionalStarLookahead(original_bytecode);
+}
+```
+
+Замечания:
+
+- На самом деле, имеется 5 байт-кодов для точки останова (как можно догадаться из суффикса `0`)
+- Все `DebugBreakX` одинаковы, поэтому их определение создается с помощью другого макроса. Для удобства я раскрыл его.
+
+Можете заметить, интересную функцию `CallRuntime`. Это функция, которая вызывает функции интерфейса рантайма. А для определения, какую функцию надо вызвать, передается код (перечисление). Очень похоже на системный вызов.
+
+Но и это еще не все. Посмотрим на ее определение:
+
+```c++
+RUNTIME_FUNCTION_RETURN_PAIR(Runtime_DebugBreakOnBytecode) {
+  using interpreter::Bytecode;
+  using interpreter::Bytecodes;
+  using interpreter::OperandScale;
+
+  DirectHandle<Object> value = args.at(0);
+  HandleScope scope(isolate);
+
+  // Return value can be changed by debugger. Last set value will be used as
+  // return value.
+  ReturnValueScope result_scope(isolate->debug());
+  isolate->debug()->set_return_value(*value);
+
+  // Get the top-most JavaScript frame.
+  JavaScriptStackFrameIterator it(isolate);
+  if (isolate->debug_execution_mode() == DebugInfo::kBreakpoints) {
+    isolate->debug()->Break(it.frame(),
+                            handle(it.frame()->function(), isolate));
+  }
+
+  // If the user requested to restart a frame, there is no need
+  // to get the return value or check the bytecode for side-effects.
+  if (isolate->debug()->IsRestartFrameScheduled()) {
+    Tagged<Object> exception = isolate->TerminateExecution();
+    return MakePair(exception,
+                    Smi::FromInt(static_cast<uint8_t>(Bytecode::kIllegal)));
+  }
+
+  // Return the handler from the original bytecode array.
+  InterpretedFrame* interpreted_frame =
+      reinterpret_cast<InterpretedFrame*>(it.frame());
+
+  bool side_effect_check_failed = false;
+  if (isolate->debug_execution_mode() == DebugInfo::kSideEffects) {
+    side_effect_check_failed =
+        !isolate->debug()->PerformSideEffectCheckAtBytecode(interpreted_frame);
+  }
+
+  // Make sure to only access these objects after the side effect check, as the
+  // check can allocate on failure.
+  Tagged<SharedFunctionInfo> shared = interpreted_frame->function()->shared();
+  Tagged<BytecodeArray> bytecode_array = shared->GetBytecodeArray(isolate);
+  int bytecode_offset = interpreted_frame->GetBytecodeOffset();
+  Bytecode bytecode = Bytecodes::FromByte(bytecode_array->get(bytecode_offset));
+
+  if (Bytecodes::Returns(bytecode)) {
+    // If we are returning (or suspending), reset the bytecode array on the
+    // interpreted stack frame to the non-debug variant so that the interpreter
+    // entry trampoline sees the return/suspend bytecode rather than the
+    // DebugBreak.
+    interpreted_frame->PatchBytecodeArray(bytecode_array);
+  }
+
+  // We do not have to deal with operand scale here. If the bytecode at the
+  // break is prefixed by operand scaling, we would have patched over the
+  // scaling prefix. We now simply dispatch to the handler for the prefix.
+  // We need to deserialize now to ensure we don't hit the debug break again
+  // after deserializing.
+  OperandScale operand_scale = OperandScale::kSingle;
+  isolate->interpreter()->GetBytecodeHandler(bytecode, operand_scale);
+
+  if (side_effect_check_failed) {
+    return MakePair(ReadOnlyRoots(isolate).exception(),
+                    Smi::FromInt(static_cast<uint8_t>(bytecode)));
+  }
+  Tagged<Object> interrupt_object = isolate->stack_guard()->HandleInterrupts();
+  if (IsException(interrupt_object, isolate)) {
+    return MakePair(interrupt_object,
+                    Smi::FromInt(static_cast<uint8_t>(bytecode)));
+  }
+  return MakePair(isolate->debug()->return_value(),
+                  Smi::FromInt(static_cast<uint8_t>(bytecode)));
+}
+```
+
+Опять макросы. Вообще, весь код полон этих макросов и кодогенерации. Например, многе реализации упомянутые выше (`DomainDispatcher` и др.) на самом деле кодосгенерированы. Для генерации используется шаблонный язык jinja, а все файлы с шаблонами имеют расширение `.template`. Тот же `DomainDispatcher` генерируется шаблоном `TypeBuilder_cpp.template`.
+
+Поэтому, если хотите поизучать его код, то без сборки исходников будет сложновато.
+
+</spoiler>
+
 ### Шаги
+
+Мы уже могли видеть метод `stepOverStatement` в классе `V8Debugger`. И да, остальные методы для шагов находятся в нем же.
+
+Все они устроены по одному и тому же принципу: вызываем `v8::debug::PrepareStep` с нужным аргументом, а затем `continueProgram` для продолжения работы. Функция `v8::debug::PrepareStep` принадлежит уже знакомому классу `Debug`.
+
+Сам алгоритм их обработки схож с тем, что видели в предыдущих рантаймах: сохраняем желаемое состояние (фрейм, строка и т.д.) и продолжаем выполнение, а как только программа остановилась, то сверяем текущее и желаемое состояние.
+
+В этом состоянии нам нужно знать только о 2 переменных:
+
+1. `last_step_action` - последний выполнявшийся шаг (ставим равным запрошенному). Нужен просто чтобы обнаружить, что на момент остановки мы запросили шаг
+2. `traget_frame_count` - количество фреймов, которое хотим достичь (глубина стека), или -1, если без разницы. Вспомните, что step into отличается от step over необходимостью остановки при вызове функции.
+
+После, мы вызываем функцию `FloodWithOneShot`, которая позволит нам выполнить 1 шаг, и продолжаем выполнение.
+
+За обработку шагов отвечает тот же метод, что и за точки останова - `Debug::Break`. Но уже 2 часть (оставил там в коде троеточие).
+
+<spoiler title="Debug::Break">
+
+```c++
+void Debug::Break(JavaScriptFrame* frame,
+                  DirectHandle<JSFunction> break_target) {
+  /* ... */
+
+  // No break point. Check for stepping.
+  StepAction step_action = last_step_action();
+  int current_frame_count = CurrentFrameCount();
+  int target_frame_count = thread_local_.target_frame_count_;
+  int last_frame_count = thread_local_.last_frame_count_;
+
+  // StepOut at not return position was requested and return break locations
+  // were flooded with one shots.
+  if (thread_local_.fast_forward_to_return_) {
+    // We might hit an instrumentation breakpoint before running into a
+    // return/suspend location.
+    // We have to ignore recursive calls to function.
+    if (current_frame_count > target_frame_count) return;
+    ClearStepping();
+    PrepareStep(StepOut);
+    return;
+  }
+
+  bool step_break = false;
+  switch (step_action) {
+    case StepNone:
+      if (has_break_points) {
+        SetMutedLocation(shared, location);
+      }
+      return;
+    case StepOut:
+      // StepOut should not break in a deeper frame than target frame.
+      if (current_frame_count > target_frame_count) return;
+      step_break = true;
+      break;
+    case StepOver:
+      // StepOver should not break in a deeper frame than target frame.
+      if (current_frame_count > target_frame_count) return;
+      [[fallthrough]];
+    case StepInto: {
+      // StepInto and StepOver should enter "generator stepping" mode, except
+      // for the implicit initial yield in generators, where it should simply
+      // step out of the generator function.
+      if (location.IsSuspend()) {
+        ClearStepping();
+        if (!IsGeneratorFunction(shared->kind()) ||
+            location.generator_suspend_id() > 0) {
+          thread_local_.suspended_generator_ =
+              location.GetGeneratorObjectForSuspendedFrame(frame);
+        } else {
+          PrepareStep(StepOut);
+        }
+        return;
+      }
+      FrameSummary summary = FrameSummary::GetTop(frame);
+      const bool frame_or_statement_changed =
+          current_frame_count != last_frame_count ||
+          thread_local_.last_statement_position_ !=
+              summary.SourceStatementPosition();
+      // If we stayed on the same frame and reached the same bytecode offset
+      // since the last step, we are in a loop and should pause. Otherwise
+      // we keep "stepping" through the loop without ever acutally pausing.
+      const bool potential_single_statement_loop =
+          current_frame_count == last_frame_count &&
+          thread_local_.last_bytecode_offset_ == summary.code_offset();
+      step_break = step_break || location.IsReturn() ||
+                   potential_single_statement_loop ||
+                   frame_or_statement_changed;
+      break;
+    }
+  }
+
+  StepAction lastStepAction = last_step_action();
+  // Clear all current stepping setup.
+  ClearStepping();
+
+  if (step_break) {
+    // If it's a debugger statement, add the reason and then mute the location
+    // so we don't stop a second time.
+    debug::BreakReasons break_reasons;
+    bool is_debugger_statement = IsBreakOnDebuggerStatement(shared, location);
+    if (is_debugger_statement) {
+      break_reasons.Add(debug::BreakReason::kDebuggerStatement);
+    }
+    // Notify the debug event listeners.
+    OnDebugBreak(isolate_->factory()->empty_fixed_array(), lastStepAction,
+                 break_reasons);
+
+    if (is_debugger_statement) {
+      // Don't pause here a second time
+      SetMutedLocation(shared, location);
+    }
+  } else {
+    // Re-prepare to continue.
+    PrepareStep(step_action);
+  }
+}
+```
+
+</spoiler>
+
+И вот тут нам нужно состояние, которое мы выставляли ранее: В случае step over мы проверяем, что находимся во фрейме не ниже требуемого. А дальше все одинаково - просто останавливаемся (`return` без переустановки шагов и других функций).
+
+- step out: если находимся во фрейме ниже требуемого, то продолжаем выполнение
+- step over: если находимся во фрейме ниже требуемого, то продолжаем выполнение (идем в step into)
+- step into: останавливаемся если (либо):
+  - строка/кадри изменились
+  - возможно мы в цикле из 1 стейтмента
+  - на инструкции возврата
+
+Еще можно заметить, что в step into дополнительно обрабатываются генераторы, а точнее `yeild` стейтмент. Если мы до них доходим, то переходим в режим step out, так как нам нужно вернуть результат, а это возврат из функции.
 
 # Другие платформы
 
