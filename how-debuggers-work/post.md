@@ -5460,11 +5460,906 @@ void Debug::Break(JavaScriptFrame* frame,
 
 ## Windows
 
+Отладка на Windows отличается как используемым API, так и инструментами.
+
+Во-первых, API. На Linux мы использовали (швейцарский нож) `ptrace`. Но в Windows пошли путем небольших функций делающих небольшие вещи. Для подключения функциональности отладки необходимо подключить соответствующий заголовок `<debugapi.h>`. В нем заключается основная функциональность связанная с отладкой.
+
+### Цикл отладки
+
+Если грубыми штрихами обрисовывать цикл отладки, то он похож на Linux.
+
+1. Создаем отлаживаемый процесс: `CreateProcess(NAME, DEBUG_PROCESS)`
+2. Заходим в вечный цикл ожидания следующего события: `WaitForDebugEvent(&event, TIMEOUT)`
+3. Определяем, что за событие произошло: `switch (event.dwDebugEventCode)`
+4. Продолжаем выполнение и идем на шаг 2: `ContinueDebugEvent(PID, TID, DBG_CONTINUE)`
+
+Теперь рассморим каждый шаг. В начале мы создаем отлаживаемый процесс. Заметьте, что это выполняется функцией `CreateProcess`, то есть это не особо отличается от подхода в Linux. И причина в архитектуре.
+На Linux все процессы создается дочерними и после `fork` имеют какой-либо контроль над выполнением. Нам это время нужно для `ptrace(PTRACE_TRACEME)`. Но в Windows все процессы равноправны и при запуске выполняется сразу готовый код (можно сказать сразу `exec` выполняем). Теперь становится понятно, зачем флаг `DEBUG_PROCESS` добавлен - это шорткат для `fork + ptrace(PTRACE_TRACEME) + exec)`. Также есть флаг `DEBUG_ONLY_THIS_PROCESS` на случай, если запускаемый будет создавать новые процессы.
+
+> Для подключения к уже запущенному процессу используется `DebugActiveProcess`
+
+На 2 шаге мы заходим в вечный цикл ожидания следующего события от отлаживаемого процесса. Это также похоже на Linux, только там мы не явно ожидали события для отладчика, а события дочернего процесса (с помощью `waitpid`).
+
+> На этом шаге тоже есть разница с Linux. В Windows вызывать `WaitForDebugEvent` может только поток, который вызвал `CreateProcess`. Но в Linux аналогичное требование отсутствует.
+
+3 шаг - определение события. По моему мнению, в Windows это устроено проще: когда `WaitForDebugEvent` завершается, то он заполняет структуру `DEBUG_EVENT`. В ней довольно много информации, для получения которой не нужно сильно заморачиваться.
+
+В начале мы также с помощью `switch/case` определяем, что перед нами за событие. Их может быть 9: создание/завершение процесса/потока, загрузка/выгрузка DLL, OutputDebugString (дочерний процесс явно передал отладчику какую-то строку), `RIP_EVENT` (системная ошибка) и `EXCEPTION_DEBUG_EVENT` (возникло исключение).
+Для каждого события есть своя структура, которая и заполняется. А хранится она в объединении (`union`).
+
+Когда мы обработали событие, отлаживаемый процесс необходимо продолжить. Это делается с помощью `ContinueDebugEvent`. С одной стороны, это также похоже на Linux - `ptrace(PTRACE_CONT)`, но не тут то было. Заметьте последний аргумент этой функции - `DBG_CONTINUE`. Этот последний аргумент имеет смысл только если событие было типа `EXCEPTION_DEBUG_EVENT`. Этот флаг принимает 2 значения: `DBG_CONTINUE` и `DBG_EXCEPTION_NOT_HANDLED`. Разница между ними проста - когда отладчик получает исключение от отлаживаемого, то это может быть как фатальная ошибка, либо как сигнал для отладчика (спойлер, точки останова). Поэтому, когда мы продолжаем выполнение этот флаг может сказать ОС что исключение обработано (`DBG_CONTINUE`), иначе обработка уже произойдет на строне отлаживаемого процесса (`DBG_EXCEPTION_NOT_HANDLED`). Это чуть-чуть похоже на Linux с точки зрения точки останова - если отладчика нет, то `SIGTRAP` приведет к core-dump'у.
+
+> Есть еще 3-ий флаг - `DBG_REPLY_LATER`. На сколько я понял, если указать этот флаг, то при возобновлении работы указанного потока это событие вернется, чтобы обработать заново.
+
+Собирая все вместе, цикл работы отладчика можно представить следующим образом:
+
+<spoiler title="Цикл работы отладчика">
+
+```c
+int main(int argc, const char **argv) {
+    DEBUG_EVENT event;
+
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+
+    si.cb = sizeof(si);
+    GetStartupInfo(&si);
+    CreateProcess(NULL, 
+                  L"dir",                                  // Запускаем 'dir' в качестве примера
+                  NULL, NULL, FALSE, 
+                  DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS, // Отлаживаем только этот процесс
+                  NULL, NULL,
+                  &si, &pi);
+
+    child_pid = pi.dwProcessId;
+    child_tid = pi.dwThreadId;
+    child_pHandle = pi.hProcess;
+    child_tHandle = pi.hThread;
+
+    while (TRUE) {
+        BOOL should_stop = FALSE;
+        DWORD continue_flag = DBG_EXCEPTION_NOT_HANDLED;
+        
+        if (!WaitForDebugEvent(&event, INFINITE)) {
+            break;
+        }
+
+        switch (event.dwDebugEventCode) {
+            case EXCEPTION_DEBUG_EVENT:
+                // В процессе случилось исключение.
+                // Вызывается также и тогда, когда достигнута инструкция остановки (int3)
+                EXCEPTION_DEBUG_INFO *edi = &event.u.Exception;
+                break;
+            case CREATE_PROCESS_DEBUG_EVENT:
+                // Создан новый процесс
+                CREATE_PROCESS_DEBUG_INFO *cpdi = &event.u.CreateProcessInfo;
+                break;
+            case EXIT_PROCESS_DEBUG_EVENT:
+                // Процесс завершается
+                should_stop = TRUE;
+                EXIT_PROCESS_DEBUG_INFO *epdi = &event.u.ExitProcess;
+                break;
+            case OUTPUT_DEBUG_STRING_EVENT:
+                // Отлаживаемый процесс вызывает DebugOutputString - посылает строку отладчику
+                OUTPUT_DEBUG_STRING_INFO *odsi = &event.u.DebugString;
+                break;
+            case CREATE_THREAD_DEBUG_EVENT:
+                // Создан новый поток
+                CREATE_THREAD_DEBUG_INFO *ctdi = &event.u.CreateThread;
+                break;
+            case EXIT_THREAD_DEBUG_EVENT:
+                // Поток завершается
+                EXIT_THREAD_DEBUG_INFO *etdi = &event.u.ExitThread;
+                break;
+            case LOAD_DLL_DEBUG_EVENT:
+                // Загружается DLL
+                LOAD_DLL_DEBUG_INFO *lddi = &event.u.LoadDll;
+                break;
+            case UNLOAD_DLL_DEBUG_EVENT:
+                // DDL выгружается
+                UNLOAD_DLL_DEBUG_INFO *uddi = &event.u.UnloadDll;
+                break;
+            case RIP_EVENT:
+                // Системная ошибка
+                RIP_INFO *ri = &event.u.RipInfo;
+                should_stop = TRUE;
+                break;
+        }
+
+        if (should_stop) {
+            break;
+        }
+        
+        // Продолжаем выполнение
+        ContinueDebugEvent(event.dwProcessId, event.dwThreadId, continue_flag);
+    }
+
+    CloseHandle(child_pHandle);
+    CloseHandle(child_tHandle);
+    return 0;
+}
+```
+
+</spoiler>
+
+Но это мой код. Давайте посмотрим на цикл отладки в lldb:
+
+<spoiler title="DebuggerThread::DebugLoop">
+
+Когда писал код выше, то в lldb не смотрел. На удивление, этот кусок сильно похож на мой.
+
+```c++
+// https://github.com/llvm/llvm-project/blob/ab51eccf88f5321e7c60591c5546b254b6afab99/lldb/source/Plugins/Process/Windows/Common/DebuggerThread.cpp#L232
+void DebuggerThread::DebugLoop() {
+  DEBUG_EVENT dbe = {};
+  bool should_debug = true;
+  while (should_debug) {
+    BOOL wait_result = WaitForDebugEvent(&dbe, INFINITE);
+    if (wait_result) {
+      DWORD continue_status = DBG_CONTINUE;
+      bool shutting_down = m_is_shutting_down;
+      switch (dbe.dwDebugEventCode) {
+      default:
+        llvm_unreachable("Unhandle debug event code!");
+      case EXCEPTION_DEBUG_EVENT: {
+        ExceptionResult status = HandleExceptionEvent(
+            dbe.u.Exception, dbe.dwThreadId, shutting_down);
+
+        if (status == ExceptionResult::MaskException)
+          continue_status = DBG_CONTINUE;
+        else if (status == ExceptionResult::SendToApplication)
+          continue_status = DBG_EXCEPTION_NOT_HANDLED;
+
+        break;
+      }
+      case CREATE_THREAD_DEBUG_EVENT:
+        continue_status =
+            HandleCreateThreadEvent(dbe.u.CreateThread, dbe.dwThreadId);
+        break;
+      case CREATE_PROCESS_DEBUG_EVENT:
+        continue_status =
+            HandleCreateProcessEvent(dbe.u.CreateProcessInfo, dbe.dwThreadId);
+        break;
+      case EXIT_THREAD_DEBUG_EVENT:
+        continue_status =
+            HandleExitThreadEvent(dbe.u.ExitThread, dbe.dwThreadId);
+        break;
+      case EXIT_PROCESS_DEBUG_EVENT:
+        continue_status =
+            HandleExitProcessEvent(dbe.u.ExitProcess, dbe.dwThreadId);
+        should_debug = false;
+        break;
+      case LOAD_DLL_DEBUG_EVENT:
+        continue_status = HandleLoadDllEvent(dbe.u.LoadDll, dbe.dwThreadId);
+        break;
+      case UNLOAD_DLL_DEBUG_EVENT:
+        continue_status = HandleUnloadDllEvent(dbe.u.UnloadDll, dbe.dwThreadId);
+        break;
+      case OUTPUT_DEBUG_STRING_EVENT:
+        continue_status = HandleODSEvent(dbe.u.DebugString, dbe.dwThreadId);
+        break;
+      case RIP_EVENT:
+        continue_status = HandleRipEvent(dbe.u.RipInfo, dbe.dwThreadId);
+        if (dbe.u.RipInfo.dwType == SLE_ERROR)
+          should_debug = false;
+        break;
+      }
+
+      ::ContinueDebugEvent(dbe.dwProcessId, dbe.dwThreadId, continue_status);
+
+      // We have to DebugActiveProcessStop after ContinueDebugEvent, otherwise
+      // the target process will crash
+      if (shutting_down) {
+        // A breakpoint that occurs while `m_pid_to_detach` is non-zero is a
+        // magic exception that we use simply to wake up the DebuggerThread so
+        // that we can close out the debug loop.
+        if (m_pid_to_detach != 0 &&
+            (dbe.u.Exception.ExceptionRecord.ExceptionCode ==
+                 EXCEPTION_BREAKPOINT ||
+             dbe.u.Exception.ExceptionRecord.ExceptionCode ==
+                 STATUS_WX86_BREAKPOINT)) {
+
+          // detaching with leaving breakpoint exception event on the queue may
+          // cause target process to crash so process events as possible since
+          // target threads are running at this time, there is possibility to
+          // have some breakpoint exception between last WaitForDebugEvent and
+          // DebugActiveProcessStop but ignore for now.
+          while (WaitForDebugEvent(&dbe, 0)) {
+            continue_status = DBG_CONTINUE;
+            if (dbe.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
+                !(dbe.u.Exception.ExceptionRecord.ExceptionCode ==
+                      EXCEPTION_BREAKPOINT ||
+                  dbe.u.Exception.ExceptionRecord.ExceptionCode ==
+                      STATUS_WX86_BREAKPOINT ||
+                  dbe.u.Exception.ExceptionRecord.ExceptionCode ==
+                      EXCEPTION_SINGLE_STEP))
+              continue_status = DBG_EXCEPTION_NOT_HANDLED;
+            ::ContinueDebugEvent(dbe.dwProcessId, dbe.dwThreadId,
+                                 continue_status);
+          }
+
+          ::DebugActiveProcessStop(m_pid_to_detach);
+          m_detached = true;
+        }
+      }
+
+      if (m_detached) {
+        should_debug = false;
+      }
+    } else {
+      should_debug = false;
+    }
+  }
+  FreeProcessHandles();
+
+  ::SetEvent(m_debugging_ended_event);
+}
+```
+
+</spoiler>
+
+Основная работа отладчика заключается в обработке этих событий и выполненнии нужных действий при остановке (выставление точек останова, трейсинг и т.д.). Начнем с базы - точки останова.
+
+### Точки останова
+
+Логика их обработки довольно проста. Для начала - как их обнаруживаем. Я уже заспойлерил, что за точки останова отвечает событие `EXCEPTION_DEBUG_EVENT`. Но вообще, это событие, как можно догадаться из названия, отвечает за исключения. Они могут быть разными, но определены. Чтобы понять какое исключение перед нами необходимо использовать поле `ExceptionCode` у структуры его события.
+
+Я насчитал 23 кода ошибки. Например, `EXCEPTION_INT_DIVIDE_BY_ZERO` - ошибка деления на 0. Но в рамках отладки нас будут интересовать 2 исключения:
+
+- `EXCEPTION_BREAKPOINT` - точка останова
+- `EXCEPTION_SINGLE_STEP` - шаг инструкции
+
+<spoiler title="SEH">
+
+Эти исключения не относятся конкретно к отладчику, а к механизму SEH (Structured Exception Handling) в Windows. В `__try/__except` блоке можно вызвать функцию `GetExceptionCode` и получить код возникшей ошибки.
+
+Он позволяет обрабатывать различные исключения - как hardware, так и software. Для их обработки он определяет 3* ключевых слова:
+
+- `__try` - `try`
+- `__except` - `catch`/`except`
+- `__finally` - `finally`
+
+Тут стоит рассказать о концепции first-chance exception. Если коротко, то при возникновении исключения отладчику могут дать возможность первому попытаться обработать исключение (дают ему первый шанс). Но как понять, что исключение обработано? Тут в игру вступают флаги, передаваемые `ContinueDebugEvent`: `DBG_CONTINUE` - исключение обработано, `DBG_EXCEPTION_NOT_HANDLED` - НЕ обработано. В первом случае, этого исключения как будто и не было, а во втором запустится стандартный поток обработки исключения в самом процессе.
+
+Последний шаг: `EXCEPTION_BREAKPOINT` И `EXCEPTION_SINGLE_STEP` - это first-chance исключения. Мы в принципе сами может их обработать (из официальной документации Microsoft):
+
+```c++
+BOOL CheckForDebugger()
+{
+    __try 
+    {
+        DebugBreak();
+    }
+    __except(GetExceptionCode() == EXCEPTION_BREAKPOINT ? 
+             EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) 
+    {
+        // No debugger is attached, so return FALSE 
+        // and continue.
+        return FALSE;
+    }
+    return TRUE;
+}
+```
+
+> Я сказал 3 ключевых слова под звездочкой, так как согласно той же документации функцию `GetExceptionCode` компилятор Microsoft обрабатывает его как ключевое слово и выдает ошибку, если использовать вне `__try/__except` блоков.
+
+</spoiler>
+
+Логика выставления/удаления точек останова такая же как и в Linux, то есть ОС предоставляет нам возможность копаться в адресном пространстве отлаживаемого процесса, но что мы туда запишем - нам на откуп, мы сами должны знать инструкцию точки останова.
+
+Для работы с адресным пространством Windows предоставляет 2 функции: `ReadProcessMemory` и `WriteProcessMemory` - чтение и запись соответственно. Это простые функции, которые читают непрерывный участок памяти (не векторизованное чтение).
+
+> Тут тоже можно заметить разницу `ptrace(PTRACE_PEEKDATA)` позволяет читать с гранулярностью в 1 *слово* (8/4 байт в зависимости от битности). `ReadProcessMemory` и `WriteProcessMemory` - с гранулярностью 1 *байт*. Но чтение из файла памяти или `process_vm_readv`/`process_vm_writev`, которые рассмотрели в секции gdb, - в Linux уже позволяют по байту читать/писать.
+
+Мы уже знаем как выставляются точки останова: запоминаем, что было по адресу и записываем туда `0xCC`:
+
+<spoiler title="Выставление точки останова">
+
+```c
+static BYTE set_breakpoint(LPVOID pAddress) {
+    BYTE saved;
+    SIZE_T numberOfBytes;
+    ReadProcessMemory(child_pHandle, pAddress, (LPVOID)&saved, sizeof(saved), &numberOfBytes);
+
+    BYTE br = 0xCC;
+    WriteProcessMemory(child_pHandle, pAddress, &br, sizeof(BYTE), &numberOfBytes);
+    FlushInstructionCache(child_pHandle, pAddress, sizeof(BYTE));
+    
+    return saved;
+}
+```
+
+</spoiler>
+
+Единственное замечание: использование функции `FlushInstructionCache`. Как можно догадаться, она используется для того чтобы сбросить сделанные нами изменения в инструкциях и CPU их подхватил.
+
+Теперь посмотрим, как это реализуется в lldb. Он кросплатформенный и его платформо-зависимые части реализованы в виде подклассов других абстрактных классов. И оно понятно: у разных платформ разные системные вызовы.
+
+Логика выставления точки останова находится в методе `NativeProcessProtocol::EnableSoftwareBreakpoint`.
+
+<spoiler title="EnableSoftwareBreakpoint">
+
+```c++
+llvm::Expected<NativeProcessProtocol::SoftwareBreakpoint>
+NativeProcessProtocol::EnableSoftwareBreakpoint(lldb::addr_t addr,
+                                                uint32_t size_hint) {
+  auto expected_trap = GetSoftwareBreakpointTrapOpcode(size_hint);
+  if (!expected_trap)
+    return expected_trap.takeError();
+
+  llvm::SmallVector<uint8_t, 4> saved_opcode_bytes(expected_trap->size(), 0);
+  // Save the original opcodes by reading them so we can restore later.
+  size_t bytes_read = 0;
+  Status error = ReadMemory(addr, saved_opcode_bytes.data(),
+                            saved_opcode_bytes.size(), bytes_read);
+  if (error.Fail())
+    return error.ToError();
+
+  // Ensure we read as many bytes as we expected.
+  if (bytes_read != saved_opcode_bytes.size()) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "Failed to read memory while attempting to set breakpoint: attempted "
+        "to read {0} bytes but only read {1}.",
+        saved_opcode_bytes.size(), bytes_read);
+  }
+
+  // Write a software breakpoint in place of the original opcode.
+  size_t bytes_written = 0;
+  error = WriteMemory(addr, expected_trap->data(), expected_trap->size(),
+                      bytes_written);
+  if (error.Fail())
+    return error.ToError();
+
+  // Ensure we wrote as many bytes as we expected.
+  if (bytes_written != expected_trap->size()) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "Failed write memory while attempting to set "
+        "breakpoint: attempted to write {0} bytes but only wrote {1}",
+        expected_trap->size(), bytes_written);
+  }
+
+  llvm::SmallVector<uint8_t, 4> verify_bp_opcode_bytes(expected_trap->size(),
+                                                       0);
+  size_t verify_bytes_read = 0;
+  error = ReadMemory(addr, verify_bp_opcode_bytes.data(),
+                     verify_bp_opcode_bytes.size(), verify_bytes_read);
+  if (error.Fail())
+    return error.ToError();
+
+  // Ensure we read as many verification bytes as we expected.
+  if (verify_bytes_read != verify_bp_opcode_bytes.size()) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "Failed to read memory while "
+        "attempting to verify breakpoint: attempted to read {0} bytes "
+        "but only read {1}",
+        verify_bp_opcode_bytes.size(), verify_bytes_read);
+  }
+
+  if (llvm::ArrayRef(verify_bp_opcode_bytes.data(), verify_bytes_read) !=
+      *expected_trap) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "Verification of software breakpoint "
+        "writing failed - trap opcodes not successfully read back "
+        "after writing when setting breakpoint at {0:x}",
+        addr);
+  }
+
+  return SoftwareBreakpoint{1, saved_opcode_bytes, *expected_trap};
+}
+```
+
+</spoiler>
+
+В ней можно выделить 3 платформо-зависимых места (функции): `GetSoftwareBreakpointTrapOpcode`, `ReadMemory` и `WriteMemory`. Первый - получение инструкции точки останова. Она зависит больше от CPU, чем от ОС, поэтому опустим и сконцетрируемся на 2 последних.
+
+Реализация чтения/записи для Windows находится в классе `ProcessDebugger` методах `ReadMemory`/`WriteMemory`.
+
+Внутри это просто обертка над `ReadProcessMemory`. Но дополнительно мы делаем повторную попытку чтения, если произошла ошибка чтения из-за того, что указанный диапазон слишком большой (превышает допустимый), то пытаемся прочитать сколько сможем:
+
+<spoiler title="ReadMemory">
+
+```c++
+Status ProcessDebugger::ReadMemory(lldb::addr_t vm_addr, void *buf, size_t size,
+                                   size_t &bytes_read) {
+  Status error;
+  bytes_read = 0;
+  Log *log = GetLog(WindowsLog::Memory);
+  llvm::sys::ScopedLock lock(m_mutex);
+
+  if (!m_session_data) {
+    error = Status::FromErrorString(
+        "cannot read, there is no active debugger connection.");
+    return error;
+  }
+
+  lldb::process_t handle = m_session_data->m_debugger->GetProcess()
+                               .GetNativeProcess()
+                               .GetSystemHandle();
+  void *addr = reinterpret_cast<void *>(vm_addr);
+  SIZE_T num_of_bytes_read = 0;
+  if (::ReadProcessMemory(handle, addr, buf, size, &num_of_bytes_read)) {
+    bytes_read = num_of_bytes_read;
+    return Status();
+  }
+  error = Status(GetLastError(), eErrorTypeWin32);
+  MemoryRegionInfo info;
+  if (GetMemoryRegionInfo(vm_addr, info).Fail() ||
+      info.GetMapped() != MemoryRegionInfo::OptionalBool::eYes)
+    return error;
+  size = info.GetRange().GetRangeEnd() - vm_addr;
+  if (::ReadProcessMemory(handle, addr, buf, size, &num_of_bytes_read)) {
+    bytes_read = num_of_bytes_read;
+    return Status();
+  }
+  error = Status(GetLastError(), eErrorTypeWin32);
+  return error;
+}
+```
+
+</spoiler>
+
+Запись выглядит так же как и описали ранее. `WriteProcessMemory` + `FlushInstructionCache`:
+
+<spoiler title="WriteMemory"> 
+
+```c++
+Status ProcessDebugger::WriteMemory(lldb::addr_t vm_addr, const void *buf,
+                                    size_t size, size_t &bytes_written) {
+  Status error;
+  bytes_written = 0;
+  Log *log = GetLog(WindowsLog::Memory);
+  llvm::sys::ScopedLock lock(m_mutex);
+
+  if (!m_session_data) {
+    error = Status::FromErrorString(
+        "cannot write, there is no active debugger connection.");
+    return error;
+  }
+
+  HostProcess process = m_session_data->m_debugger->GetProcess();
+  void *addr = reinterpret_cast<void *>(vm_addr);
+  SIZE_T num_of_bytes_written = 0;
+  lldb::process_t handle = process.GetNativeProcess().GetSystemHandle();
+  if (::WriteProcessMemory(handle, addr, buf, size, &num_of_bytes_written)) {
+    FlushInstructionCache(handle, addr, num_of_bytes_written);
+    bytes_written = num_of_bytes_written;
+  } else {
+    error = Status(GetLastError(), eErrorTypeWin32);
+  }
+  return error;
+}
+```
+
+</spoiler>
+
+<spoiler title="hardware vs software">
+
+Вы уже могли заметить сочетание `SoftwareBreakpoint`. Можно выделить 2 типа точек останова: software и hardware. Если говорить грубо, то:
+
+- `software` - это инструкции точки останова
+- `hardware` - это CPU исключения
+
+До этого момента мы использовали только `software` точки останова - ставили инструкцию `0xCC`. Они доступны практически для любого CPU так как не требуют особых условий.
+
+`hardware` с другой строны, как можно догадаться, используют возможности CPU. С одной стороны, эти точки останова сильно зависят от железа (CPU) и их количество сильно ограничено. С другой, они позволяют то, чего `software` нет, в частности, точка останова при изменении данных по определенному адресу.
+
+Для примера, рассмотрим `x64` архитектуру. В ней имются специальные `DR` регистры - debug register.
+
+- `DR0 - DR3` - регистры отслеживаемых адресов. В них записываются адреса памяти, которые мы хотим отслеживать. В них записывается виртуальный адрес, который потом транслируется в физический.
+
+- `DR4 - DR5` (зарезервированы)
+
+- `DR6` - Debug-Status
+
+- `DR7` - Debug Control Register
+
+- `DebugCtl` - специальный регистр для управления.
+
+Когда мы записываем адрес в регистры `DR0 - DR3`, то при работе с указанными адресами будет сгенерировано исключение, которое подходит ОС.
+
+С помощью `DR6` можно получить различную информацию, касательно режима отладки. Например, выставленный флаг `BS` говорит о том, 
+
+С помощью `DR7` можно, например, установить условия срабатывания исключения: запись и/или чтение и/или выполенение.
+
+С помощью `DebugCtl` и его флага `BTF` (Branch Single Step) мы можем управлять шагами при выполнении branching инструкций (jmp, call и т.д.).
+
+> Дополнительно, спецификация оговаривает регистры `DR8 - DR15` для 64-битного режима, но не описывает - ее поведение implementation-defined.
+
+</spoiler>
+
+Но это точки останова. Иногда необходимо выполнить только 1 инструкцию. В Windows это реализуется не с помощью отдельной функции, а с помощью выставления `TF` (Trap Flag) флага в регистре `RFLAGS`. Этот флаг 9-ый, то есть его шестнадцатеричное представление - `0x100`.
+
+Когда этот шаг сделан, то возникает то же исключение `EXCEPTION_DEBUG_BREAK`, но код исключения будет уже `EXCEPTION_SINGLE_STEP`.
+
+<spoiler title="Выставление TF">
+
+```c
+static void make_single_step() {
+    /* Выставление режима Single step */
+    CONTEXT ctx;
+    GetThreadContext(child_hThread, &ctx);
+    ctx.EFlags |= 0x100;
+    SetThreadContext(child_hThread, &ctx);
+
+    /* Продолжение работы */
+    ContinueDebugEvent(child_hProcess, child_hThread, DBG_CONTINUE);
+    DEBUG_EVENT event;
+    WaitForDebugEvent(&event, INFINITE);
+    if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && 
+        event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        /* Single step */
+    }
+}
+```
+
+Поле называется `EFLAGS`. Это название из 32-битного мира, для 64-битных используется префикс `R`.
+
+</spoiler>
+
+Если мы посмотрим на реализацию lldb, то увидим, что они также выставляют этот флаг:
+
+<spoiler title="TargetThreadWindows::DoResume">
+
+```c++
+Status TargetThreadWindows::DoResume() {
+  StateType resume_state = GetTemporaryResumeState();
+  StateType current_state = GetState();
+  if (resume_state == current_state)
+    return Status();
+
+  if (resume_state == eStateStepping) {
+    Log *log = GetLog(LLDBLog::Thread);
+
+    uint32_t flags_index =
+        GetRegisterContext()->ConvertRegisterKindToRegisterNumber(
+            eRegisterKindGeneric, LLDB_REGNUM_GENERIC_FLAGS);
+    uint64_t flags_value =
+        GetRegisterContext()->ReadRegisterAsUnsigned(flags_index, 0);
+    ProcessSP process = GetProcess();
+    const ArchSpec &arch = process->GetTarget().GetArchitecture();
+    switch (arch.GetMachine()) {
+    /* 
+     * 
+     * Выставляем флаг TF
+     *
+     */
+    case llvm::Triple::x86:
+    case llvm::Triple::x86_64:
+      flags_value |= 0x100; // Set the trap flag on the CPU
+      break;
+    case llvm::Triple::aarch64:
+    case llvm::Triple::arm:
+    case llvm::Triple::thumb:
+      flags_value |= 0x200000; // The SS bit in PState
+      break;
+    default:
+      LLDB_LOG(log, "single stepping unsupported on this architecture");
+      break;
+    }
+    GetRegisterContext()->WriteRegisterFromUnsigned(flags_index, flags_value);
+  }
+
+  if (resume_state == eStateStepping || resume_state == eStateRunning) {
+    DWORD previous_suspend_count = 0;
+    HANDLE thread_handle = m_host_thread.GetNativeThread().GetSystemHandle();
+    do {
+      // ResumeThread returns -1 on error, or the thread's *previous* suspend
+      // count on success. This means that the return value is 1 when the thread
+      // was restarted. Note that DWORD is an unsigned int, so we need to
+      // explicitly compare with -1.
+      previous_suspend_count = ::ResumeThread(thread_handle);
+
+      if (previous_suspend_count == (DWORD)-1)
+        return Status(::GetLastError(), eErrorTypeWin32);
+
+    } while (previous_suspend_count > 1);
+  }
+
+  return Status();
+}
+```
+
+</spoiler>
+
+### Отладочная информация
+
+Теперь переходим к части поинтереснее - отладочные символы. Подход Windows - хранить отладочные символы CodeView в отдельном файле `.pdb`.
+
+Для работы с отладочными символами необходимо подключить уже другой заголовок - `<DbgHelp.h>`. В нем определено множество вспомогательных функций для работы с символами отладки. 
+
+Перед началом работы с символами необходимо инициализировать состояние. Это делается с помощью функции `SymInitialize`. Эта библиотека часто на вход принимает дескрипторы процесса, потока и даже файла. Но откуда их взять?
+Кажется это сложно, но в Windows поняли, что возможно чаще всего библиотеку будут инициализировать в самом начале. Поэтому они сделали такое решение: когда процесс создается, то генерируется событие `CREATE_PROCESS_DEBUG_EVENT` и в его структуре данных события уже хранятся нужные нам дескрипторы.
+
+Когда библиотека инициализирована нужно ее настроить. Для этого используется функция `SymSetOptions`. На вход ей передается маска флагов состояния. Сейчас я передаю 3 флага:
+
+- `SYMOPT_LOAD_LINES` - загрузить информацию о строках исходного кода
+- `SYMOPT_DEFERRED_LOADS` - ленивая загрузка символов
+
+Последним шагом, скармливаем ей наш модуль, из которого она должна прочитать символы. Это делается с помощью функции `SymLoadModule`.
+
+Собирая все вместе получаем нечто подобное.
+
+<spoiler title="Инициализация при запуске">
+
+```c
+int main(int argc, const char **argv) {
+    /* ... */
+    while (TRUE) {
+        DEBUG_EVENT event;
+        BOOL should_stop = FALSE;
+        DWORD continue_flag = DBG_EXCEPTION_NOT_HANDLED;
+        
+        if (!WaitForDebugEvent(&event, INFINITE)) {
+            break;
+        }
+
+        switch (event.dwDebugEventCode) {
+
+            case CREATE_PROCESS_DEBUG_EVENT:
+                if (SymInitialize(event.u.CreateProcessInfo.hProcess, NULL, FALSE)) {
+                    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS);
+                    DWORD64 base =
+                      SymLoadModule(event.u.CreateProcessInfo.hProcess, 
+                                    event.u.CreateProcessInfo.hFile, 
+                                    event.u.CreateProcessInfo.lpImageName, 
+                                    NULL, 
+                                    (DWORD64)event.u.CreateProcessInfo.lpStartAddress, 
+                                    0);
+                }
+                break;
+            /* ... */
+        }
+    }
+    return 0;
+}
+```
+
+</spoiler>
+
+Как можете заметить, вся необходимая информация уже находится с данных события, что очень удобно. Можете заметить, что `SymLoadModule` возвращает какой-то `base`. Это базовый адрес модуля, но я его интерпретирую как дескриптор/идентификатор, так как его нужно передавать везде.
+
+Далее можем приступать к работе. Для начала, рассмотрим как получается информация о строках исходного кода. И на удивление просто: нам нужно только 2 функции: `SymEnumSourceFiles` и `SymEnumLines`. Обе устроены одинаково: передаем идентификатор цели (процесс, дескриптор, файл...), контекст (значение, которое будет передаваться) и колбэк, который будет вызван для каждого элемента множества. Под множеством, как можно догадаться из названий функций, имеется ввиду множество файлов исходного кода и строк внутри них соответственно.
+
+Все это можно описать так:
+
+<spoiler title="SymEnumSourceFiles">
+
+Выводим файл и номера строк внутри него.
+
+```c
+static BOOL CALLBACK process_single_source_file(PSRCCODEINFO line, PVOID context) {
+    /* Файл:Строка (Адрес инструкции) */
+    printf("%s: %d (%llx)\n", line->FileName, line->LineNumber, line->Address);
+    return TRUE;
+}
+
+static BOOL CALLBACK process_source_files_info(PSOURCEFILE file, PVOID context) {
+    DWORD64 base = (DWORD64)context;
+    if (!SymEnumLines(child_hProcess, base, NULL, NULL, process_single_source_file, context)) {
+        print_error("SymEnumLines");
+    }
+    printf("\n");
+    return TRUE;
+}
+
+static void show_source_file_info(DWORD64 base) {
+    if (!SymEnumSourceFiles(child_hProcess, base, "*.c", process_source_files_info, (PVOID)base)) {
+        print_error("SymEnumSourceFiles");
+    }
+}
+```
+
+</spoiler>
+
+Можете заметить, что колбэк для `SymEnumLines` получает структуру `SRCCODEINFO` и она довольно полезная, потому что хранит в себе не только номер строки и файл, но еще и адрес этой инструкции (`line->Address`).
+
+> Выводиться будут все файлы, участвовавшие в компиляции конкретного файла. Даже заголовки (или как в моем случае, неизвестные `.cpp` файлы), поэтому стоит проверить название файла в колбэке.
+
+Теперь, перейдем к более интересной теме - типам. Для них также есть отдельная функция, которая принимает колбэк - `SymEnumTypes`. Передаваемый колбэк получает на вход указатель на структуру `SYMBOL_INFO`. В ней хранится информация связанная с символом.
+
+Также, как как Windows сильно связан с PDB, то в этой структуре есть поле `Tag`. Она хранит тэг типа из *PDB* файла. С ее помощью (если PDB доступен) мы можем получить тип символа.
+
+Но было бы все так просто. Я сказал, что в `SYMBOL_INFO` хранится информация о символе, но символы бывают разные и, соответственно, данные могут быть разные. В этой структуре хранятся все необходимые данные для *начала* работы, а все остальное надо получить самим.
+
+Получать дополнительную информацию о символе мы можем с помощью функции `SymGetTypeInfo`. Для ее использования мы передаем значение из перечисления `IMAGEHLP_SYMBOL_TYPE_INFO` (команду) и адрес, в который будет записываться результат (тип зависит от команды). Всего есть 39 команд, но все описывать не буду. 
+
+Просто покажу пример использования. Мы будем получать все структуры (классы) и выводить все их поля вместе с типами. Для простоты, я буду выводить только `int`, `char` и `float`.
+
+<spoiler title="Определение типа структур">
+
+```c
+static BOOL CALLBACK process_type_info(PSYMBOL_INFO symbol, ULONG symbol_size, PVOID context) {    
+    /* 1 */
+    if (symbol->Tag != SymTagUDT) {
+        return TRUE;
+    }
+
+    /* 1.5 */
+    DWORD kind; 
+    if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, symbol->TypeIndex, TI_GET_UDTKIND, &kind)) {
+        return FALSE;
+    }
+
+    if (kind != UdtStruct && kind != UdtClass) {
+        return TRUE;
+    }
+    
+    /* 2 */
+    DWORD childrenCount;
+    if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, symbol->TypeIndex, TI_GET_CHILDRENCOUNT, &childrenCount)) {
+        return FALSE;
+    }
+
+    int findChildrenSize = sizeof(TI_FINDCHILDREN_PARAMS) + childrenCount * sizeof(ULONG);
+    TI_FINDCHILDREN_PARAMS *children = malloc(findChildrenSize);
+    memset(children, 0, findChildrenSize);
+    children->Count = childrenCount;
+
+    if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, symbol->TypeIndex, TI_FINDCHILDREN, children)) {
+        return FALSE;
+    }
+
+    /* 3 */
+    printf("%s %s\n", kind == UdtClass ? "class" : "struct", symbol->Name);
+    for (DWORD i = 0; i < childrenCount; i++) {
+        /* 4 */
+        DWORD childTag;
+        if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, children->ChildId[i], TI_GET_SYMTAG, &childTag)) {
+            return FALSE;
+        }
+
+        if (childTag != SymTagData) {
+            continue;
+        }
+
+        WCHAR *memberName;
+        if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, children->ChildId[i], TI_GET_SYMNAME, &memberName)) {
+            return FALSE;
+        }
+
+        /* 5 */
+        DWORD typeId;
+        if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, children->ChildId[i], TI_GET_TYPEID, &typeId)) {
+            return FALSE;
+        }
+
+        DWORD memberTypeTag;
+        if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, typeId, TI_GET_SYMTAG, &memberTypeTag)) {
+            return FALSE;
+        }
+
+        /* 6 */
+        char *typeName;
+        if (memberTypeTag == SymTagBaseType) {
+            DWORD baseType;
+            if (!SymGetTypeInfo(child_hProcess, symbol->ModBase, typeId, TI_GET_BASETYPE, &baseType)) {
+                return FALSE;
+            }
+
+            typeName = "unknown";
+            switch (baseType) {
+                case btInt:
+                    typeName = "int";
+                    break;
+                case btChar:
+                    typeName = "char";
+                    break;
+                case btFloat:
+                    typeName = "float";
+                    break;
+            }
+        } else {
+            typeName = "*complex*";
+        }
+
+        printf("\t%s %ls\n", typeName, memberName);
+    }
+    printf("\n");
+    
+    return TRUE;
+}
+
+static void show_types_info(DWORD64 base, ULONG64 baseOfImage) {
+    if (!SymEnumTypes(child_hProcess, baseOfImage, process_type_info, (PVOID)base)) {
+        print_error("SymEnumTypes");
+    }
+}
+```
+
+</spoiler>
+
+Теперь, давайте разберем, что здесь написано. Для удобства я добавил комментарии по частям. Вначале (1) мы проверяем, что переданный символ - это пользовательский тип (`SymTagUDT`). Тэг хранится в поле `Tag`, но также мы можем получить тэг сами (1.5).
+
+После (2) мы получаем информацию о дочерних членах этого символа. В этой части необходимо вначале получить их общее количество, а затем аллоцировать необходимое место для структуры. Делается это с помощью 2 команд.
+В результате мы получим массив из `TypeIndex` дочерних членов (т.е. просто индексы, не структура `SYMBOL_INFO`).
+
+Далее (3) начинаем итерироваться по всем членам и обрабатывать каждый. Сперва (4), проверяем, что этот член - поле (`SymTagData`). Дело в том, что дочерними могут быть функции или базовые классы (я тестировал логику на C, поэтому такую проверку я мог и не делать).
+
+Теперь (4), получаем информацию о типе этого поля. Делается это за 3 шага: 
+
+1. получаем индекс типа поля
+2. получаем тэг этого тип и 
+3. получаем название этого типа. 
+
+Шаг 1 наверное понятен, поэтому рассмотрим остальные. Здесь типы хранятся примерно также как и в DWARF, то есть для указателя, структуры пользовательской, базового (встроенного) типа, `typedef`'ов и т.д. есть свои тэги и обрабатывать их необходимо также в зависимости от тэга. Для этого мы его и получили. Я вывожу название только для базовых типов, поэтому на шаге 3 получаю индекс базового типа (Base Type). Они все определены и значения хранятся в перечислении `BasicType` (префикс `bt` у его значений).
+
+Вроде просто, но не совсем. Кто хочет использовать `DbgHelp`, то вам несколько советов:
+
+1. Многие перечисления и другая информация о PDB файле (то же самое перечисление `SymTagEnum`) по умолчанию заголовком `DbgHelp.h` не отдается. Для этого необходимо перед его включением объявить макрос `_NO_CVCONST_H`. Это тогда, когда когда у вас нет заголовочного файла `cvconst.h`. Его можно просто [скачать](https://github.com/microsoft/microsoft-pdb/tree/master/include) с репозитория Microsoft на GitHub (что я и сделал)
+2. У каждого тэга есть свои определенные команды (`TI_GET_XXX`), которые он поддерживает. Если нет, то возникнет ошибка `Incorrect function`. Я искал, но не нашел список поддерживаемых команд (скорее всего они в документации PDB). Зато нашел [проект `TypeInfoDump`](https://www.debuginfo.com/tools/typeinfodump.html), в котором есть примеры использования этих команд для различных тэгов. Во время написания кода для меня он стал документацией.
+
+### Стек вызовов
+
+Честно говоря, эту часть я писать изначально не планировал, но в любой статье посвященной отладчику на Windows она есть, поэтому исключением не стану. Напомню, что стек вызовов - это пройтись по всем фреймам, начиная с текущего, и вывести информацию о нем.
+
+Для развертки стека в Windows имеется отдельная функция `StackWalk`. Это рабочая лошадка всего - мы просто вызываем ее в цикле, пока не наткнемся на адрес возврата `0`. Это означает, что мы дошли до конца.
+
+Эта функция работает со структурой `STACKFRAME`. В самом начале мы заполняем ее поля (обычно текущим фреймом с помощью `GetThreadContext`), а далее заходим в цикл и считываем данные очередного фрейма.
+
+Для примера я вывожу файл и номер строки, на которой этот фрейм находится в данный момент. Делаю это с помощью `DbgHelp`.
+
+Собрая все вместе мы получаем:
+
+<spoiler title="StackWalk">
+
+```c
+static void dump_callstack() {
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(child_hThread, &ctx)) {
+        print_error("GetThreadContext");
+        return;
+    }
+    STACKFRAME stack = {0};
+    stack.AddrPC.Offset = ctx.Rip;
+    stack.AddrPC.Mode = AddrModeFlat;
+    stack.AddrFrame.Offset = ctx.Rbp;
+    stack.AddrFrame.Mode = AddrModeFlat;
+    stack.AddrStack.Offset = ctx.Rsp;
+    stack.AddrStack.Mode = AddrModeFlat;
+
+    do
+    {
+        if (!StackWalk(IMAGE_FILE_MACHINE_AMD64, child_hProcess, child_hThread, &stack, &ctx, 
+                       NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) {
+            print_error("StackWalk");
+            return;
+        }
+        DWORD displacement;
+        IMAGEHLP_LINE64 line;
+        DWORD64 addr = stack.AddrPC.Offset;
+        if (SymGetLineFromAddr(child_hProcess, addr, &displacement, &line)) {
+            /* Файл:Строка */
+            printf("%s:%d\n", line.FileName, line.LineNumber);
+        }
+
+        if (GetLastError() == ERROR_MOD_NOT_FOUND) {
+            continue;
+        }
+    } while (stack.AddrReturn.Offset != 0);
+}
+```
+
+</spoiler>
+
+Но и тут не без замечаний. Для доступа к функции `SymGetLineFromAddr` необходима библиотека `DbgHelp`. И здесь стоит вернуться к моменту ее инициализации. Если помните, то мы указывали флаг `SYMOPT_DEFERRED_LOADS` для ленивой загрузки информации, но когда я начал тестировать код, то *всегда* возникала ошибка `The specified module could not be found`. Она исчезла после удаления этого флага.
+
+Но все же эта ошибка говорит о том, что указанный модуль найти не удалось и это вполне нормальная ситуация. Например, если вверх по стеку находится не наш код и доступа к отладочным символам у нас нет. Для тестирования я вызывал функцию `DebugBreak` (генерирует исключение для отладки) - она была первой в стеке и для нее не было отладочной информации, поэтому для нее возникала эта ошибка.
+
+### ColibriOS
+
 Windows, FreeBSD, ColibriOS (???), Реального времени ОС
 
 # Другие процессоры (архитектуры)
 
-x86, ARM, SPARC-V, Байкал (????)
+x86, ARM, RISC-V, SPARC-V, Байкал (????)
 
 # Среды разработки
 
@@ -5472,4 +6367,6 @@ VS Code, CodeBlocks
 Как различные IDE взаимодействуют с отладчиками - м.б. есть общий протокол работы с ними
 
 
-TODO: jit реализован через ptrace ?
+# Прочее
+
+- Работа с несколькими загружаемыми библиотеками
