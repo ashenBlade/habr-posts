@@ -2289,7 +2289,7 @@ TODO: формат отладки SOM
 TODO: ссылка на event-loop файл
 
 Архитектура GDB - событийно-ориентированная. Для обработки событий используется цикл событий.
-Его реализация располагается в [`event-loop.c`]().
+Его реализация располагается в [`event-loop.c`](). TODO: ссылка на него
 Всего есть 3 типа событий (в скобках указана функция обработчик типа события):
 
 - Таймауты событий (`poll_timers`)
@@ -7146,7 +7146,7 @@ static int enable_single_step(struct task_struct *child)
 
 Как и ожидалось, `ptrace` просто выставляет флаг `TF` в `EFLAGS`.
 
-### Точки останова
+### Аппаратные точки останова
 
 Последнее - точки останова. Как вы могли догадаться, речь пойдет об аппаратных точках останова.
 
@@ -7375,6 +7375,491 @@ x86_linux_dr_set (ptid_t ptid, int regnum, unsigned long value)
 
 ## ARM
 
+Также известен как: aarch64/aarch32.
+
+Когда обсуждают отладку на уровне процессора, то чаще всего я слышал про x86. Поэтому сейчас настало время поговорить и про другие архитектуры. Начнем с ARM.
+
+ARM - это не 1 архитектура, а их семейство. Существует несколько наборов инструкций (разделение по длине команд):
+
+- `A32` - команды 32 бита
+- `T32` - команды 16 и 32 бита
+- `A64` - команды 32 бита
+
+A64 появилась позже остальных (с выходом ARMV8), но ее отличие в поддержке 64-битной разрядности. В контексте ARM имеется такое понятие как Execution State и их может быть 2: `AArch64` и `AArch32`. Говоря грубо, это разрядность: первое - 64 бита (A64), вторая - 32 бита (A32, T32). Причем, в процессе работы возможен переход между ними.
+
+Я буду рассматривать `AArch64` и, соответственно, `A64`. В качестве документации используют [этот документ](https://github.com/kn-gloryo/armv8a/blob/master/docs/ARM%20Architecture%20Reference%20Manual%20-%20ARMv8%2C%20for%20ARMv8-A%20architecture%20profile.pdf).
+
+### Точки останова
+
+Точка останова реализуется с помощью инструкции `BRK`. При ее выполнении генерируется исключение `Breakpoint Instruction`. Но в отличии от x86 это не просто константная инструкция - она принимает аргумент, 2 байтное число (константа). Эта константа затем сохраняется в регистре `ESR_ELn` (n - уровень исключения).
+
+<spoiler title="Уровни исключений">
+
+В ARMV8 определяется 4 уровня исключений и каждый соответствует какому-либо уровню привилегий (как кольца защиты в x86): 
+
+- `EL0` - приложения
+- `EL1` - ядро ОС
+- `EL2` - гипервизор
+- `EL3` - монитор безопасности
+
+При обработке исключения его уровень **может быть** повышен, а при возвращении - понижен. Тоже самое касается и `AArchXXX` - при обработке возможен переход `AArch32` -> `AArch64`, и наоборот при возвращении.
+
+Также, в ARM имеется несколько Link регистров. Они хранят адреса возврата при вызове функции. А для исключений имеются собственные Exception Link регистры. Всего их 3, для каждого уровня, начиная с 1: `ELR_EL1`, `ELR_EL2`, `ELR_EL3`. В них хранятся адреса для возврата на предыдущий уровень.
+
+Про уровнии исключений можно почитать [в этой статье](https://habr.com/ru/articles/353994/).
+
+</spoiler>
+
+Таким образом, чтобы поставить точку останова нам необходимо подставить на место этой константы какое-нибудь число. Но в общем-то это не обязательно.
+
+В указанном документе байты точки останова не указаны, зато они есть [здесь](https://student.cs.uwaterloo.ca/~cs452/docs/rpi4b/ISA_A64_xml_v88A-2021-12_OPT.pdf). Хотя зачем напрягаться, лучше посмотреть что там в gdb.
+
+<spoiler title="Выставление точки останова в gdb">
+
+Напомню, что за платформо-зависимые части вынесены в отдельные классы/функции. Поэтому реализация выставления точки останова реализована так: обобщенная функция получает инструкцию точки останова (массив байт), а потом записывает по указанному адресу.
+
+```c++
+/* gdb/aarch64-tdep.c */
+/* AArch64 BRK software debug mode instruction.
+   Note that AArch64 code is always little-endian.
+   1101.0100.0010.0000.0000.0000.0000.0000 = 0xd4200000.  */
+constexpr gdb_byte aarch64_default_breakpoint[] = {0x00, 0x00, 0x20, 0xd4};
+
+/* gdb/arch-utils.h */
+template <size_t bp_size,
+	  const gdb_byte *break_insn_little,
+	  const gdb_byte *break_insn_big>
+struct bp_manipulation_endian
+{
+  static int
+  kind_from_pc (struct gdbarch *gdbarch, CORE_ADDR *pcptr)
+  {
+    return bp_size;
+  }
+
+  static const gdb_byte *
+  bp_from_kind (struct gdbarch *gdbarch, int kind, int *size)
+  {
+    *size = kind;
+    if (gdbarch_byte_order (gdbarch) == BFD_ENDIAN_BIG)
+      return break_insn_big;
+    else
+      return break_insn_little;
+  }
+};
+
+#define BP_MANIPULATION(BREAK_INSN) \
+  bp_manipulation<sizeof (BREAK_INSN), BREAK_INSN>
+
+typedef BP_MANIPULATION (aarch64_default_breakpoint) aarch64_breakpoint;
+
+/* gdb/mem-break.c */
+int
+default_memory_insert_breakpoint (struct gdbarch *gdbarch,
+				  struct bp_target_info *bp_tgt)
+{
+    CORE_ADDR addr = bp_tgt->placed_address;
+    const unsigned char *bp;
+    gdb_byte *readbuf;
+    int bplen;
+    int val;
+  
+    /* Determine appropriate breakpoint contents and size for this address.  */
+    bp = gdbarch_sw_breakpoint_from_kind (gdbarch, bp_tgt->kind, &bplen);
+
+    /* Save the memory contents in the shadow_contents buffer and then
+       write the breakpoint instruction.  */
+    readbuf = (gdb_byte *) alloca (bplen);
+    val = target_read_memory (addr, readbuf, bplen);
+    if (val == 0)
+    {
+        /* ... */
+        val = target_write_raw_memory (addr, bp, bplen);
+    }
+
+    return val;
+}
+```
+
+</spoiler>
+
+Можно заметить, что gdb использует 0 для этой константы.
+
+> В `AArch32` используется другая ассемблерная инструкция - `BKPT`. Но при этом в A32 используется 32 битная инструкция с 2 байтной константой, а в T32 уже инструкция короче - 16 бит, а константа - 1 байт.
+
+Чтобы определить, что за тип исключения был, в регистр `ESR_ELn` записывается код исключения. Для `BKPT` он будет равен `0x3C`. И если посмотрим в код Linux, то увидим его использование:
+
+<spoiler title="Обработка BKPT в Linux">
+
+```c
+/* arch/arm64/include/asm/esr.h */
+#define ESR_ELx_EC_BRK64	UL(0x3C)
+#define ESR_ELx_EC(esr)		(((esr) & ESR_ELx_EC_MASK) >> ESR_ELx_EC_SHIFT)
+
+/* arch/arm64/kernel/entry-common.c */
+asmlinkage void noinstr el1h_64_sync_handler(struct pt_regs *regs)
+{
+	unsigned long esr = read_sysreg(esr_el1);
+
+	switch (ESR_ELx_EC(esr)) {
+	/* ... */
+	case ESR_ELx_EC_BREAKPT_CUR:
+	case ESR_ELx_EC_SOFTSTP_CUR:
+	case ESR_ELx_EC_WATCHPT_CUR:
+	case ESR_ELx_EC_BRK64:
+		el1_dbg(regs, esr);
+		break;
+    /* ... */
+	}
+}
+
+static void noinstr el1_dbg(struct pt_regs *regs, unsigned long esr)
+{
+	unsigned long far = read_sysreg(far_el1);
+
+	if (/* ... */)
+		do_debug_exception(far, esr, regs);
+}
+```
+
+</spoiler>
+
+### Шаги
+
+Шаги аналогичны x86. В регистре PSTATE имеется специальный флаг `SS` (Single Step). Если он выставлен, то после выполнения инструкции будет послан специальный сигнал.
+
+Ранее, я уже показывал код из lldb для продолжения работы на Windows. Там, мы рассматривали TF флаг процессора. Но также внизу был код для ARM. Продублирую этот участок кода:
+
+<spoiler title="TragetThreadWindows::DoResume">
+
+```c++
+Status TargetThreadWindows::DoResume() {
+  /* ... */
+  if (resume_state == eStateStepping) {
+    const ArchSpec &arch = process->GetTarget().GetArchitecture();
+    switch (arch.GetMachine()) {
+    case llvm::Triple::x86:
+    case llvm::Triple::x86_64:
+      flags_value |= 0x100; // Set the trap flag on the CPU
+      break;
+    case llvm::Triple::aarch64:
+    case llvm::Triple::arm:
+    case llvm::Triple::thumb:
+      flags_value |= 0x200000; // The SS bit in PState
+      break;
+    }
+  }
+  /* ... */
+}
+```
+
+</spoiler>
+
+Комментарий говорит сам за себя - выставляем флаг SS (бит) в регистре PSTATE. Ну и чтобы наверняка - посмотрим как в Linux реализуется `ptrace(PTRACE_SINGLESTEP)`:
+
+<spoiler title="ptrace(PTRACE_SINGLESTEP)">
+
+```c
+/* kernel/ptrace.c */
+static int ptrace_resume(struct task_struct *child, long request,
+			 unsigned long data)
+{
+	if (/* ... */) {
+        /* ... */
+	} else if (is_singlestep(request) || is_sysemu_singlestep(request)) {
+		user_enable_single_step(child);
+	} else {
+        /* ... */
+	}
+}
+
+/* arch/arm64/kernel/debug-monitors.c */
+void user_enable_single_step(struct task_struct *task)
+{
+	struct thread_info *ti = task_thread_info(task);
+
+	if (!test_and_set_ti_thread_flag(ti, TIF_SINGLESTEP))
+        set_user_regs_spsr_ss(user_regs);
+}
+
+#define DBG_SPSR_SS		(1 << 21)
+
+static void set_user_regs_spsr_ss(struct user_pt_regs *regs)
+{
+	regs->pstate |= DBG_SPSR_SS;
+}
+```
+
+</spoiler>
+
+На этом можно было и остановиться, если бы не gdb. В gdb имеется функциональность выполнять software шаги, то есть тогда когда не доступны шаги через hardware (те самые флаги регистра). В таких случаях, шаги реализуются через точки останова.
+
+И вот тут следует знать об одной особенности этой архитектуры - LSE, Large System Extensions. Грубо говоря, эта фича добавляет поддержку транзакций - набор инструкций, которые должны быть выполнены атомарно.
+
+В gdb решено, что если мы решили сделать шаг, когда находимся перед такой последовательностью, то шаг - это вся транзакция. А для реализации этого, ищется конец этой последовательности.
+
+Реализовано это в функции `aarch64_software_single_step`:
+
+<spoiler title="aarch64_software_single_step">
+
+```c++ 
+/* gdb/aarch64-tdep.c */
+static std::vector<CORE_ADDR>
+aarch64_software_single_step (struct regcache *regcache)
+{
+  struct gdbarch *gdbarch = regcache->arch ();
+  enum bfd_endian byte_order_for_code = gdbarch_byte_order_for_code (gdbarch);
+  const int insn_size = 4;
+  const int atomic_sequence_length = 16; /* Instruction sequence length.  */
+  CORE_ADDR pc = regcache_read_pc (regcache);
+  CORE_ADDR breaks[2] = { CORE_ADDR_MAX, CORE_ADDR_MAX };
+  CORE_ADDR loc = pc;
+  CORE_ADDR closing_insn = 0;
+  uint32_t insn = read_memory_unsigned_integer (loc, insn_size,
+						byte_order_for_code);
+  int index;
+  int insn_count;
+  int bc_insn_count = 0; /* Conditional branch instruction count.  */
+  int last_breakpoint = 0; /* Defaults to 0 (no breakpoints placed).  */
+  aarch64_inst inst;
+
+  if (aarch64_decode_insn (insn, &inst, 1, NULL) != 0)
+    return {};
+
+  /* Look for a Load Exclusive instruction which begins the sequence.  */
+  if (inst.opcode->iclass != ldstexcl || bit (insn, 22) == 0)
+    return {};
+
+  for (insn_count = 0; insn_count < atomic_sequence_length; ++insn_count)
+    {
+      loc += insn_size;
+      insn = read_memory_unsigned_integer (loc, insn_size,
+					   byte_order_for_code);
+
+      if (aarch64_decode_insn (insn, &inst, 1, NULL) != 0)
+	return {};
+      /* Check if the instruction is a conditional branch.  */
+      if (inst.opcode->iclass == condbranch)
+	{
+	  if (bc_insn_count >= 1)
+	    return {};
+
+	  /* It is, so we'll try to set a breakpoint at the destination.  */
+	  breaks[1] = loc + inst.operands[0].imm.value;
+
+	  bc_insn_count++;
+	  last_breakpoint++;
+	}
+
+      /* Look for the Store Exclusive which closes the atomic sequence.  */
+      if (inst.opcode->iclass == ldstexcl && bit (insn, 22) == 0)
+	{
+	  closing_insn = loc;
+	  break;
+	}
+    }
+
+  /* We didn't find a closing Store Exclusive instruction, fall back.  */
+  if (!closing_insn)
+    return {};
+
+  /* Insert breakpoint after the end of the atomic sequence.  */
+  breaks[0] = loc + insn_size;
+
+  /* Check for duplicated breakpoints, and also check that the second
+     breakpoint is not within the atomic sequence.  */
+  if (last_breakpoint
+      && (breaks[1] == breaks[0]
+	  || (breaks[1] >= pc && breaks[1] <= closing_insn)))
+    last_breakpoint = 0;
+
+  std::vector<CORE_ADDR> next_pcs;
+
+  /* Insert the breakpoint at the end of the sequence, and one at the
+     destination of the conditional branch, if it exists.  */
+  for (index = 0; index <= last_breakpoint; index++)
+    next_pcs.push_back (breaks[index]);
+
+  return next_pcs;
+}
+```
+
+</spoiler>
+
+### Аппаратные точки останова
+
+ARM часто используется как микропроцессор на всяких платах, поэтому запустить на нем Линукс, накатить gdb и начать отладку как обсуждали ранее получится не всегда. Но разработчики не глупые, поэтому этот недостаток компенсировали множеством дополнительных регистров.
+
+Для отладки существует несколько вспомогательных отладочных регистров:
+
+- `DBGAUTHSTATUS_EL1` (Debug Authentication Status) - информация об интерфейсе аутентификации (зависит от реализации)
+- `DBGCLAIMSET_EL1` (Debug Claim Tag Set) - выставление специальных битов тэга CLAIM (используется для взаимодействия отладчика и машины)
+- `DBGCLAIMCLR_EL1` (Debug Claim Tag Clear) - очистка тэга CLAIM
+- `DBGDTR_EL0` (Debug Data Transfer) - передача 64-битных слов между отладчиком и машиной (в обе строны)
+- `DBGDTRRX_EL0` (Debug Data Transfer) - передача 32-битных слов от отладчика к машине
+- `DBGDTRTX_EL0` (Debug Data Transfer) - передача 32-битных слов от машины к отладчику
+- `DBGPRCR_EL1` (Debug Power Control) - запрос на выключение (его эмуляция)
+- `DBGVCR32_EL2` (Debug Vector Catch) - возможность доступа к регистру `DBGVCR` (он есть в AArch32, но не в AArch64)
+- `DSPSSR_EL0` (Debug Saved Program Status) - хранит состояние при входе в режим отладки
+- `DLR_EL0` (Debug Link) - адрес возврата для продолжения работы из режима отладки
+
+Эти регистры необходимы при взаимодействии с внешним отладчиком, то есть когда мы отлаживаем железо. Вообще, чтобы отлаживать железо на ARM необходимо войти в состояние отладки (Debug State). Это можно сделать с помощью инструкции `HTL`. Но про отладку железа я говорить не буду, а эти регистры просто упомянул. Сконцетрируемся мы на 4 других. Эти регистры отвечают за точки останова. Можно сказать, что это 2 группы с 2 шаблонными регистрами: первый хранит какие-то данные, а второй эти данные интерпретирует (регистр данных и регистр контроля назовем их). И сразу спойлер: каждого регистра 16 штук и в названии имеется число `<n>` - это его номер (от 0 до 15), хотя в документации говорится, что их может быть от 2 до 16.
+
+Первая группа - точки останова. Когда мы отлаживаем железо, то поставить программную точку останова не представляется возможным, поэтому единственный вариант в данном случае - поддержка со стороны самого железа. И это реализуется с помощью 2 регистров:
+
+1. `DBGBVR<n>_EL1` (Debug Breakpoint Value) - данные 
+2. `DBGBCR<n>_EL1` (Debug Breakponit Control) - контроль
+
+В регистре контроля хранятся разные поля, но гланое - это `BT` (Breakpoint Type). Оно определяет тип точки останова и оно же определяет то, как интепретировать регистр данных. Этот поле занимает 4 бита и точек останова 16 типов соответственно (строго говоря, их 8, так как 1 бит используется как флаг).
+
+Далее идет группа уже для точек наблюдения (watchpoint). Это те самые аппаратные точки останова, о которых говорили в x86. Они нужны для отслеживания изменений в адресах данных:
+
+1. `DBGWVR<n>_EL1` (Debug Watchpoint Value) - данные
+2. `DBGWCR<n>_EL1` (Debug Watchpoint Control) - контроль
+
+Здесь уже регистр контроля не определяет интерпретацию регистра данных. Но зато в нем также есть поле условий активации - `LSC` (Load Store Control). В отличии от x86 доступны только 3 события: запись (store), чтение (load) или запись/чтение (load/store). 
+
+Адрес в регистре данных тоже должен быть выровнен по 8 байтам. Но как же быть, если я хочу, например, отслеживать измения на адресе 9 (8 + 1)? Для этого имеется поле `BAS` (Byte Address Select). Это битовая маска, в которой можно указать смещение отслеживаемого байта. Например, маска `0b00000010` говорит о том, что необходимо отслеживать адрес `DBGWVR<n>_EL1` + 1, поэтому записав в этот регистр адрес 4 и указанную маску. Так как это битовая маска, то, например, выставив все биты в 1 мы будем отслеживать все изменения в слове.
+
+Посмотрим, как это реализуется в gdb:
+
+<spoiler title="">
+
+Небольшое замечание: в коде gdb вы не найдете прямого упоминания регистров `DBGWCR`/`DBGWVR`, вместо этого используется специальная структура, отображаемая на эти регистры. Работа ведется с ней, а после этот кэш сбрасывается.
+
+```c
+/* gdb/nat/aarch64-linux-hw-point.h */
+#define AARCH64_HBP_MAX_NUM 16
+#define AARCH64_HWP_MAX_NUM 16
+
+#define AARCH64_HBP_ALIGNMENT 4
+#define AARCH64_HWP_ALIGNMENT 8
+
+struct aarch64_debug_reg_state
+{
+  /* hardware breakpoint */
+  CORE_ADDR dr_addr_bp[AARCH64_HBP_MAX_NUM];
+  unsigned int dr_ctrl_bp[AARCH64_HBP_MAX_NUM];
+  unsigned int dr_ref_count_bp[AARCH64_HBP_MAX_NUM];
+
+  /* hardware watchpoint */
+  /* Address aligned down to AARCH64_HWP_ALIGNMENT.  */
+  CORE_ADDR dr_addr_wp[AARCH64_HWP_MAX_NUM];
+  /* Address as entered by user without any forced alignment.  */
+  CORE_ADDR dr_addr_orig_wp[AARCH64_HWP_MAX_NUM];
+  unsigned int dr_ctrl_wp[AARCH64_HWP_MAX_NUM];
+  unsigned int dr_ref_count_wp[AARCH64_HWP_MAX_NUM];
+};
+
+
+/* gdb/nat/aarch64-linux-hw-point.c */
+static int
+aarch64_dr_state_insert_one_point (struct aarch64_debug_reg_state *state,
+				   enum target_hw_bp_type type,
+				   CORE_ADDR addr, int offset, int len,
+				   CORE_ADDR addr_orig)
+{
+  int i, idx, num_regs, is_watchpoint;
+  unsigned int ctrl, *dr_ctrl_p, *dr_ref_count;
+  CORE_ADDR *dr_addr_p, *dr_addr_orig_p;
+
+  /* Set up state pointers.  */
+  is_watchpoint = (type != hw_execute);
+  gdb_assert (aarch64_point_is_aligned (is_watchpoint, addr, len));
+  if (is_watchpoint)
+    {
+      num_regs = aarch64_num_wp_regs;
+      dr_addr_p = state->dr_addr_wp;
+      dr_addr_orig_p = state->dr_addr_orig_wp;
+      dr_ctrl_p = state->dr_ctrl_wp;
+      dr_ref_count = state->dr_ref_count_wp;
+    }
+  else
+    {
+      num_regs = aarch64_num_bp_regs;
+      dr_addr_p = state->dr_addr_bp;
+      dr_addr_orig_p = nullptr;
+      dr_ctrl_p = state->dr_ctrl_bp;
+      dr_ref_count = state->dr_ref_count_bp;
+    }
+
+  ctrl = aarch64_point_encode_ctrl_reg (type, offset, len);
+
+  /* Find an existing or free register in our cache.  */
+  idx = -1;
+  for (i = 0; i < num_regs; ++i)
+    {
+      if ((dr_ctrl_p[i] & 1) == 0)
+	{
+	  gdb_assert (dr_ref_count[i] == 0);
+	  idx = i;
+	  /* no break; continue hunting for an exising one.  */
+	}
+      else if (dr_addr_p[i] == addr
+	       && (dr_addr_orig_p == nullptr || dr_addr_orig_p[i] == addr_orig)
+	       && dr_ctrl_p[i] == ctrl)
+	{
+	  gdb_assert (dr_ref_count[i] != 0);
+	  idx = i;
+	  break;
+	}
+    }
+
+  /* No space.  */
+  if (idx == -1)
+    return -1;
+
+  /* Update our cache.  */
+  if ((dr_ctrl_p[idx] & 1) == 0)
+    {
+      /* new entry */
+      dr_addr_p[idx] = addr;
+      if (dr_addr_orig_p != nullptr)
+	dr_addr_orig_p[idx] = addr_orig;
+      dr_ctrl_p[idx] = ctrl;
+      dr_ref_count[idx] = 1;
+      /* Notify the change.  */
+      aarch64_notify_debug_reg_change (state, is_watchpoint, idx);
+    }
+  else
+    {
+      /* existing entry */
+      dr_ref_count[idx]++;
+    }
+
+  return 0;
+}
+```
+
+</spoiler>
+
+Если мы попадаем на breakponit, то генерируется `Breakpoint exception`, а если на watchpoint - то `Watchpoint exception`. То есть в итоге, у нас 3 различных исключения (программная точка останова - `Breakpoint instruction exception`).
+
+### Отладка железа
+
+Ранее я уже обронил слово о внешней отладке, но что такое внятно не объяснил. ARM часто используется на встраиваемых системах. На них ОС не накатишь и по SSH не подключишься. Для их отладки необходимо использовать внешние средства и отладка с помощью них называется внешней отладкой (external debug). По аналогии, отладка привычными нам средствами называется уже self-hosted debug.
+
+Для того, чтобы начать внешнюю отладку на ARM необходимо войти в состояние отладки (debug state). Когда мы входим в это состояние, то контроль передается внешнему отладчику и выполнение останавливается. А войти в это состояние можно, когда возникают, так называемые, Halting debug exceptions. Самое простое - это инструкция `HLT`, при ее выполнении машина переходит в режим отладки. Также, это может быть Breakpoint или Watchpoint exception (логично, что при их срабатывании необходимо остановиться и передать управление). Но чтобы external не конфликтовал self-hosted отладкой существует флаг `HDE` (Halting debug enable) в регистре `EDSCR` (external debug status and control).
+
+> Также, на сколько я понял, поведение инструкции точки останова (`BRK`) в debug state не определено:
+> > The following events never generate entry to Debug state:
+> >  - Breakpoint Instruction exceptions.
+> >  This means that these events can do one of the following:
+> >  - They can generate a debug exception.
+> >  - They can be ignored.
+
+Пока мы находимся в режиме отладки мы можем выполнять отладочные действия: выполнять какие-то инструкции (в документации явно прописано как различные инструкции влияют на состояние), читать значения регистров или памяти и так далее.
+
+Чтобы выйти из debug state необходимо отправить `Restart request` на специальный триггер.
+
+Но на главный вопрос пока не ответили - так как же происходит общение отладчика и процесса? Для взаимодействия между отладчиком и процессом используется DCC - Debug Communication Channel. Это *логический* канал взаимодействия, а его физическая реализация состоит из совокупности регистров и флагов:
+
+- `DBGDTRRX` и `DBGDTRTX` - это флаги передачи данных (упомянал ранее). `DBG` - debug, `DTR` - data transfer register, `RX` - receive, `TX` - transmit.
+- `EDITR` (External Debug Instruction Transfer Register) - регистр для передачи инструкций, которые необходимо выполнить.
+- `EDSCR` (External Debug Status and Control Register) - регистр с флагами контроля. Например, `RXO` - флаг уведомления об ошибке потока передачи.
+
+Но конечно же это самый низкоуровневый интерфейс. Им пользуются уже более высокоуровневые, предоставляющие интерфейс удобнее, чем сырые регистры. Таковым является, например, [JTAG](https://habr.com/ru/articles/190012/).
+
 ## RISC-V
 
 ## Loong64
@@ -7384,8 +7869,6 @@ x86_linux_dr_set (ptid_t ptid, int regnum, unsigned long value)
 ## PowerPC
 
 ## s390
-
-## IA32
 
 ## Sparc64
 
