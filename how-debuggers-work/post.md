@@ -8152,15 +8152,330 @@ static inline int set_dabr(struct arch_hw_breakpoint *brk)
 
 Но это точка останова для данных. Для инструкций используется другой регистр - `IABR` (Instruction Address Breakpoint Register). В ней по аналогии хранится адрес инструкции, такой же выровненный.
 
-## Loong64
+## Loongson
 
-## Mips64
+Также известна как: loongarch, godson, LA32/LA64
 
-## s390
+https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.pdf
 
-## Sparc64
+Последним в нашем списке рассмотрю архитектуру Loongson.
 
-TODO: попробовать MISC архитектуру
+Эта архитектура была создана в начале 2000-х, но уже имеет богатую историю - несколько поколений и семейств.
+
+LoongArch - это RISC архитектура. Она состоит базовой части (Loongson Base) и множества (необязательных) расширений, например, LBT - Loongson Binary Translation (расширение для бинарной трансляции x86/ARM/MIPS).
+
+На поверхности эта архитектура похожа на остальные: поддержка 32 и 64 битного режимов, все инструкции размером 32 бит, 3 уровня привилегий (причем уровень 0 - это уровень ядра, а 3 - пользователя), вектор прерываний и т.д.
+
+Модель исключений тоже понятна - у каждого исключения свой номер и его обрабатывает соответствующая функция, хранящаяся в таблице.
+
+Для отладки используется регистр `DBG`. В нем хранится информация, специфичная для режима отладки. В частности, `DST` - флаг нахождения в режиме отладки. Он выставляется автоматически при срабатывании `Debug exception`. Также, есть несколько флагов говорящих о том, какое исключение сработало: несколько отдельных флагов для возможных исключений отладки, а также поле с кодом исключения.
+
+### Программная точка останова
+
+За программную точку останова отвечает инструкция `break #imm`. Ей на вход передается число, которое потом можно передать обработчику. А исключение, которое возникает - `Breakpoint exception`.
+
+Здесь также уже знакомая ситуация. Но вот что интересно, так это код обработки в ядре. Ранее мы видели, что отладчики передают 0 в качестве заглушки. Но вот в ядре Linux оно используется для передачи некоторой информации, а конкретно используется для механизмов kprobe.
+
+<spoiler title="Обработка точки останова">
+
+```c
+/* arch/loongarch/kernel/traps.c */
+asmlinkage void noinstr do_bp(struct pt_regs *regs)
+{
+	bool user = user_mode(regs);
+	unsigned int opcode, bcode;
+	unsigned long era = exception_era(regs);
+	irqentry_state_t state = irqentry_enter(regs);
+
+	if (regs->csr_prmd & CSR_PRMD_PIE)
+		local_irq_enable();
+
+	if (__get_inst(&opcode, (u32 *)era, user))
+		goto out_sigsegv;
+
+	bcode = (opcode & 0x7fff);
+
+	/*
+	 * notify the kprobe handlers, if instruction is likely to
+	 * pertain to them.
+	 */
+	switch (bcode) {
+	case BRK_KDB:
+		if (kgdb_breakpoint_handler(regs))
+			goto out;
+		else
+			break;
+	case BRK_KPROBE_BP:
+		if (kprobe_breakpoint_handler(regs))
+			goto out;
+		else
+			break;
+	case BRK_KPROBE_SSTEPBP:
+		if (kprobe_singlestep_handler(regs))
+			goto out;
+		else
+			break;
+	case BRK_UPROBE_BP:
+		if (uprobe_breakpoint_handler(regs))
+			goto out;
+		else
+			break;
+	case BRK_UPROBE_XOLBP:
+		if (uprobe_singlestep_handler(regs))
+			goto out;
+		else
+			break;
+	default:
+		current->thread.trap_nr = read_csr_excode();
+		if (notify_die(DIE_TRAP, "Break", regs, bcode,
+			       current->thread.trap_nr, SIGTRAP) == NOTIFY_STOP)
+			goto out;
+		else
+			break;
+	}
+
+	switch (bcode) {
+	case BRK_BUG:
+		bug_handler(regs);
+		break;
+	case BRK_DIVZERO:
+		die_if_kernel("Break instruction in kernel code", regs);
+		force_sig_fault(SIGFPE, FPE_INTDIV, (void __user *)regs->csr_era);
+		break;
+	case BRK_OVERFLOW:
+		die_if_kernel("Break instruction in kernel code", regs);
+		force_sig_fault(SIGFPE, FPE_INTOVF, (void __user *)regs->csr_era);
+		break;
+	default:
+		die_if_kernel("Break instruction in kernel code", regs);
+		force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)regs->csr_era);
+		break;
+	}
+
+out:
+	if (regs->csr_prmd & CSR_PRMD_PIE)
+		local_irq_disable();
+
+	irqentry_exit(regs, state);
+	return;
+
+out_sigsegv:
+	force_sig(SIGSEGV);
+	goto out;
+}
+```
+
+</spoiler>
+
+### Аппаратная точка останова
+
+После программных рассмотрим аппаратные точки останова. Согласно документации их максимальное количество 14. Также для breakpoint'ов и watchpoint'ов используются разные регистры (n - номер регистра):
+
+- watchpoint - `MWPNCFG` (M - memory)
+- breakpoint - `FWPnCFG` (F - fetch)
+
+<spoiler title="Выставление точек останова">
+
+```c
+static int hw_breakpoint_control(struct perf_event *bp,
+				 enum hw_breakpoint_ops ops)
+{
+	u32 ctrl, privilege;
+	int i, max_slots, enable;
+	struct pt_regs *regs;
+	struct perf_event **slots;
+	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
+
+	if (arch_check_bp_in_kernelspace(info))
+		privilege = CTRL_PLV0_ENABLE;
+	else
+		privilege = CTRL_PLV3_ENABLE;
+
+	/*  Whether bp belongs to a task. */
+	if (bp->hw.target)
+		regs = task_pt_regs(bp->hw.target);
+
+	if (info->ctrl.type == LOONGARCH_BREAKPOINT_EXECUTE) {
+		/* Breakpoint */
+		slots = this_cpu_ptr(bp_on_reg);
+		max_slots = boot_cpu_data.watch_ireg_count;
+	} else {
+		/* Watchpoint */
+		slots = this_cpu_ptr(wp_on_reg);
+		max_slots = boot_cpu_data.watch_dreg_count;
+	}
+
+	i = hw_breakpoint_slot_setup(slots, max_slots, bp, ops);
+
+	if (WARN_ONCE(i < 0, "Can't find any breakpoint slot"))
+		return i;
+
+	switch (ops) {
+	case HW_BREAKPOINT_INSTALL:
+		/* Set the FWPnCFG/MWPnCFG 1~4 register. */
+		if (info->ctrl.type == LOONGARCH_BREAKPOINT_EXECUTE) {
+			write_wb_reg(CSR_CFG_ADDR, i, 0, info->address);
+			write_wb_reg(CSR_CFG_MASK, i, 0, info->mask);
+			write_wb_reg(CSR_CFG_ASID, i, 0, 0);
+			write_wb_reg(CSR_CFG_CTRL, i, 0, privilege);
+		} else {
+			write_wb_reg(CSR_CFG_ADDR, i, 1, info->address);
+			write_wb_reg(CSR_CFG_MASK, i, 1, info->mask);
+			write_wb_reg(CSR_CFG_ASID, i, 1, 0);
+			ctrl = encode_ctrl_reg(info->ctrl);
+			write_wb_reg(CSR_CFG_CTRL, i, 1, ctrl | privilege);
+		}
+		enable = csr_read64(LOONGARCH_CSR_CRMD);
+		csr_write64(CSR_CRMD_WE | enable, LOONGARCH_CSR_CRMD);
+		if (bp->hw.target && test_tsk_thread_flag(bp->hw.target, TIF_LOAD_WATCH))
+			regs->csr_prmd |= CSR_PRMD_PWE;
+		break;
+	case HW_BREAKPOINT_UNINSTALL:
+		/* Reset the FWPnCFG/MWPnCFG 1~4 register. */
+		if (info->ctrl.type == LOONGARCH_BREAKPOINT_EXECUTE) {
+			write_wb_reg(CSR_CFG_ADDR, i, 0, 0);
+			write_wb_reg(CSR_CFG_MASK, i, 0, 0);
+			write_wb_reg(CSR_CFG_CTRL, i, 0, 0);
+			write_wb_reg(CSR_CFG_ASID, i, 0, 0);
+		} else {
+			write_wb_reg(CSR_CFG_ADDR, i, 1, 0);
+			write_wb_reg(CSR_CFG_MASK, i, 1, 0);
+			write_wb_reg(CSR_CFG_CTRL, i, 1, 0);
+			write_wb_reg(CSR_CFG_ASID, i, 1, 0);
+		}
+		if (bp->hw.target)
+			regs->csr_prmd &= ~CSR_PRMD_PWE;
+		break;
+	}
+
+	return 0;
+}
+```
+
+</spoiler>
+
+### Шаг
+
+Наконец-то что-то интересное - шаги. А точнее *их отсутствие*. Да, архитектура Loongson не поддерживает возможность выполнения только 1 инструкции. Но это не значит, что поддержки этого совсем нет.
+
+Для обхода этого ограничения в Linux используются аппаратные точки останова. Она ставится на *текущую* инструкцию (на которую указывает PC). Таким образом, когда выполнение продолжится будет мгновенно сгенерировано исключение. Последний вопрос - как обнаружить что мы запросили шаг и это не реальнаая точка останова. Это сделано просто - в структуре потока хранится адрес инструкции для которой запросили single step.
+
+<spoiler title="Обработка шага">
+
+```c
+/* arch/loongarch/kernel/ptrace.c */
+void user_enable_single_step(struct task_struct *task)
+{
+	struct thread_info *ti = task_thread_info(task);
+
+    /* Выставляем точку останова */
+	set_single_step(task, task_pt_regs(task)->csr_era);
+    /* Запоминаем адрес */
+	task->thread.single_step = task_pt_regs(task)->csr_era;
+	set_ti_thread_flag(ti, TIF_SINGLESTEP);
+}
+
+static int set_single_step(struct task_struct *tsk, unsigned long addr)
+{
+	struct perf_event *bp;
+	struct perf_event_attr attr;
+	struct arch_hw_breakpoint *info;
+	struct thread_struct *thread = &tsk->thread;
+
+	bp = thread->hbp_break[0];
+	if (!bp) {
+		ptrace_breakpoint_init(&attr);
+
+		attr.bp_addr = addr;
+		attr.bp_len = HW_BREAKPOINT_LEN_8;
+		attr.bp_type = HW_BREAKPOINT_X;
+
+		bp = register_user_hw_breakpoint(&attr, ptrace_triggered,
+						 NULL, tsk);
+		if (IS_ERR(bp))
+			return PTR_ERR(bp);
+
+		thread->hbp_break[0] = bp;
+	} else {
+		int err;
+
+		attr = bp->attr;
+		attr.bp_addr = addr;
+
+		/* Reenable breakpoint */
+		attr.disabled = false;
+		err = modify_user_hw_breakpoint(bp, &attr);
+		if (unlikely(err))
+			return err;
+
+		csr_write64(attr.bp_addr, LOONGARCH_CSR_IB0ADDR);
+	}
+	info = counter_arch_bp(bp);
+	info->mask = TASK_SIZE - 1;
+
+	return 0;
+}
+```
+
+</spoiler>
+
+В предыдущей секции я не показал обработчик исключения, возникающего при срабатывании точки останова. Покажу здесь, так как заметная ее часть отводится этому шагу:
+
+<spoiler title="Обработка точки останова">
+
+```c
+/* arch/loongarch/kernel/traps.c */
+asmlinkage void noinstr do_watch(struct pt_regs *regs)
+{
+	irqentry_state_t state = irqentry_enter(regs);
+
+	if (kgdb_breakpoint_handler(regs))
+		goto out;
+
+	if (test_tsk_thread_flag(current, TIF_SINGLESTEP)) {
+		int llbit = (csr_read32(LOONGARCH_CSR_LLBCTL) & 0x1);
+		unsigned long pc = instruction_pointer(regs);
+		union loongarch_instruction *ip = (union loongarch_instruction *)pc;
+
+		if (llbit) {
+			/*
+			 * When the ll-sc combo is encountered, it is regarded as an single
+			 * instruction. So don't clear llbit and reset CSR.FWPS.Skip until
+			 * the llsc execution is completed.
+			 */
+			csr_write32(CSR_FWPC_SKIP, LOONGARCH_CSR_FWPS);
+			csr_write32(CSR_LLBCTL_KLO, LOONGARCH_CSR_LLBCTL);
+			goto out;
+		}
+
+		if (pc == current->thread.single_step) {
+			/*
+			 * Certain insns are occasionally not skipped when CSR.FWPS.Skip is
+			 * set, such as fld.d/fst.d. So singlestep needs to compare whether
+			 * the csr_era is equal to the value of singlestep which last time set.
+			 */
+			if (!is_self_loop_ins(ip, regs)) {
+				/*
+				 * Check if the given instruction the target pc is equal to the
+				 * current pc, If yes, then we should not set the CSR.FWPS.SKIP
+				 * bit to break the original instruction stream.
+				 */
+				csr_write32(CSR_FWPC_SKIP, LOONGARCH_CSR_FWPS);
+				goto out;
+			}
+		}
+	} else {
+		breakpoint_handler(regs);
+		watchpoint_handler(regs);
+	}
+
+	force_sig(SIGTRAP);
+out:
+	irqentry_exit(regs, state);
+}
+```
+
+</spoiler>
 
 # Среды разработки
 
