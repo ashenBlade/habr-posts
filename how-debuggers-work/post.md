@@ -7860,24 +7860,318 @@ aarch64_dr_state_insert_one_point (struct aarch64_debug_reg_state *state,
 
 Но конечно же это самый низкоуровневый интерфейс. Им пользуются уже более высокоуровневые, предоставляющие интерфейс удобнее, чем сырые регистры. Таковым является, например, [JTAG](https://habr.com/ru/articles/190012/).
 
-## RISC-V
+## PowerPC
+
+Также известен как: ppc, ppc64, power isa, PowerPC64
+
+PowerPC - это RISC архитектура, созданная совместно Motorolla, IBM и Apple (AIM). Она основана на другой, более ранней POWER, использовавшейся на RS/6000, и проектировалась с учетом совместимости. Работать может как в 32, так и в 64 битном режиме. Для 64 битного режима используется название PowerPC64, его мы и будем рассматривать.
+
+Еще одной особенностью является то, что это гарвардская архитектура, то есть для инструкций и данных используется разная память.
+
+PowerPC определяет 3 уровня ISA:
+
+1. [User instruction set architecture](https://cr.yp.to/2005-590/powerpc.pdf) (UISA)
+2. [Virtual environment architecture](https://www.ece.lsu.edu/ee4720/doc/ppc_isa_book2.pdf) (VEA)
+3. [Operating envionment architecture](https://wiki.raptorcs.com/w/images/7/72/PPC_Vers201_Book3_public.pdf) (OEA)
+
+Хотел бы я сказать, что это аналогия колец защиты x86, но это не так. IUSA определяет набор основных инструкций, которые можно использовать для написать программ, VEA дополняет это все кэшами, виртуальной памятью, атомарностью и т.д., а OEA - уже больше для системных программистов, так как там описывается модель исключений и прерываний, привилегированные инструкции.
+
+У PowerPC 3 уровня привилегий, причем для определения уровня необходимо использовать 2 флага из регистра `MSR` (Machine State Register):
+
+1. `PR` (Problem State)
+2. `HV` (Hypervisor State)
+
+| PR/HV | 0          | 1          |
+| ----- | ---------- | ---------- |
+| 0     | Privileged | Hypervisor |
+| 1     | User       | User       |
+
+Уровни привилегий выстроены следующим образом, с увеличением привилегий:
+
+1. User
+2. Privileged
+3. Hypervisor
+
+Как можно догадаться, User - режим пользователя, а вот остальное - это уже привилегированный режим. Причем Hypervisor можно отнести к уровню самой ОС.
+
+Когда возникает исключение, то оно обрабатывается соответствующим обработчиком. При этом, уровень привилегий повышается: `PR` всегда сбрасывается (то есть переход в привилегированный режим), а `HV` выставляется в зависимости от окружения.
+
+Теперь, приступим к отладке.
+
+### Программные точки останова
+
+Программные точки останова реализуются с помощью инструкции `td` - Trap Double Word. Она занимает 4 байта (это RISC) и при ее срабатывании генерируется прерывание Program interrupt.
+
+Ее особенность заключается в том, что она условная, то есть существует возможность добавить условие ее срабатывания. Ее сигнатура `td TO, RA, RB`. `RA` и `RB` - это номера регистров общего назначения (просто их числа), которые сравниваются, а `TO` - это битовая маска условия срабатывания (меньше, равно, больше и т.д.). Из примера документации: `td 0x2, 3, 4` - если регистр 3 (`R3`) больше (`0x2`) регистра 4 (`R4`), то будет сгенерирован Program interrupt.
+
+Также существует и другая версия этой инструкции - `tdi`, Trap Double Word Immediate. Отличие от `td` в том, что вместо регистра `RB` используется константное число (16 битное).
+
+> Для 32 битного режима используются инструкции `tw` и `twi` (Word вместо Double Word).
+
+Но `Program interrupt` может срабатывать и из-за других причин, например, при выполнении недопустимой инструкции (Illegal instruction). Для того, чтобы их различать используется регистр `MSR` (Machine Status Register). Диапазон 4-48 записан как зарезервированный, но на самом деле он используется для записи дополнительной информации при возникновении исключений. Для `Trap` исключения выставляется бит 46.
+
+Посмотрим как в Linux обрабатывается это исключение:
+
+<spoiler title="Program Interrupt">
+
+```c
+/* arch/powerpc/include/asm/reg.h */
+#define   SRR1_PROGTRAP		0x00020000 /* Trap */
+
+/* arch/powerpc/kernel/traps.c */
+DEFINE_INTERRUPT_HANDLER(program_check_exception)
+{
+	do_program_check(regs);
+}
+
+#define REASON_TRAP		SRR1_PROGTRAP
+
+static void do_program_check(struct pt_regs *regs)
+{
+	unsigned int reason = get_reason(regs);
+
+	if (reason & REASON_TRAP) {
+		/* ... */
+
+		/* User mode considers other cases after enabling IRQs */
+		if (!user_mode(regs)) {
+			_exception(SIGTRAP, regs, TRAP_BRKPT, regs->nip);
+			return;
+		}
+	}
+
+    /* ... */
+
+	if (reason & REASON_TRAP) {
+		/* ... */
+		_exception(SIGTRAP, regs, TRAP_BRKPT, regs->nip);
+		return;
+	}
+
+	/* ... */
+}
+
+void _exception(int signr, struct pt_regs *regs, int code, unsigned long addr)
+{
+    /* ... */
+	force_sig_fault(signr, code, (void __user *)addr);
+}
+
+/* kernel/signal.c */
+int force_sig_fault(int sig, int code, void __user *addr)
+{
+	return force_sig_fault_to_task(sig, code, addr, current);
+}
+
+int force_sig_fault_to_task(int sig, int code, void __user *addr,
+			    struct task_struct *t)
+{
+	struct kernel_siginfo info;
+
+	clear_siginfo(&info);
+	info.si_signo = sig;
+	info.si_errno = 0;
+	info.si_code  = code;
+	info.si_addr  = addr;
+	return force_sig_info_to_task(&info, t, HANDLER_CURRENT);
+}
+```
+
+> Если посмотрите на код, то можете заметить, что для маски `Trap` используется `0x00020000`. Но если выставить в 64 битном числе выставить 46 бит в 1, то будет не то же самое. Причина в том, что в документации все биты записываются с конца. Если мы выставим бит 18 (64 - 46), то получим указанное значение.
+
+</spoiler>
+
+### Шаги
+
+Реализация шагов аналогична предыдущим архитектурам. В регистре `MSR` имеется флаг `SE` - Single Step Trace Enable (бит 53). Если он выставлен, то при выполнении следующей инструкции будет сгенерирован `Trace interrupt`.
+
+<spoiler title="Trace interrupt">
+
+```c
+/* arch/powerpc/kernel/traps.c */
+DEFINE_INTERRUPT_HANDLER(single_step_exception)
+{
+	__single_step_exception(regs);
+}
+
+#define clear_single_step(regs)	(regs_set_return_msr((regs), (regs)->msr & ~MSR_SE))
+#define clear_br_trace(regs)	(regs_set_return_msr((regs), (regs)->msr & ~MSR_BE))
+
+static void __single_step_exception(struct pt_regs *regs)
+{
+	clear_single_step(regs);
+	clear_br_trace(regs);
+
+	/* ... */
+
+	_exception(SIGTRAP, regs, TRAP_TRACE, regs->nip);
+}
+```
+
+</spoiler>
+
+Также существует флаг `BE` - Branch Trace Enable. Он занимает бит 54 (рядом с `SE`). Если он выставлен, то Trap interrupt будет сгенерирован при выполнении очередной инструкции ветвления.
+
+### Аппаратные точки останова
+
+Наконец, аппаратные точки останова.
+
+Во-первых, они не обязательны и в реализации могут отсутствовать. Во-вторых, для инструкций и данных используется 2 разных регистра. Причина этого - гарвардская архитектура, инструкции и данные хранятся отдельно. В-третьих, поддерживается только 1 такая точка останова.
+
+Для данных используется регистр `DABR` - Data Address Breakpoint Register. Для PowerPC64 он имеет размер 64 бита. В нем имеется 3 флага и поле адреса. Адрес - 60 бит, то есть записываемые адреса необходимо выравнивать, а остальное - это флаги условий активации (чтение/запись).
+
+Здесь тоже есть отличие от предыдущих архитектур. Если ранее мы самостоятельно (в коде отладчика) выставляли эти регистры, то сейчас это делается с помощью вызова `ptrace`. Еще одна причина почему `ptrace` - это швейцарский нож, так потому что его функциональность может меняться в зависимости от машины. Если мы работаем на PowerPC и имеется расширение HWDEBUG (которое и добавляет аппаратные точки останова), то нам становятся доступны еще 3 запроса и один из них `PPC_PTRACE_SETHWDEBUG` - команда для выставления аппаратной точки останова.
+
+Соответственно, этот код располагается уже в самом ядре.
+
+<spoiler title="PPC_PTRACE_SETHWDEBUG">
+
+```c
+/* arch/powerpc/include/uapi/asm/ptrace.h */
+#define PPC_PTRACE_GETHWDBGINFO	0x89
+#define PPC_PTRACE_SETHWDEBUG	0x88
+#define PPC_PTRACE_DELHWDEBUG	0x87
+
+/* arch/powerpc/kernel/ptrace/ptrace.c */
+long arch_ptrace(struct task_struct *child, long request,
+		 unsigned long addr, unsigned long data)
+{
+	void __user *datavp = (void __user *) data;
+	unsigned long __user *datalp = datavp;
+
+	switch (request) {
+		/* ... */
+		case PPC_PTRACE_SETHWDEBUG: {
+			struct ppc_hw_breakpoint bp_info;
+
+			if (copy_from_user(&bp_info, datavp,
+					sizeof(struct ppc_hw_breakpoint)))
+				return -EFAULT;
+			return ppc_set_hwdebug(child, &bp_info);
+		}
+	}
+}
+
+/* arch/powerpc/kernel/ptrace/ptrace-noadv.c */
+long ppc_set_hwdebug(struct task_struct *child, struct ppc_hw_breakpoint *bp_info)
+{
+	int i;
+	int len = 0;
+	struct thread_struct *thread = &child->thread;
+	struct perf_event *bp;
+	struct perf_event_attr attr;
+	struct arch_hw_breakpoint brk;
+
+	if (bp_info->version != 1)
+		return -ENOTSUPP;
+	/*
+	 * We only support one data breakpoint
+	 */
+	if ((bp_info->trigger_type & PPC_BREAKPOINT_TRIGGER_RW) == 0 ||
+	    (bp_info->trigger_type & ~PPC_BREAKPOINT_TRIGGER_RW) != 0 ||
+	    bp_info->condition_mode != PPC_BREAKPOINT_CONDITION_NONE)
+		return -EINVAL;
+
+	if ((unsigned long)bp_info->addr >= TASK_SIZE)
+		return -EIO;
+
+	brk.address = ALIGN_DOWN(bp_info->addr, HW_BREAKPOINT_SIZE);
+	brk.type = HW_BRK_TYPE_TRANSLATE | HW_BRK_TYPE_PRIV_ALL;
+	brk.len = DABR_MAX_LEN;
+	brk.hw_len = DABR_MAX_LEN;
+	if (bp_info->trigger_type & PPC_BREAKPOINT_TRIGGER_READ)
+		brk.type |= HW_BRK_TYPE_READ;
+	if (bp_info->trigger_type & PPC_BREAKPOINT_TRIGGER_WRITE)
+		brk.type |= HW_BRK_TYPE_WRITE;
+	if (bp_info->addr_mode == PPC_BREAKPOINT_MODE_RANGE_INCLUSIVE)
+		len = bp_info->addr2 - bp_info->addr;
+	else if (bp_info->addr_mode == PPC_BREAKPOINT_MODE_EXACT)
+		len = 1;
+	else
+		return -EINVAL;
+
+	i = find_empty_ptrace_bp(thread);
+	if (i < 0)
+		return -ENOSPC;
+
+	/* Create a new breakpoint request if one doesn't exist already */
+	hw_breakpoint_init(&attr);
+	attr.bp_addr = (unsigned long)bp_info->addr;
+	attr.bp_len = len;
+	arch_bp_generic_fields(brk.type, &attr.bp_type);
+
+	bp = register_user_hw_breakpoint(&attr, ptrace_triggered, NULL, child);
+	thread->ptrace_bps[i] = bp;
+	if (IS_ERR(bp)) {
+		thread->ptrace_bps[i] = NULL;
+		return PTR_ERR(bp);
+	}
+
+	return i + 1;
+}
+
+/* arch/powerpc/kernel/process.c */
+static inline int set_dabr(struct arch_hw_breakpoint *brk)
+{
+	unsigned long dabr, dabrx;
+
+	dabr = brk->address | (brk->type & HW_BRK_TYPE_DABR);
+	dabrx = ((brk->type >> 3) & 0x7);
+
+	if (ppc_md.set_dabr)
+		return ppc_md.set_dabr(dabr, dabrx);
+
+	if (IS_ENABLED(CONFIG_PPC_ADV_DEBUG_REGS)) {
+		mtspr(SPRN_DAC1, dabr);
+		if (IS_ENABLED(CONFIG_PPC_47x))
+			isync();
+		return 0;
+	} else if (IS_ENABLED(CONFIG_PPC_BOOK3S)) {
+		mtspr(SPRN_DABR, dabr);
+		if (cpu_has_feature(CPU_FTR_DABRX))
+			mtspr(SPRN_DABRX, dabrx);
+		return 0;
+	} else {
+		return -EINVAL;
+	}
+}
+
+/* arch/powerpc/include/asm/reg.h */
+#define mtspr(rn, v)	asm volatile("mtspr " __stringify(rn) ",%0" : \
+				     : "r" ((unsigned long)(v)) \
+				     : "memory")
+```
+
+Замечания:
+
+1. Существует еще 1 регистр для точек останова - `DABRX`. В ней хранится маска привилегий. Но сейчас это не важно, поэтому опустил
+2. В конце находится сама функция, которая выставляет значения регистров. В ней используется функция `mtspr`. На самом деле это обертка над одноименной инструкцией. Она необходима для выставления значений регистров, зависящих от реализации. А так как `DABR` - это регистр добавляемый в расширении, то использовать необходимо его.
+3. Существует несколько версий архитектуры и для них используются разные способы выставления точки останова, поэтому имеются различные способы ее обработки.
+
+</spoiler>
+
+Но это точка останова для данных. Для инструкций используется другой регистр - `IABR` (Instruction Address Breakpoint Register). В ней по аналогии хранится адрес инструкции, такой же выровненный.
 
 ## Loong64
 
 ## Mips64
 
-## PowerPC
-
 ## s390
 
 ## Sparc64
 
-x86, ARM, RISC-V, SPARC-V, Байкал (????)
+TODO: попробовать MISC архитектуру
 
 # Среды разработки
 
 VS Code, CodeBlocks
 Как различные IDE взаимодействуют с отладчиками - м.б. есть общий протокол работы с ними
+
+# Где собака зарыта?
+
+- Не все так просто
+- Есть нишевые/частные проблемы
+- Надо о них знать
 
 # Прочее
 
