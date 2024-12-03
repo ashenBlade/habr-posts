@@ -5454,6 +5454,1091 @@ void Debug::Break(JavaScriptFrame* frame,
 
 Еще можно заметить, что в step into дополнительно обрабатываются генераторы, а точнее `yeild` стейтмент. Если мы до них доходим, то переходим в режим step out, так как нам нужно вернуть результат, а это возврат из функции.
 
+
+# Среды разработки
+
+Теперь мы знаем о том как взаимодействуют отлачики с программой, но сегодня большая часть действий выполняется через IDE. Но как это происходит? Не может же IDE fork/exec'аться, а затем через stdin/stdout посылать команды *интерактивному* отладчику. Давайте разберемся как же устроен этот последний слой: IDE <-> отладчик.
+
+## VS Code
+
+Начнем с Visual Studio Code.
+
+Чтобы понять, как реализована отладка в нем достаточно посмотреть на [страницу документации](https://code.visualstudio.com/api/extension-guides/debugger-extension) связаной с разработкой расширения отладки.
+
+VS Code это браузер и в качестве рантайма использует NodeJS. Как отлаживать последний мы уже рассмотрели, но ведь в нем мы можем отлаживать любую программу (и даже не программу). Почему так?
+
+Дело в том как устроен сам процесс отладки. Расширение, которое именуется отладчиком, на самом деле является прослойкой между IDE и настоящим отладчиком. А главная его задача - это обеспечение взаимодействия между IDE и отладчиком по понятному (в первую очередь IDE) протоколу. И протокол этот называется DAP - [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/overview).
+
+![Архитектура отладчиков VS Code](https://code.visualstudio.com/assets/api/extension-guides/debugger-extension/debug-arch1.png)
+
+DAP - это протокол, созданный Microsoft. Как понятно из названия, главная его задача - абстрагироваться от деталей языка и предоставить общий интерфейс взаимодействия с отладчиком (шаги, исследование переменных, точки останова и т.д.). Этот протокол не привязан к контретному IDE, но описание самого протокола дано в виде TypeScript объектов: `interface`, типизация, комментарии. Предполагаю, что сделано это из-за того, что протокол в первую очередь был создан для VS Code, но сейчас им пользуются и другие IDE, например, [NeoVIM](https://github.com/mfussenegger/nvim-dap). [На сайте](https://microsoft.github.io/debug-adapter-protocol/implementors/adapters/) можно найти более полный список известных адаптеров для различных IDE.
+
+Для взаимодействия между клиентом и адаптером используется простой текстовый протокол. Он похож на HTTP: сообщение состоит из заголовка и содержимого, которые разделяются CRLF, и все это в ASCII. Заголовок состоит из полей (таких же как в HTTP), но сейчас поддерживается только 1 - `Content-Length`. Содержимое же - это JSON объект запроса.
+
+Всего может быть 3 типа сообщений:
+
+1. Request - запрос, клиент -> адаптер
+2. Response - ответ, адаптер -> клиент
+3. Event - событие, адаптер -> клиент
+
+Первые 2 - синхронные, а 3 - асинхронный.
+
+Для различия этих объектов используется поле `type`: `request`, `response`, `event`. Также и у каждого типа есть свои обязательные поля. Например, для `request` - это `command`, название команды, которую мы запрашиваем. Ей еще передаются аргументы, но как понятно, они зависят от самой команды. А для `response` - флаг `success`, успешно или нет выполнилась команда.
+
+Мы уже видели, что многие события в отладчике происходят асинхронно. Аналогично это относится и к сообщениям в DAP. Чтобы решить некоторые проблемы связанные с асихронностью, каждое сообщение снабжается полем `seq`, числом монотонно инкреметирующимся с каждым сообщением. Благодаря этому такие сообщение можно идентифицировать и выстраивать их историю.
+
+Но голая теория мало что даст. Получилось так, что я уже работал с этим протоколом задолго до написания этой секции. Мне необходимо было разработать расширение VS Code для взаимодействия с отладчиком - [PostgreSQL Hacker Helper](https://github.com/ashenBlade/postgres-dev-helper). Если вкратце, то в PostgreSQL (ядре) существует своя система типов, основанная на C-style наследовании: первое поле хранит тип (тэг), а дальше структура приводится к типу соответствующему этому тэгу. В коде на макросах это реализуется довольно просто, так как название тэга (`enum`'а) составляется как `T_` + название структуры. Но в рантайме есть только числа, то есть мы не можем в окне выражений написать что-то по типу `(substr(nodeTag(node)) *)node`, это приходилось делать отдельными шагами. Все что я хотел сделать - автоматизировать эту рутину. И спойлер - у меня получилось.
+
+> Если кого заинтересовала тема типов в PostgreSQL, то ранее я писал статьи по исходному коду PostgreSQL (вот [в этой](https://habr.com/ru/articles/723668/) краткое их описание). Также у меня есть [доклад](https://rutube.ru/video/58b85572a9a6154cc5a8a2493e6a2e16/) на тему разработки PostgreSQL - в ней я рассказываю о разработке исходного кода и отладке.
+
+Если рассмотреть ядро логики расширения, то оно состоит из 4 простых шагов:
+
+1. Получаем переменную - `(Node *)variable`
+2. Получаем ее тэг - `((Node *)variable)->type = T_SampleStruct`
+3. Убираем префикс `T_` - `T_SampleStruct = struct SampleStruct`
+4. Приводим переменную к нужному типу - `((SampleStruct *)variable)`
+
+Это простая логика, но дьявол кроется в деталях. Во-первых, как нам получить первые переменные (не поля уже известных переменных)? Это решается за счет 3 дополнительных вызовов: `threads`, `stackTrace` и `scopes` - получение информации о всех потоках, фреймы нужного потока и информация о scope'ах нужного фрейма соответственно. Последнее, scope - это какой-то именованный набор переменных. В моем случае, их было 2: `locals` (локальные переменные) и `registers` (регистры).
+Во-вторых, как нам обращаться к ресурсам (указывать на конктреные переменные, потоки, фреймы и т.д.)?  Для этого имеются специальные идентификаторы. У них всех имеется суффикс `reference`. Например, `variablesReference` - это ID набора переменных (см. ранее). И этот `variablesReference` краеугольный камень моей логики, так как благодаря нему я и получаю информацию о переменных и полях: он передается в `scopes` (ответе), а также каждая переменная ее имеет (в этом случае, полученные переменные считаются либо полями структуры, либо элементами массива).
+
+Теперь переведем это все на язык DAP:
+
+1. `threads` - находим нужный нам поток
+2. `stackTrace` - находим нужный нам фрейм
+3. `scopes` - получаем `variablesReference` области переменных
+4. `getVariables` - получаем все переменные по `variablesReference`
+5. `evaluate` - вычисляю значение тэга узла с помощью выражения `((Node *)variable)->type` и нахожу настоящий тип структуры
+6. `evaluate` - получаю `variablesReference` уже приведенного типа `((RealType *)variable)`
+
+Повторяем 4 шаг уже с новым `variablesReference` пока не будем получать пустой ответ. И да, как вы могли догадаться `evaluate` - это вызов, с помощью которого можно динамически вычислять выражения, и он также возвращает `variablesReference`.
+
+И здесь стоит сказать о третьей детали - DAP описывает протокол, но он не формат возвращаемых данных. В моем случае, это означает что я жестко привязан к конкретному адаптеру так как моя логика завязана на парсинг его ответов. К примеру, чтобы понять, что `getVariables` вернул простую структуру я проверяю не только тип (поле `type`), но и значение (поле `value`), так как для переменных значение равно `{...}`, а вот для поля (с типом структуры, не указатель) он возвращает пустую строку. Это отладчик [C/C++](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools), но когда я попробовал использовать расширение [CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb), то к моему удивлению значения практически всех полей были отформатированы по другому и не были совместимы с моей логикой. В частности, структуры в поле значения форматировались полностью со всеми полями.
+
+## GDB/MI
+
+TODO: "всего-лишь прослойка" - это не прослойка, надо по другому
+
+Ранее я уже сказал, что использовал расширение C/C++. Это всего-лишь DAP прослойка между настоящим отладчиком и VS Code. В качестве настоящего отладчика используется gdb. Если редактировали файл `launch.json`, то могли видеть такое поле как `miMode`. mi в данном случае - это сокращение Machine Interface.
+
+[gdb mi](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI.html) (gdb Machine Interface) - текстовый интерфейс для взаимодействия с gdb. Его можно активировать запустив gdb с флагом `--interpreter` и предназначен для окружений, где отладчик является частью большой системы, такой как IDE. На данный момент, существует 4 версии этого протокола.
+
+Сам протокол сильно похож на стандартный протокол/алгоритм отладчика. Имеем команды, ответы и уведомления. Ответ присылаются при отправке команды, а уведомления приходят асинхронно. Из интересного - совместимость с командами интерактивного режима. Она есть, но оговаривается, что поведение может быть непредсказуемым. Чтобы использовать их без проблем есть отдельная команда (mi) - `-interperter-exec`.
+
+На странице документации есть примеры взаимодействия с gdb mi. Например, таким образом выставляется точка останова:
+
+```text
+-break-insert main
+
+^done,bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x000000000000114c",func="main",file="main.c",fullname="/path/to/file/main.c",line="9",thread-groups=["i1"],times="0",original-location="main"}
+```
+
+Сразу можно заметить, что у названий команд в начале идет тире, а затем список их аргументов. Но давайте посмотрим на другую строку.
+
+Как можно понять, это ответ. На [этой странице](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Output-Syntax.html#GDB_002fMI-Output-Syntax) приводится синтаксис вывода (output), но мне кажется приводить его здесь лишнее, поэтому просто опишу в общем и приведу примеры. Вывод может быть 2 видов: результат (Result) и асинхронные (Async). На примере выше мы видели результат. Он начинается с циркумфлекса и типа ответа. На этом же примере, тип - завершение синхронной операции. После идет результат операции. Опять же, здесь это [информация о точке останова](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI-Breakpoint-Information.html#GDB_002fMI-Breakpoint-Information). Кроме `done` есть еще 4 типа ответа, но они не такие частые: запуск/остановка отладчика и ошибка.
+
+И последнее - уведомления. Уведомления разделяеются на 3 категории: уведомения выполнения (изменение в состоянии), статусные и общие уведомения. Также как и у результата, в начале идет специальный символ идентифицирующих их тип. Например, мы продолжили выполнение и наткнулись на точку останова:
+
+```text
+^running
+*running,thread-id="all"
+(gdb) 
+=breakpoint-modified,bkpt={number="2",type="breakpoint",disp="keep",enabled="y",addr="0x0000555555555153",func="main",file="main.c",fullname="/path/to/file/main.c",line="10",thread-groups=["i1"],times="1",original-location="main.c:10"}
+~"\n"
+~"Breakpoint 2, main () at main.c:10\n"
+~"10\t  printf(\"%d\\n\", value);\n"
+*stopped,reason="breakpoint-hit",disp="keep",bkptno="2",frame={addr="0x0000555555555153",func="main",args=[],file="main.c",fullname="/path/to/file/main.c",line="10",arch="i386:x86-64"},thread-id="1",stopped-threads="all",core="3"
+```
+
+Здесь можно заметить все 2 типа этих уведомлений:
+
+- `*` - изменение состояния выполняемого процесса
+- `=` - статусное уведомление
+
+Также есть `~`. Некоторые команды могут в ответе отправлять какой-либо текст. Если так, то для его отправки используется такой тип уведомления.
+
+## MIEngine
+
+В VS Code я использую расширение C/C++ для разработки и мое расшрение использует его как DAP адаптер. Но если посмотреть вглубь, то окажется, что C/C++ расширение не само реализует DAP. Она использует [MIEngine](https://github.com/Microsoft/MIEngine) - движок отладки  Visual Studio, который умеет "говорить" на языке MI (того самого как у gdb). Но это еще не все: последняя деталь  - OpenDebugAD7, адаптер для DAP (его код в том же проекте, что и MIEngine). На этой схеме показано взаимодействие между этими частями:
+
+![Архитектура отладки C/C++ в VS Code](https://raw.githubusercontent.com/wiki/microsoft/MIEngine/images/architecture.png)
+
+> AD7 - Active Debugging 7, фреймворк для создания отладчиков в Visual Studio
+
+Для большей наглядности будем рассматривать путь запроса от пользователя до MIEngine и обратно, то есть включая действия OpenDebugAD7 и отправляемые в gdb команды. И начнем с запуска отладки.
+
+За запуск отладки отвечает либо `launch`, либо `attach`. Я рассмотрю первый вариант.
+
+Отладка произодвдится сессиями. Такую сессию отладки представляет класс `AD7DebugSession`. Он содержит в себе все методы, соответствующие запросам из DAP. Таким образом, за обработку `launch` запроса отвечает метод `HandleLaunchRequestAsync`. Но по факту, все что он делает - перенаправляет запросы другому объекту, движку MI. Это интейфейс `IDebugEngineLaunch2`, который реализует `AD7Engine`.
+
+<spoiler title="Запуск процесса для отладки">
+
+```cs
+/* src/OpenDebugAD7/AD7DebugSession.cs */
+internal sealed class AD7DebugSession
+{
+    private IDebugEngineLaunch2 m_engineLaunch;
+    protected override void HandleLaunchRequestAsync(IRequestResponder<LaunchArguments> responder)
+    {
+        /* ... */
+        hr = m_engineLaunch.LaunchSuspended(null,
+            m_port,
+            program,
+            null,
+            null,
+            null,
+            launchJson,
+            flags,
+            0,
+            0,
+            0,
+            this,
+            out m_process);
+
+        hr = m_engineLaunch.ResumeProcess(m_process);
+        /* ... */
+    }
+    /* ... */
+}
+
+/* src/MIDebugEngine/AD7.Impl/AD7Engine.cs */
+sealed public class AE7Engine
+{
+    int IDebugEngineLaunch2.LaunchSuspended(string pszServer, IDebugPort2 port, string exe, string args, string dir, string env, string options, enum_LAUNCH_FLAGS launchFlags, uint hStdInput, uint hStdOutput, uint hStdError, IDebugEventCallback2 ad7Callback, out IDebugProcess2 process)
+    {
+        /* ... */
+        StartDebugging(launchOptions);
+        /* ... */
+    }
+
+    private void StartDebugging(LaunchOptions launchOptions)
+    {
+        /* ... */
+        _pollThread = new WorkerThread(Logger);
+        var cancellationTokenSource = new CancellationTokenSource();
+
+        using (cancellationTokenSource)
+        {
+            _pollThread.RunOperation(ResourceStrings.InitializingDebugger, cancellationTokenSource, (HostWaitLoop waitLoop) =>
+            {
+                    _debuggedProcess = new DebuggedProcess(true, launchOptions, _engineCallback, _pollThread, _breakpointManager, this, _configStore, waitLoop);
+
+                return _debuggedProcess.Initialize(waitLoop, cancellationTokenSource.Token);
+            });
+        }
+        /* ... */
+    }
+}
+
+/* src/MIDebugEngine/Engine.Impl/DebuggedProcess.cs */
+internal class DebuggedProcess : MICore.Debugger
+{
+    public async Task Initialize(HostWaitLoop waitLoop, CancellationToken token)
+    {
+        /* ... */
+        List<LaunchCommand> commands = await GetInitializeCommands();
+        _childProcessHandler?.Enable();
+
+        total = commands.Count;
+        var i = 0;
+        foreach (var command in commands)
+        {
+            token.ThrowIfCancellationRequested();
+            waitLoop.SetProgress(total, i++, command.Description);
+            if (command.IsMICommand)
+            {
+                Results results = await CmdAsync(command.CommandText, ResultClass.None);
+            }
+            else
+            {
+                string resultString = await ConsoleCmdAsync(command.CommandText, allowWhileRunning: false, ignoreFailures: command.IgnoreFailures);
+            }
+        }
+        /* ... */
+    }
+}
+```
+
+</spoiler>
+
+Как можем видеть по этой цепочке вызовов - мы запускаем отладчик, инициализируем его и запускаем программу. Но где же сами MI команды? Да, я их пропустил, но намеренно, чтобы сконцетрироваться на логике, а сейчас посмотрим на то, как их отправляют. Первый пример - это команды инициализации, те что были в методе `Initialize`. Они создаются в методе `GetInitializeCommands`.
+
+<spoiler title="GetInitializeCommands">
+
+```cs
+internal class DebuggedProcess : MIcore.Debugger
+{
+    private async Task<List<LaunchCommand>> GetInitializeCommands()
+    {
+        List<LaunchCommand> commands = new List<LaunchCommand>();
+
+        commands.AddRange(_launchOptions.SetupCommands);
+
+        if (_launchOptions.DebuggerMIMode == MIMode.Gdb)
+        {
+            commands.Add(new LaunchCommand("-interpreter-exec console \"set pagination off\""));
+        }
+
+        // When user specifies loading directives then the debugger cannot auto load symbols, the MIEngine must intervene at each solib-load event and make a determination
+        commands.Add(new LaunchCommand("-gdb-set auto-solib-add " + (_launchOptions.CanAutoLoadSymbols() ? "on" : "off")));
+
+        // If the absolute prefix so path has not been specified, then don't set it to null
+        // because the debugger might already have a default.
+        if (!string.IsNullOrEmpty(_launchOptions.AbsolutePrefixSOLibSearchPath))
+        {
+            commands.Add(new LaunchCommand("-gdb-set solib-absolute-prefix " + _launchOptions.AbsolutePrefixSOLibSearchPath));
+        }
+
+        // On Windows ';' appears to correctly works as a path seperator and from the documentation, it is ':' on unix or cygwin envrionments
+        string pathEntrySeperator = (_launchOptions.UseUnixSymbolPaths || IsCygwin) ? ":" : ";";
+        string escapedSearchPath = string.Join(pathEntrySeperator, _launchOptions.GetSOLibSearchPath().Select(path => {
+            return EnsureProperPathSeparators(path, ignoreSpaces: true);
+        }));
+        if (!string.IsNullOrWhiteSpace(escapedSearchPath))
+        {
+            if (_launchOptions.DebuggerMIMode == MIMode.Gdb)
+            {
+                // Do not place quotes around so paths for gdb
+                commands.Add(new LaunchCommand("-gdb-set solib-search-path " + escapedSearchPath + pathEntrySeperator, ResourceStrings.SettingSymbolSearchPath));
+            }
+            else
+            {
+                // surround so lib path with quotes in other cases
+                commands.Add(new LaunchCommand("-gdb-set solib-search-path \"" + escapedSearchPath + pathEntrySeperator + "\"", ResourceStrings.SettingSymbolSearchPath));
+            }
+        }
+
+        if (this.MICommandFactory.SupportsStopOnDynamicLibLoad())
+        {
+            // Do not stop on shared library load/unload events while debugging core dump.
+            // Also check _needTerminalReset because we need to work around a GDB bug and clear the terminal error message. 
+            // This clear operation can't be done too early (because GDB only generate this message after start debugging) 
+            // or too late (otherwise we might clear debuggee's output). 
+            // The stop cause by first module load seems to be the perfect timing to clear the terminal, 
+            // that's why we still need to initially turn stop-on-solib-events on then turn it off after the first stop.
+            if ((_needTerminalReset || _launchOptions.WaitDynamicLibLoad) && !this.IsCoreDump)
+            {
+                commands.Add(new LaunchCommand("-gdb-set stop-on-solib-events 1"));
+            }
+        }
+
+        if (MICommandFactory.SupportsChildProcessDebugging())
+        {
+            if (_launchOptions.DebugChildProcesses)
+            {
+                _childProcessHandler = new DebugUnixChild(this, this._launchOptions);  // TODO: let the user enable/disable this functionality
+            }
+        }
+
+        // Custom launch options replace the built in launch steps. This is used on iOS
+        // and Linux attach scenarios.
+        if (_launchOptions.CustomLaunchSetupCommands != null)
+        {
+            commands.AddRange(_launchOptions.CustomLaunchSetupCommands);
+
+            SetTargetArch(_launchOptions.TargetArchitecture);
+        }
+        else
+        {
+            LocalLaunchOptions localLaunchOptions = _launchOptions as LocalLaunchOptions;
+            if (this.IsCoreDump)
+            {
+                // Load executable and core dump
+                this.AddExecutableAndCorePathCommand(commands);
+
+                // Important: this must occur after executable load but before anything else.
+                this.AddGetTargetArchitectureCommand(commands);
+            }
+            else if (_launchOptions.ProcessId.HasValue)
+            {
+                // This is an attach
+
+                if (this.MICommandFactory.Mode == MIMode.Gdb)
+                {
+                    if (_launchOptions is UnixShellPortLaunchOptions)
+                    {
+                        // This code path is probably applicable when the ExePath is not specified and can be used to determine the full executable path.
+                        // For now it is limited to Linux and debugger running on remote machine.
+                        Debug.Assert(_launchOptions.ExePath == null);
+
+                        DetermineAndAddExecutablePathCommand(commands, _launchOptions as UnixShellPortLaunchOptions);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(_launchOptions.ExePath))
+                    {
+                        this.AddExecutablePathCommand(commands);
+                    }
+                }
+
+                // Important: this must occur after file-exec-and-symbols but before anything else.
+                this.AddGetTargetArchitectureCommand(commands);
+
+                // check for remote
+                string destination = localLaunchOptions?.MIDebuggerServerAddress;
+                bool useExtendedRemote = localLaunchOptions?.UseExtendedRemote ?? false;
+                if (!string.IsNullOrWhiteSpace(destination))
+                {
+                    string remoteMode = useExtendedRemote ? "extended-remote" : "remote";
+                    commands.Add(new LaunchCommand($"-target-select {remoteMode} {destination}", string.Format(CultureInfo.CurrentCulture, ResourceStrings.ConnectingMessage, destination)));
+                }
+                // Allow attach after connection only in extended-remote mode
+                if (useExtendedRemote || (!useExtendedRemote && string.IsNullOrWhiteSpace(destination)))
+                {
+                    Action<string> failureHandler = (string miError) =>
+                    {
+                        if (miError.Trim().StartsWith("ptrace:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string message = string.Format(CultureInfo.CurrentCulture, ResourceStrings.Error_PTraceFailure, _launchOptions.ProcessId, MICommandFactory.Name, miError);
+                            throw new LaunchErrorException(message);
+                        }
+                        else
+                        {
+                            string message = string.Format(CultureInfo.CurrentCulture, ResourceStrings.Error_ExePathInvalid, _launchOptions.ExePath, MICommandFactory.Name, miError);
+                            throw new LaunchErrorException(message);
+                        }
+                    };
+
+                    commands.Add(new LaunchCommand("-target-attach " + _launchOptions.ProcessId.Value.ToString(CultureInfo.InvariantCulture), ignoreFailures: false, failureHandler: failureHandler));
+                }
+
+                if (_launchOptions.PostRemoteConnectCommands != null) 
+                {
+                    commands.AddRange(_launchOptions.PostRemoteConnectCommands);
+                }
+
+
+                if (this.MICommandFactory.Mode == MIMode.Lldb)
+                {
+                    // LLDB finishes attach in break mode. Gdb does finishes in run mode. Issue a continue in lldb to match the gdb behavior
+                    commands.Add(new LaunchCommand("-exec-continue", ignoreFailures: false));
+                }
+
+                return commands;
+            }
+            else
+            {
+                // The default launch is to start a new process
+
+                if (!string.IsNullOrWhiteSpace(_launchOptions.WorkingDirectory))
+                {
+                    string escapedDir = this.EnsureProperPathSeparators(_launchOptions.WorkingDirectory, true);
+
+                    commands.Add(new LaunchCommand("-environment-cd " + escapedDir));
+                }
+
+                // TODO: The last clause for LLDB may need to be changed when we support LLDB on Linux as LLDB's tty redirection doesn't work.
+                if (localLaunchOptions != null &&
+                    localLaunchOptions.UseExternalConsole &&
+                    (PlatformUtilities.IsWindows() ||
+                        (PlatformUtilities.IsOSX() && this.MICommandFactory.Mode == MIMode.Lldb)))
+                {
+                    commands.Add(new LaunchCommand("-gdb-set new-console on", ignoreFailures: true));
+                }
+
+                this.AddExecutablePathCommand(commands);
+
+                // Important: this must occur after file-exec-and-symbols but before anything else.
+                this.AddGetTargetArchitectureCommand(commands);
+
+                // LLDB requires -exec-arguments after -file-exec-and-symbols has been run, or else it errors
+                if (!string.IsNullOrWhiteSpace(_launchOptions.ExeArguments))
+                {
+                    commands.Add(new LaunchCommand("-exec-arguments " + _launchOptions.ExeArguments));
+                }
+
+                Func<Results, Task> breakMainSuccessResultsHandler = (Results bkptResult) =>
+                {
+                    if (bkptResult.Contains("bkpt"))
+                    {
+                        ResultValue b = bkptResult.Find("bkpt");
+                        TupleValue bkpt = null;
+                        if (b is TupleValue)
+                        {
+                            bkpt = b as TupleValue;
+                        }
+                        else if (b is ValueListValue) // Used when main breakpoint binds in more than one location
+                        {
+                            // Grab the first one as this is usually the <MULTIPLE> one that we can unbind them all with.
+                            // This is usually "1" when the children manifest as "1.1", "1.2", etc
+                            bkpt = (b as ValueListValue).Content[0] as TupleValue;
+                        }
+
+                        if (bkpt != null)
+                        {
+                            this._entryPointBreakpoint = bkpt.FindString("number");
+                            this._deleteEntryPointBreakpoint = true;
+                        }
+                    }
+                    return Task.FromResult(0);
+                };
+
+                // Builds '-break-insert' for 'main'.
+                StringBuilder breakInsertCommand = await this.MICommandFactory.BuildEntryBreakInsert();
+                breakInsertCommand.Append("main");
+
+                commands.Add(new LaunchCommand(breakInsertCommand.ToString(), ignoreFailures: true, successResultsHandler: breakMainSuccessResultsHandler));
+
+                if (null != localLaunchOptions)
+                {
+                    string destination = localLaunchOptions.MIDebuggerServerAddress;
+                    if (!string.IsNullOrWhiteSpace(destination))
+                    {
+                        string remoteMode = localLaunchOptions.UseExtendedRemote ? "extended-remote" : "remote";
+                        commands.Add(new LaunchCommand($"-target-select {remoteMode} {destination}", string.Format(CultureInfo.CurrentCulture, ResourceStrings.ConnectingMessage, destination)));
+                        if (localLaunchOptions.RequireHardwareBreakpoints && localLaunchOptions.HardwareBreakpointLimit > 0) {
+                            commands.Add(new LaunchCommand(string.Format(CultureInfo.InvariantCulture, "-interpreter-exec console \"set remote hardware-breakpoint-limit {0}\"", localLaunchOptions.HardwareBreakpointLimit.ToString(CultureInfo.InvariantCulture))));
+                        }
+                    }
+
+                }
+
+                if (_launchOptions.PostRemoteConnectCommands != null) 
+                {
+                    commands.AddRange(_launchOptions.PostRemoteConnectCommands);
+                }
+
+                // Environment variables are set for the debuggee only with the modes that support that
+                foreach (EnvironmentEntry envEntry in _launchOptions.Environment)
+                {
+                    commands.Add(new LaunchCommand(MICommandFactory.GetSetEnvironmentVariableCommand(envEntry.Name, envEntry.Value)));
+                }
+            }
+        }
+
+        return commands;
+    }
+}
+```
+
+</spoiler>
+
+Как можете заметить, во-первых, оперируем простыми, иногда интерполированными параметрами, строками (это ведь текстовый протокол), и, во-вторых, больше количество кода используется для кроссплатформенности: речь не только об ОС (Windows, Cygwin, Linux ...), но и отладчике (gdb, lldb ...).
+
+Теперь, посмотрим, как эти самые команды отправляются в сам отладчик. Для отправки данных на отладчик используется абстракция `ITransport` и зачем она нужна ставится понятно, если понять, что отладчик может находится не на нашем ПК, а где нибудь на сервере и взаимодействовать с ним нужно через сеть. Поэтому и реализаций этого транспорта несколько: pipe, tcp, shell, stream, local. Если мы хотим запустить локальный gdb, то будем использовать `LocalTransport` - он настраивает окружение, находим файл конфигурации (`.gdbinit`) и запускает сам `gdb`, а далее, для взаимодействия с ним используются абстракции C\# - `StreamReader` и `StreamWriter` (можно сказать, простые дескрипторы stdin/stdout).
+
+Вот мы выполнили свою работу - теперь нужно ответить клиенту DAP. Для реализации DAP используется собственный фреймворк и в самом его ядре находится класс `DebugProtocol`. Он содержит основную логику: последний `seq`, заголовок ответа, поток ввода/вывода (для взаимодействия), сериализация и т.д. Клиенту просто необходимо реализовать бизнес-логику, то есть взаимодействие с отладчиком. За ответ отвечает метод `SendMessageCore` - в нем находится практически вся необходимая инфраструктурная логика: увеличение `seq`, сериализация, выставление заголовка:
+
+<spoiler title="SendMessageCore">
+
+Это дизассемблированные исходники
+
+```cs
+public abstract class DebugProtocol
+{
+    internal void SendMessageCore(ProtocolMessage message)
+    {
+        if (message.Seq == 0)
+        {
+            message.Seq = GetNextSequenceNumber();
+        }
+
+        TraceMessage(message, null, isSend: true);
+        string s = JsonConvert.SerializeObject(message, jsonSettings);
+        byte[] bytes = ProtocolEncoding.GetBytes(s);
+        string s2 = "Content-Length: {0}\r\n\r\n".FormatInvariantWithArgs(bytes.Length);
+        byte[] bytes2 = ProtocolEncoding.GetBytes(s2);
+        byte[] array = new byte[bytes2.Length + bytes.Length];
+        Buffer.BlockCopy(bytes2, 0, array, 0, bytes2.Length);
+        Buffer.BlockCopy(bytes, 0, array, bytes2.Length, bytes.Length);
+        lock (outgoingSyncObj)
+        {
+            outgoingQueue.Enqueue(array);
+            if (!isSendingMessages)
+            {
+                isSendingMessages = true;
+                messagesPendingEvent.Reset();
+                Task.Run(delegate
+                {
+                    SendQueuedMessages();
+                });
+            }
+        }
+    }
+}
+```
+
+</spoiler>
+
+Подобная обощенная машинерия используется и для вызова соответствующего обработчика запроса на основании переданной команды. Но располагается она в классе `DebugAdapterBase`:
+
+<spoiler title="Вызов соответствующего обработчика">
+
+```cs
+public abstract class DebugAdapterBase
+{
+    protected virtual ResponseBody HandleProtocolRequest(string requestType, object requestArgs)
+    {
+        return requestType switch
+        {
+            "addBreakpoint" => HandleAddBreakpointRequest((AddBreakpointArguments)requestArgs),
+            "addFavorite" => HandleAddFavoriteRequest((AddFavoriteArguments)requestArgs),
+            "attach" => HandleAttachRequest((AttachArguments)requestArgs),
+            "breakpointLocations" => HandleBreakpointLocationsRequest((BreakpointLocationsArguments)requestArgs),
+            "cancel" => HandleCancelRequest((CancelArguments)requestArgs),
+            "completions" => HandleCompletionsRequest((CompletionsArguments)requestArgs),
+            "configurationDone" => HandleConfigurationDoneRequest((ConfigurationDoneArguments)requestArgs),
+            "continue" => HandleContinueRequest((ContinueArguments)requestArgs),
+            "createObjectId" => HandleCreateObjectIdRequest((CreateObjectIdArguments)requestArgs),
+            "dataBreakpointInfo" => HandleDataBreakpointInfoRequest((DataBreakpointInfoArguments)requestArgs),
+            "destroyObjectId" => HandleDestroyObjectIdRequest((DestroyObjectIdArguments)requestArgs),
+            "disassemble" => HandleDisassembleRequest((DisassembleArguments)requestArgs),
+            "disconnect" => HandleDisconnectRequest((DisconnectArguments)requestArgs),
+            "evaluate" => HandleEvaluateRequest((EvaluateArguments)requestArgs),
+            "exceptionInfo" => HandleExceptionInfoRequest((ExceptionInfoArguments)requestArgs),
+            "exceptionStackTrace" => HandleExceptionStackTraceRequest((ExceptionStackTraceArguments)requestArgs),
+            "goto" => HandleGotoRequest((GotoArguments)requestArgs),
+            "gotoTargets" => HandleGotoTargetsRequest((GotoTargetsArguments)requestArgs),
+            "initialize" => HandleInitializeRequest((InitializeArguments)requestArgs),
+            "launch" => HandleLaunchRequest((LaunchArguments)requestArgs),
+            "loadedSources" => HandleLoadedSourcesRequest((LoadedSourcesArguments)requestArgs),
+            "loadSymbols" => HandleLoadSymbolsRequest((LoadSymbolsArguments)requestArgs),
+            "modules" => HandleModulesRequest((ModulesArguments)requestArgs),
+            "moduleSymbolSearchLog" => HandleModuleSymbolSearchLogRequest((ModuleSymbolSearchLogArguments)requestArgs),
+            "next" => HandleNextRequest((NextArguments)requestArgs),
+            "pause" => HandlePauseRequest((PauseArguments)requestArgs),
+            "readMemory" => HandleReadMemoryRequest((ReadMemoryArguments)requestArgs),
+            "removeBreakpoint" => HandleRemoveBreakpointRequest((RemoveBreakpointArguments)requestArgs),
+            "removeFavorite" => HandleRemoveFavoriteRequest((RemoveFavoriteArguments)requestArgs),
+            "restartFrame" => HandleRestartFrameRequest((RestartFrameArguments)requestArgs),
+            "restart" => HandleRestartRequest((RestartArguments)requestArgs),
+            "reverseContinue" => HandleReverseContinueRequest((ReverseContinueArguments)requestArgs),
+            "scopes" => HandleScopesRequest((ScopesArguments)requestArgs),
+            "setBreakpoints" => HandleSetBreakpointsRequest((SetBreakpointsArguments)requestArgs),
+            "setDataBreakpoints" => HandleSetDataBreakpointsRequest((SetDataBreakpointsArguments)requestArgs),
+            "setDebuggerProperty" => HandleSetDebuggerPropertyRequest((SetDebuggerPropertyArguments)requestArgs),
+            "setExceptionBreakpoints" => HandleSetExceptionBreakpointsRequest((SetExceptionBreakpointsArguments)requestArgs),
+            "setExpression" => HandleSetExpressionRequest((SetExpressionArguments)requestArgs),
+            "setFunctionBreakpoints" => HandleSetFunctionBreakpointsRequest((SetFunctionBreakpointsArguments)requestArgs),
+            "setHitCount" => HandleSetHitCountRequest((SetHitCountArguments)requestArgs),
+            "setInstructionBreakpoints" => HandleSetInstructionBreakpointsRequest((SetInstructionBreakpointsArguments)requestArgs),
+            "setSymbolOptions" => HandleSetSymbolOptionsRequest((SetSymbolOptionsArguments)requestArgs),
+            "setVariable" => HandleSetVariableRequest((SetVariableArguments)requestArgs),
+            "source" => HandleSourceRequest((SourceArguments)requestArgs),
+            "stackTrace" => HandleStackTraceRequest((StackTraceArguments)requestArgs),
+            "stepBack" => HandleStepBackRequest((StepBackArguments)requestArgs),
+            "stepIn" => HandleStepInRequest((StepInArguments)requestArgs),
+            "stepInTargets" => HandleStepInTargetsRequest((StepInTargetsArguments)requestArgs),
+            "stepOut" => HandleStepOutRequest((StepOutArguments)requestArgs),
+            "terminate" => HandleTerminateRequest((TerminateArguments)requestArgs),
+            "terminateThreads" => HandleTerminateThreadsRequest((TerminateThreadsArguments)requestArgs),
+            "threads" => HandleThreadsRequest((ThreadsArguments)requestArgs),
+            "updateBreakpoint" => HandleUpdateBreakpointRequest((UpdateBreakpointArguments)requestArgs),
+            "variables" => HandleVariablesRequest((VariablesArguments)requestArgs),
+            "vsCustomMessage" => HandleVsCustomMessageRequest((VsCustomMessageArguments)requestArgs),
+            "writeMemory" => HandleWriteMemoryRequest((WriteMemoryArguments)requestArgs),
+            _ => throw new InvalidOperationException("Unknown request type '{0}'!".FormatInvariantWithArgs(requestType)),
+        };
+    }
+}
+```
+
+</spoiler>
+
+Таким образом, можно сказать, что инфраструктурная часть реализуется с помощью паттерна Шаблонный метод.
+
+Теперь перейдем к точкам останова. В DAP они разделяются на 3 вида: function (на входе в функцию), data (точки останова на данные, watchpoint) и обычные. Я рассмотрю самые обычные точки останова. За них отвечает метод `HandleSetBreakpointsRequestAsync` и запрос `setBreakpoints` в DAP.
+
+Здесь адаптер выступает в роли кэша - он запоминает какие точки останова уже были выставлены и при необходимости добавляет или удаляет.
+
+<spoiler title="HandleSetBreakpointsRequestAsync">
+
+```cs
+internal sealed class AD7DebugSession
+{
+    protected override void HandleSetBreakpointsRequestAsync(IRequestResponder<SetBreakpointsArguments, SetBreakpointsResponse> responder)
+    {
+        string path = null;
+        string name = null;
+
+        if (responder.Arguments.Source != null)
+        {
+            string p = responder.Arguments.Source.Path;
+            if (p != null && p.Trim().Length > 0)
+            {
+                path = p;
+            }
+            string nm = responder.Arguments.Source.Name;
+            if (nm != null && nm.Trim().Length > 0)
+            {
+                name = nm;
+            }
+        }
+
+        var source = new Source()
+        {
+            Name = name,
+            Path = path,
+            SourceReference = 0
+        };
+
+        List<SourceBreakpoint> breakpoints = responder.Arguments.Breakpoints;
+
+        bool sourceModified = responder.Arguments.SourceModified.GetValueOrDefault(false);
+
+        string convertedPath = m_pathConverter.ConvertClientPathToDebugger(source.Path);
+
+        HashSet<int> lines = new HashSet<int>(breakpoints.Select((b) => b.Line));
+
+        Dictionary<int, IDebugPendingBreakpoint2> dict = null;
+        if (m_breakpoints.ContainsKey(convertedPath))
+        {
+            dict = m_breakpoints[convertedPath];
+            var keys = new int[dict.Keys.Count];
+            dict.Keys.CopyTo(keys, 0);
+            foreach (var l in keys)
+            {
+                // Delete all breakpoints that are no longer listed.
+                // In the case of modified source, delete everything.
+                if (!lines.Contains(l) || sourceModified)
+                {
+                    var bp = dict[l];
+                    bp.Delete();
+                    dict.Remove(l);
+                }
+            }
+        }
+        else
+        {
+            dict = new Dictionary<int, IDebugPendingBreakpoint2>();
+            m_breakpoints[convertedPath] = dict;
+        }
+
+        foreach (var bp in breakpoints)
+        {
+            if (dict.ContainsKey(bp.Line))
+            {
+                // already created
+                IDebugBreakpointRequest2 breakpointRequest;
+                if (dict[bp.Line].GetBreakpointRequest(out breakpointRequest) == 0 &&
+                    breakpointRequest is AD7BreakPointRequest ad7BPRequest)
+                {
+                    // Check to see if this breakpoint has a condition that has changed.
+                    if (!StringComparer.Ordinal.Equals(ad7BPRequest.Condition, bp.Condition))
+                    {
+                        // Condition has been modified. Delete breakpoint so it will be recreated with the updated condition.
+                        var toRemove = dict[bp.Line];
+                        toRemove.Delete();
+                        dict.Remove(bp.Line);
+                    }
+                    // Check to see if tracepoint changed
+                    else if (!StringComparer.Ordinal.Equals(ad7BPRequest.LogMessage, bp.LogMessage))
+                    {
+                        ad7BPRequest.ClearTracepoint();
+                        var toRemove = dict[bp.Line];
+                        toRemove.Delete();
+                        dict.Remove(bp.Line);
+                    }
+                    else
+                    {
+                        if (ad7BPRequest.BindResult != null)
+                        {
+                            // use the breakpoint created from IDebugBreakpointErrorEvent2 or IDebugBreakpointBoundEvent2
+                            resBreakpoints.Add(ad7BPRequest.BindResult);
+                        }
+                        else
+                        {
+                            resBreakpoints.Add(new Breakpoint()
+                            {
+                                Id = (int)ad7BPRequest.Id,
+                                Verified = true,
+                                Line = bp.Line
+                            });
+                        }
+                        continue;
+                    }
+                }
+            }
+
+
+            // Create a new breakpoint
+            if (!dict.ContainsKey(bp.Line))
+            {
+                IDebugPendingBreakpoint2 pendingBp;
+                AD7BreakPointRequest pBPRequest = new AD7BreakPointRequest(m_sessionConfig, convertedPath, m_pathConverter.ConvertClientLineToDebugger(bp.Line), bp.Condition);
+
+                try
+                {
+                    bool verified = true;
+                    if (!string.IsNullOrEmpty(bp.LogMessage))
+                    {
+                        // Make sure tracepoint is valid.
+                        verified = pBPRequest.SetLogMessage(bp.LogMessage);
+                    }
+
+                    if (verified)
+                    {
+                        eb.CheckHR(m_engine.CreatePendingBreakpoint(pBPRequest, out pendingBp));
+                        eb.CheckHR(pendingBp.Bind());
+
+                        dict[bp.Line] = pendingBp;
+
+                        resBreakpoints.Add(new Breakpoint()
+                        {
+                            Id = (int)pBPRequest.Id,
+                            Verified = verified,
+                            Line = bp.Line
+                        });
+                    }
+                    else
+                    {
+                        resBreakpoints.Add(new Breakpoint()
+                        {
+                            Id = (int)pBPRequest.Id,
+                            Verified = verified,
+                            Line = bp.Line,
+                            Message = string.Format(CultureInfo.CurrentCulture, AD7Resources.Error_UnableToParseLogMessage)
+                        });
+                    }
+                }
+                catch (Exception e)
+                {
+                    e = Utilities.GetInnerMost(e);
+                    if (Utilities.IsCorruptingException(e))
+                    {
+                        Utilities.ReportException(e);
+                    }
+
+                    resBreakpoints.Add(new Breakpoint()
+                    {
+                        Id = (int)pBPRequest.Id,
+                        Verified = false,
+                        Line = bp.Line,
+                        Message = eb.GetMessageForException(e)
+                    });
+                }
+            }
+        }
+    }
+}
+```
+
+</spoiler>
+
+Ответственность за создание и управление (выставление/удаление) точкой останова лежит на разных сущностях. Создание - это движок (MIEngine), а управление - на самой точке останова.
+
+За создание отвечает метод `CreatePendingBreakpoint`. По факту что он делает - создает новый объект, выставляет необходимые поля и добавляет ее в свой список. Поэтому опустим реализацию и сконцетрируемся на управлении.
+
+Управление точкой останова проблема самой точки останова. Перед тем как выполнить целевое действие она иницилазирует и проверяет свое состояние: условие срабатывания, расположение и т.д. Когда приходит время выставить или удалить точку останова (отправить команду), то это делегируется классу `MICommandFactory`.
+
+Из названия становится понятно, что это вспомогательный класс, который используется работы с коммандами MI. Так и есть, этот класс предоставляет программный интерфейс для команд MI протокола, а сам внутри собирает строки этих команд. Например, для выставления точки останова используется метод `BreakInsert`:
+
+<spoiler title="BreakInsert">
+
+Их 3 версии - на строку в файле, функцию и адрес инструкции.
+
+```cs
+/* src/MICore/CommandFactories/MICommandFactory.cs */
+public abstract class MICommandFactory
+{
+    public virtual async Task<Results> BreakInsert(string filename, bool useUnixFormat, uint line, string condition, bool enabled, IEnumerable<Checksum> checksums = null, ResultClass resultClass = ResultClass.done)
+    {
+        StringBuilder cmd = await BuildBreakInsert(condition, enabled);
+
+        if (checksums != null && checksums.Any())
+        {
+            cmd.Append(Checksum.GetMIString(checksums));
+            cmd.Append(' ');
+        }
+
+        string filenameMI;
+        bool quotes = PreparePath(filename, useUnixFormat, out filenameMI);
+        if (quotes)
+        {
+            cmd.Append('\"');
+        }
+        cmd.Append(filenameMI);
+        cmd.Append(':');
+        cmd.Append(line.ToString(CultureInfo.InvariantCulture));
+        if (quotes)
+        {
+            cmd.Append('\"');
+        }
+
+        return await _debugger.CmdAsync(cmd.ToString(), resultClass);
+    }
+    public virtual async Task<Results> BreakInsert(string functionName, string condition, bool enabled, ResultClass resultClass = ResultClass.done)
+    {
+        StringBuilder cmd = await BuildBreakInsert(condition, enabled);
+        // TODO: Add support of break function type filename:function locations
+        cmd.Append(functionName);
+        return await _debugger.CmdAsync(cmd.ToString(), resultClass);
+    }
+
+    public virtual async Task<Results> BreakInsert(ulong codeAddress, string condition, bool enabled, ResultClass resultClass = ResultClass.done)
+    {
+        StringBuilder cmd = await BuildBreakInsert(condition, enabled);
+        cmd.Append('*');
+        cmd.Append(codeAddress);
+        return await _debugger.CmdAsync(cmd.ToString(), resultClass);
+    }
+
+    public virtual Task<StringBuilder> BuildBreakInsert(string condition, bool enabled)
+    {
+        StringBuilder cmd = new StringBuilder("-break-insert -f ");
+        if (condition != null)
+        {
+            cmd.Append("-c \"");
+            cmd.Append(EscapeQuotes(condition));
+            cmd.Append("\" ");
+        }
+        if (!enabled)
+        {
+            cmd.Append("-d ");
+        }
+        if (_debugger.LaunchOptions.RequireHardwareBreakpoints)
+        {
+            cmd.Append("-h ");
+        }
+        return Task<StringBuilder>.FromResult(cmd);
+    }
+}
+```
+
+</spoiler>
+
+Удаление происходит аналогично и метод для MI - `BreakDelete`:
+
+<spoiler title="BreakDelete">
+
+```cs
+public abstract class MICommandFactory
+{
+    public virtual async Task BreakDelete(string bkptno, ResultClass resultClass = ResultClass.done)
+    {
+        await _debugger.CmdAsync("-break-delete " + bkptno, resultClass);
+    }
+}
+```
+
+</spoiler>
+
+Переходим к шагам. В DAP за них отвечают команды `next`, `stepIn` и `stepOut` - step over, step into и step out соответственно.
+
+Обработка этих запросов происходит похожим образом как видели ранее - все они обрабатываются единственным методом, в который просто передается тип шага, - `StepInternal`. И вся его логика состоит в том, чтобы вызвать метод `Step` у объекта движка. Который в свою очередь просто вызовет нужный метод у MICommandfFactory. Никакой другой логики кроме валидации и маппинга особо нет (в сравнии с другим кодом).
+
+<spoiler title="Step XXX">
+
+```cs
+/* src/OpenDebugAD7/AD7DebugSession.cs */
+internal sealed class AD7DebugSession
+{
+    protected override void HandleStepInRequestAsync(IRequestResponder<StepInArguments> responder)
+    {
+        try
+        {
+            var granularity = responder.Arguments.Granularity.GetValueOrDefault();
+            StepInternal(responder.Arguments.ThreadId, enum_STEPKIND.STEP_INTO, granularity, AD7Resources.Error_Scenario_Step_In);
+            responder.SetResponse(new StepInResponse());
+        }
+        catch (AD7Exception e)
+        {
+            responder.SetError(new ProtocolException(e.Message));
+        }
+    }
+
+    protected override void HandleNextRequestAsync(IRequestResponder<NextArguments> responder)
+    {
+        try
+        {
+            var granularity = responder.Arguments.Granularity.GetValueOrDefault();
+            StepInternal(responder.Arguments.ThreadId, enum_STEPKIND.STEP_OVER, granularity, AD7Resources.Error_Scenario_Step_Next);
+            responder.SetResponse(new NextResponse());
+        }
+        catch (AD7Exception e)
+        {
+            responder.SetError(new ProtocolException(e.Message));
+        }
+    }
+
+    protected override void HandleStepOutRequestAsync(IRequestResponder<StepOutArguments> responder)
+    {
+        try
+        {
+            var granularity = responder.Arguments.Granularity.GetValueOrDefault();
+            StepInternal(responder.Arguments.ThreadId, enum_STEPKIND.STEP_OUT, granularity, AD7Resources.Error_Scenario_Step_Out);
+            responder.SetResponse(new StepOutResponse());
+        }
+        catch (AD7Exception e)
+        {
+            responder.SetError(new ProtocolException(e.Message));
+        }
+    }
+    private void StepInternal(int threadId, enum_STEPKIND stepKind, SteppingGranularity granularity, string errorMessage)
+    {
+        // If we are already running ignore additional step requests
+        if (!m_isStopped)
+            return;
+
+        IDebugThread2 thread = null;
+        lock (m_threads)
+        {
+            if (!m_threads.TryGetValue(threadId, out thread))
+            {
+                throw new AD7Exception(errorMessage);
+            }
+        }
+
+        ErrorBuilder builder = new ErrorBuilder(() => errorMessage);
+        m_isStepping = true;
+
+        enum_STEPUNIT stepUnit = enum_STEPUNIT.STEP_STATEMENT;
+        switch (granularity)
+        {
+            case SteppingGranularity.Statement:
+            default:
+                break;
+            case SteppingGranularity.Line:
+                stepUnit = enum_STEPUNIT.STEP_LINE;
+                break;
+            case SteppingGranularity.Instruction:
+                stepUnit = enum_STEPUNIT.STEP_INSTRUCTION;
+                break;
+        }
+        try
+        {
+            builder.CheckHR(m_program.Step(thread, stepKind, stepUnit));
+        }
+        catch (AD7Exception)
+        {
+            m_isStopped = true;
+            throw;
+        }
+        // The program should now be stepping, so it is safe to discard the
+        // cached program state.
+        BeforeContinue();
+        m_isStepping = true;
+    }
+}
+
+/* src/MIDebugEngine/AD7.Impl/AD7Engine.cs */
+sealed public class AD7Engine
+{
+    public int Step(IDebugThread2 pThread, enum_STEPKIND kind, enum_STEPUNIT unit)
+    {
+        AD7Thread thread = (AD7Thread)pThread;
+
+        try
+        {
+            if (null == thread || null == thread.GetDebuggedThread())
+            {
+                return Constants.E_FAIL;
+            }
+
+            _debuggedProcess.WorkerThread.RunOperation(() => _debuggedProcess.Step(thread.GetDebuggedThread().Id, kind, unit));
+        }
+        catch (InvalidCoreDumpOperationException)
+        {
+            return AD7_HRESULT.E_CRASHDUMP_UNSUPPORTED;
+        }
+        catch (Exception e)
+        {
+            _engineCallback.OnError(EngineUtils.GetExceptionDescription(e));
+            return Constants.E_ABORT;
+        }
+
+        return Constants.S_OK;
+    }
+}
+
+internal class DebuggedProcess
+{
+    public async Task Step(int threadId, enum_STEPKIND kind, enum_STEPUNIT unit)
+    {
+        this.VerifyNotDebuggingCoreDump();
+
+        await ExceptionManager.EnsureSettingsUpdated();
+
+        if ((unit == enum_STEPUNIT.STEP_LINE) || (unit == enum_STEPUNIT.STEP_STATEMENT))
+        {
+            switch (kind)
+            {
+                case enum_STEPKIND.STEP_INTO:
+                    await MICommandFactory.ExecStep(threadId);
+                    break;
+                case enum_STEPKIND.STEP_OVER:
+                    await MICommandFactory.ExecNext(threadId);
+                    break;
+                case enum_STEPKIND.STEP_OUT:
+                    await MICommandFactory.ExecFinish(threadId);
+                    break;
+                default:
+                    throw new NotImplementedException();
+            }
+        }
+        else if (unit == enum_STEPUNIT.STEP_INSTRUCTION)
+        {
+            switch (kind)
+            {
+                case enum_STEPKIND.STEP_INTO:
+                    await MICommandFactory.ExecStepInstruction(threadId);
+                    break;
+                case enum_STEPKIND.STEP_OVER:
+                    await MICommandFactory.ExecNextInstruction(threadId);
+                    break;
+                case enum_STEPKIND.STEP_OUT:
+                    await MICommandFactory.ExecFinish(threadId);
+                    break;
+                default:
+                    throw new NotImplementedException();
+            }
+        }
+        else
+        {
+            throw new NotImplementedException();
+        }
+    }
+}
+
+/* src/MICore/CommandFactories/MICommandFactory.cs */
+public abstract class MICommandFactory
+{
+    public async Task ExecStep(int threadId, ResultClass resultClass = ResultClass.running)
+    {
+        string command = "-exec-step";
+        string args = string.Empty;
+        await ThreadFrameCmdAsync(command, args, resultClass, threadId, 0);
+    }
+
+    public async Task ExecNext(int threadId, ResultClass resultClass = ResultClass.running)
+    {
+        string command = "-exec-next";
+        string args = string.Empty;
+        await ThreadFrameCmdAsync(command, args, resultClass, threadId, 0);
+    }
+
+    public async Task ExecFinish(int threadId, ResultClass resultClass = ResultClass.running)
+    {
+        string command = "-exec-finish";
+        string args = string.Empty;
+        await ThreadFrameCmdAsync(command, args, resultClass, threadId, 0);
+    }
+
+    public async Task ExecStepInstruction(int threadId, ResultClass resultClass = ResultClass.running)
+    {
+        string command = "-exec-step-instruction";
+        string args = string.Empty;
+        await ThreadFrameCmdAsync(command, args, resultClass, threadId, 0);
+    }
+
+    public async Task ExecNextInstruction(int threadId, ResultClass resultClass = ResultClass.running)
+    {
+        string command = "-exec-next-instruction";
+        string args = string.Empty;
+        await ThreadFrameCmdAsync(command, args, resultClass, threadId, 0);
+    }
+}
+```
+
+</spoiler>
+
+## Code Blocks
+
+## IntellijIdea
+
+## Eclipse
+
+## NetBeans
+
+## Xcode
+
 # Другие ОС
 
 Мы забрались слишком высоко - управляемые языки со своим рантаймом. Теперь пора вернуться вниз по иерархии и рассмотреть подробнее примеры каждого слоя. Начнем с операционных систем. Ранее мы рассмотрели только Linux. Пришло время для других. Начнем в Windows.
@@ -5462,7 +6547,7 @@ void Debug::Break(JavaScriptFrame* frame,
 
 Отладка на Windows отличается как используемым API, так и инструментами.
 
-Во-первых, API. На Linux мы использовали (швейцарский нож) `ptrace`. Но в Windows пошли путем небольших функций делающих небольшие вещи. Для подключения функциональности отладки необходимо подключить соответствующий заголовок `<debugapi.h>`. В нем заключается основная функциональность связанная с отладкой.
+Во-первых, API. На Linux мы использовали (швейцарский нож) `ptrace`. Но в Windows пошли путем небольших функций делающих простые вещи. Для подключения функциональности отладки необходимо подключить соответствующий заголовок `<debugapi.h>`. В нем заключается основная функциональность связанная с отладкой.
 
 ### Цикл отладки
 
@@ -8476,11 +9561,6 @@ out:
 ```
 
 </spoiler>
-
-# Среды разработки
-
-VS Code, CodeBlocks
-Как различные IDE взаимодействуют с отладчиками - м.б. есть общий протокол работы с ними
 
 # Где собака зарыта?
 
