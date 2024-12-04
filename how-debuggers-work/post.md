@@ -6531,6 +6531,439 @@ public abstract class MICommandFactory
 
 ## Code Blocks
 
+- Графический интерфейс на wxWidgets
+- Парсится вывод отладчика с помощью регулярок
+- Поддерживается GDB и CDB: gdb_driver и cdb_driver
+- Запуск с помощью пайпов
+
+Code::Blocks - это кроссплатформенная IDE для C/C++/D/Fortran. Для визуальной части используется wxWidgets.
+
+Отладка поддерживается IDE, но сама же функциональность реализована с помощью плагинов (отладчики реализуют интерфейс `cbDebuggerPlugin`). В частности, плагин `debuggergdb` - добавляет поддержку отладки с помощью GDB и CDB (Microsoft Console Debugger, для Windows).
+
+Код визуальной части не тема статьи, но обойти не могу, поэтому вкратце. Имеется класс `DebuggerManager` и он тот самый менеджер - ничего не делает, а только дает доступ к другим. И под другими, в основном говорю об окнах. Таким окном, например, является `cbBreakpointsDlg` - окно точек останова. И вот эти самые окна содержат методы-обработчики кнопок, которые и запускают функциональность. Для того же окна точек останова есть метод `AddBreakpoints`, который как можно догадаться и вызывает логику добавления точки останова.
+
+Для начала поговорим о главном - кто же отвечает за логику отладки. Уже заспойлерил - сами отладчики, а IDE просто с ними взаимодействует. Для взаимодействия с отладчиком используются методы класса `cbDebuggerPlugin`. В `debuggergdb` находится единственная реализация этого интерфейса - `DebuggerGDB`. И вот тут еще одна интересная деталь - это класс также является простым фасадом. Почему? Как минимум потому что поддерживается не только gdb, но и cdb, а интерфейс у них разный. Поэтому логика адресуется интерфейсу `DebuggerDriver`. И этих драйверов 2: `GDB_driver` и `CDB_driver`.
+
+Так как же происходит взаимодействие с ними? Все просто - запускаем в через консоль, а затем взаимодействуем с помощью stdin/stdout/stderr. Причем для запуска используется функция `wxExecute` (из wxWidgets, как можно догадаться). А строку запуска создает уже сам драйвер, так как он сам знает где лежит его исполяемый файл.
+
+<spoiler title="Запуск отладчика">
+
+```c++
+/* src/plugins/debuggergdb/debuggergdb.cpp */
+int DebuggerGDB::DoDebug(bool breakOnEntry)
+{
+    /* ... */
+    wxString cmdline;
+    if (m_PidToAttach == 0)
+    {
+        /* ... */
+        cmdline = m_State.GetDriver()->GetCommandLine(cmdexe, debuggee, GetActiveConfigEx().GetUserArguments());
+    }
+    else // m_PidToAttach != 0
+        cmdline = m_State.GetDriver()->GetCommandLine(cmdexe, m_PidToAttach, GetActiveConfigEx().GetUserArguments());
+
+    /* ... */
+
+    // start the gdb process
+    wxString wdir = m_State.GetDriver()->GetDebuggersWorkingDirectory();
+    if (wdir.empty())
+        wdir = m_pProject ? m_pProject->GetBasePath() : _T(".");
+    int ret = LaunchProcess(cmdline, wdir);
+    /* ... */
+} // Debug
+
+int DebuggerGDB::LaunchProcess(const wxString& cmd, const wxString& cwd)
+{
+    if (m_pProcess)
+        return -1;
+
+    // start the gdb process
+    m_pProcess = new PipedProcess(&m_pProcess, this, idGDBProcess, true, cwd);
+    Log(_("Starting debugger: ") + cmd);
+    m_Pid = LaunchProcessWithShell(cmd, m_pProcess, cwd);
+
+    if (!m_Pid)
+    {
+        delete m_pProcess;
+        m_pProcess = 0;
+        Log(_("failed"), Logger::error);
+        return -1;
+    }
+    else if (!m_pProcess->GetOutputStream())
+    {
+        delete m_pProcess;
+        m_pProcess = 0;
+        Log(_("failed (to get debugger's stdin)"), Logger::error);
+        return -2;
+    }
+    else if (!m_pProcess->GetInputStream())
+    {
+        delete m_pProcess;
+        m_pProcess = 0;
+        Log(_("failed (to get debugger's stdout)"), Logger::error);
+        return -2;
+    }
+    else if (!m_pProcess->GetErrorStream())
+    {
+        delete m_pProcess;
+        m_pProcess = 0;
+        Log(_("failed (to get debugger's stderr)"), Logger::error);
+        return -2;
+    }
+    return 0;
+}
+
+/* src/plugins/debuggergdb/gdb_driver.cpp */
+wxString GDB_driver::GetCommandLine(const wxString& debugger, const wxString& debuggee, const wxString &userArguments)
+{
+    wxString cmd;
+    cmd << debugger;
+    if (m_pDBG->GetActiveConfigEx().GetFlag(DebuggerConfiguration::DisableInit))
+        cmd << _T(" -nx");      // don't run .gdbinit
+    cmd << _T(" -fullname");    // report full-path filenames when breaking
+    cmd << _T(" -quiet");       // don't display version on startup
+    cmd << wxT(" ") << userArguments;
+    cmd << _T(" -args ") << debuggee;
+    return cmd;
+}
+
+wxString GDB_driver::GetCommandLine(const wxString& debugger, cb_unused int pid, const wxString &userArguments)
+{
+    wxString cmd;
+    cmd << debugger;
+    if (m_pDBG->GetActiveConfigEx().GetFlag(DebuggerConfiguration::DisableInit))
+        cmd << _T(" -nx");      // don't run .gdbinit
+    cmd << _T(" -fullname");    // report full-path filenames when breaking
+    cmd << _T(" -quiet");       // don't display version on startup
+    cmd << wxT(" ") << userArguments;
+    return cmd;
+}
+
+/* src/plugins/debuggergdb/cdb_driver.cpp */
+wxString CDB_driver::GetCommandLine(const wxString& debugger, const wxString& debuggee, cb_unused const wxString &userArguments)
+{
+    wxString cmd = GetCommonCommandLine(debugger);
+    cmd << _T(' ');
+
+    // finally, add the program to debug
+    wxFileName debuggeeFileName(debuggee);
+    if (debuggeeFileName.IsAbsolute())
+        cmd << debuggee;
+    else
+        cmd << m_Target->GetParentProject()->GetBasePath() << wxT("/") << debuggee;
+
+    return cmd;
+}
+
+wxString CDB_driver::GetCommonCommandLine(const wxString& debugger)
+{
+    wxString cmd;
+    cmd << debugger;
+//    cmd << _T(" -g"); // ignore starting breakpoint
+    cmd << _T(" -G"); // ignore ending breakpoint
+    cmd << _T(" -lines"); // line info
+
+    if (m_Target->GetTargetType() == ttConsoleOnly)
+        cmd << wxT(" -2"); // tell the debugger to launch a console for us
+
+    if (m_Dirs.GetCount() > 0)
+    {
+        // add symbols dirs
+        cmd << _T(" -y ");
+        for (unsigned int i = 0; i < m_Dirs.GetCount(); ++i)
+            cmd << m_Dirs[i] << wxPATH_SEP;
+
+        // add source dirs
+        cmd << _T(" -srcpath ");
+        for (unsigned int i = 0; i < m_Dirs.GetCount(); ++i)
+            cmd << m_Dirs[i] << wxPATH_SEP;
+    }
+    return cmd;
+}
+
+wxString CDB_driver::GetCommandLine(const wxString& debugger, int pid, cb_unused const wxString &userArguments)
+{
+    wxString cmd = GetCommonCommandLine(debugger);
+    // finally, add the PID
+    cmd << _T(" -p ") << wxString::Format(_T("%d"), pid);
+    return cmd;
+}
+```
+
+</spoiler>
+
+Но самая интересная часть - это обработка ответа. Ранее мы использовали DAP или GDB/MI. Но здесь мы запускаем интерактивный клиент, он ориентирован на человека. Писать кастомные парсеры? Почти - использовать регулярные выражения. Да, если заглянуть в код `gdb_driver.cpp`, то первое что мы увидим это регулярные выражения для парсинга ответов, например, результат после команды выставления точки останова. И эта функциональность (regex) также поставляется wxWidgets:
+
+<spoiler title="Регулярки парсинга ответа">
+
+```c++
+/* src/plugings/debuggergdb/gdb_driver.cpp */
+
+// the ">>>>>>" is a hack: sometimes, especially when watching uninitialized char*
+// some random control codes in the stream (like 'delete') will mess-up our prompt and the debugger
+// will seem like frozen (only "stop" button available). Using this dummy prefix,
+// we allow for a few characters to be "eaten" this way and still get our
+// expected prompt back.
+#define GDB_PROMPT _T("cb_gdb:")
+#define FULL_GDB_PROMPT _T(">>>>>>") GDB_PROMPT
+
+//[Switching to thread 2 (Thread 1082132832 (LWP 12298))]#0  0x00002aaaac5a2aca in pthread_cond_wait@@GLIBC_2.3.2 () from /lib/libpthread.so.0
+static wxRegEx reThreadSwitch(_T("^\\[Switching to thread .*\\]#0[ \t]+(0x[A-Fa-f0-9]+) in (.*) from (.*)"));
+static wxRegEx reThreadSwitch2(_T("^\\[Switching to thread .*\\]#0[ \t]+(0x[A-Fa-f0-9]+) in (.*) from (.*):([0-9]+)"));
+
+// Regular expresion for breakpoint. wxRegEx don't want to recognize '?' command, so a bit more general rule is used
+// here.
+//  ([A-Za-z]*[:]*) corresponds to windows disk name. Under linux it can be none empty in crosscompiling sessions;
+//  ([^:]+) corresponds to the path in linux or to the path within windows disk in windows to current file;
+//  ([0-9]+) corresponds to line number in current file;
+//  (0x[0-9A-Fa-f]+) correponds to current memory address.
+static wxRegEx reBreak(_T("\032*([A-Za-z]*[:]*)([^:]+):([0-9]+):[0-9]+:[begmidl]+:(0x[0-9A-Fa-f]+)"));
+
+static wxRegEx reBreak2(_T("^(0x[A-Fa-f0-9]+) in (.*) from (.*)"));
+static wxRegEx reBreak3(_T("^(0x[A-Fa-f0-9]+) in (.*)"));
+// Catchpoint 1 (exception thrown), 0x00007ffff7b982b0 in __cxa_throw () from /usr/lib/gcc/x86_64-pc-linux-gnu/4.4.4/libstdc++.so.6
+static wxRegEx reCatchThrow(_T("^Catchpoint ([0-9]+) \\(exception thrown\\), (0x[0-9a-f]+) in (.+) from (.+)$"));
+// Catchpoint 1 (exception thrown), 0x00401610 in __cxa_throw ()
+static wxRegEx reCatchThrowNoFile(_T("^Catchpoint ([0-9]+) \\(exception thrown\\), (0x[0-9a-f]+) in (.+)$"));
+
+// easily match cygwin paths
+//static wxRegEx reCygwin(_T("/cygdrive/([A-Za-z])/"));
+
+// Pending breakpoint "C:/Devel/libs/irr_svn/source/Irrlicht/CSceneManager.cpp:1077" resolved
+#ifdef __WXMSW__
+static wxRegEx rePendingFound(_T("^Pending[ \t]+breakpoint[ \t]+[\"]+([A-Za-z]:)([^:]+):([0-9]+)\".*"));
+#else
+static wxRegEx rePendingFound(_T("^Pending[ \t]+breakpoint[ \t]+[\"]+([^:]+):([0-9]+)\".*"));
+#endif
+// Breakpoint 2, irr::scene::CSceneManager::getSceneNodeFromName (this=0x3fa878, name=0x3fbed8 "MainLevel", start=0x3fa87c) at CSceneManager.cpp:1077
+static wxRegEx rePendingFound1(_T("^Breakpoint[ \t]+([0-9]+),.*"));
+
+// Temporary breakpoint 2, main () at /path/projects/tests/main.cpp:136
+static wxRegEx reTempBreakFound(wxT("^[Tt]emporary[ \t]breakpoint[ \t]([0-9]+),.*"));
+
+
+// [Switching to Thread -1234655568 (LWP 18590)]
+// [New Thread -1234655568 (LWP 18590)]
+static wxRegEx reChildPid1(_T("Thread[ \t]+[xA-Fa-f0-9-]+[ \t]+\\(LWP ([0-9]+)\\)]"));
+// MinGW GDB 6.8 and later
+// [New Thread 2684.0xf40] or [New thread 2684.0xf40]
+static wxRegEx reChildPid2(_T("\\[New [tT]hread[ \t]+[0-9]+\\.[xA-Fa-f0-9-]+\\]"));
+
+static wxRegEx reInferiorExited(wxT("^\\[Inferior[ \\t].+[ \\t]exited normally\\]$"), wxRE_EXTENDED);
+static wxRegEx reInferiorExitedWithCode(wxT("^\\[[Ii]nferior[ \\t].+[ \\t]exited[ \\t]with[ \\t]code[ \\t]([0-9]+)\\]$"), wxRE_EXTENDED);
+
+```
+
+</spoiler>
+
+Но на этом инфраструктура отладчика не закончена. Мы рассмотрели запуск, но что же в рантайме? Как выполняются запросы? Проблема здесь заключается в IDE, а точнее оконном приложении. Они должны быть однопоточными, но многие команды отладчика могут выполняться долго и просто заблокироваться на его ожидании означает ~~смерть~~ зависание всего приложения.
+
+Эту проблему решили просто - очередь команд/паттерн команда. Все действия, которые можно отправить отладчику представляются в виде класса `DebuggerCmd` (базовый класс). У него 2 главных метода: `Action` - выполнение действия и `ParseOutput` - парсинг ответа. А для их выполнения используется абстракция очереди команд. При добавлении новой команды она выполняется, но вот ответ парсится тогда, когда будет доступен. Ответ передается с помощью обработчика события `OnGDBOutput` (или `OnGDBError`).
+
+Зная это, мы можем понять как происходит взаимодействие с отладчиком:
+
+1. Форматируем строку команды как мы бы это сделали в gdb
+2. Отправляем ее по stdin процессу
+3. Ждем ответа от gdb
+4. Парсим ответ
+
+На этом можно было бы и закончить, так как это и есть ответ на основной вопрос - а по какому протоколу ведется взаимодействие. Но чтобы закрыть гештальты предоставлю команды добавления точки останова:
+
+<spoiler title="GdbCmd_AddBreakpoint">
+
+```c++
+/* src/plugins/debuggergdb/gdb_commands.h */
+// Breakpoint 1 at 0x4013d6: file main.cpp, line 8.
+static wxRegEx reBreakpoint(_T("Breakpoint ([0-9]+) at (0x[0-9A-Fa-f]+)"));
+// GDB7.4 and before will return:
+// Breakpoint 1 ("/home/jens/codeblocks-build/codeblocks-1.0svn/src/plugins/debuggergdb/gdb_commands.h:125) pending.
+// GDB7.5 and later will return:
+// Breakpoint 4 ("E:/code/cb/test_code/DebugDLLTest/TestDLL/dllmain.cpp:29") pending.
+static wxRegEx rePendingBreakpoint(_T("Breakpoint ([0-9]+)[ \t]\\(\"(.+):([0-9]+)(\"?)\\)[ \t]pending\\."));
+// Hardware assisted breakpoint 1 at 0x4013d6: file main.cpp, line 8.
+static wxRegEx reHWBreakpoint(_T("Hardware assisted breakpoint ([0-9]+) at (0x[0-9A-Fa-f]+)"));
+// Hardware watchpoint 1: expr
+static wxRegEx reDataBreakpoint(_T("Hardware watchpoint ([0-9]+):.*"));
+// Temporary breakpoint 2 at 0x401203: file /home/obfuscated/projects/tests/_cb_dbg/watches/main.cpp, line 115.
+static wxRegEx reTemporaryBreakpoint(wxT("^[Tt]emporary[ \t]breakpoint[ \t]([0-9]+)[ \t]at.*"));
+
+class GdbCmd_AddBreakpoint : public DebuggerCmd
+{
+        cb::shared_ptr<DebuggerBreakpoint> m_BP;
+    public:
+        /** @param bp The breakpoint to set. */
+        GdbCmd_AddBreakpoint(DebuggerDriver* driver, cb::shared_ptr<DebuggerBreakpoint> bp)
+            : DebuggerCmd(driver),
+            m_BP(bp)
+        {
+            // gdb doesn't allow setting the bp number.
+            // instead, we must read it back in ParseOutput()...
+            m_BP->index = -1;
+
+            if (m_BP->enabled)
+            {
+                if (m_BP->type == DebuggerBreakpoint::bptCode)//m_BP->func.IsEmpty())
+                {
+                    wxString out = m_BP->filename;
+                    // we add one to line,  because scintilla uses 0-based line numbers, while gdb uses 1-based
+                    if (!m_BP->temporary)
+                        m_Cmd << _T("break ");
+                    else
+                        m_Cmd << _T("tbreak ");
+                    m_Cmd << _T('"') << out << _T(":") << wxString::Format(_T("%d"), m_BP->line) << _T('"');
+                }
+                else if (m_BP->type == DebuggerBreakpoint::bptData)
+                {
+                    if (m_BP->breakOnRead && m_BP->breakOnWrite)
+                        m_Cmd << _T("awatch ");
+                    else if (m_BP->breakOnRead)
+                        m_Cmd << _T("rwatch ");
+                    else
+                        m_Cmd << _T("watch ");
+                    m_Cmd << m_BP->breakAddress;
+                }
+                //GDB workaround
+                //Use function name if this is C++ constructor/destructor
+                else
+                {
+//                    if (m_BP->temporary)
+//                        cbThrow(_T("Temporary breakpoint on constructor/destructor is not allowed"));
+                    m_Cmd << _T("rbreak ") << m_BP->func;
+                }
+                //end GDB workaround
+
+                m_BP->alreadySet = true;
+                // condition and ignore count will be set in ParseOutput, where we 'll have the bp number
+            }
+        }
+        void ParseOutput(const wxString& output)
+        {
+            // possible outputs (we 're only interested in 1st and 2nd samples):
+            //
+            // Hardware watchpoint 1: expr
+            // Breakpoint 1 at 0x4013d6: file main.cpp, line 8.
+            // No line 100 in file "main.cpp".
+            // No source file named main2.cpp.
+            if (reBreakpoint.Matches(output))
+            {
+//                m_pDriver->DebugLog(wxString::Format(_("Breakpoint added: file %s, line %d"), m_BP->filename.c_str(), m_BP->line + 1));
+                if (!m_BP->func.IsEmpty())
+                    m_pDriver->Log(_("GDB workaround for constructor/destructor breakpoints activated."));
+
+                reBreakpoint.GetMatch(output, 1).ToLong(&m_BP->index);
+                reBreakpoint.GetMatch(output, 2).ToULong(&m_BP->address, 16);
+
+                // conditional breakpoint
+                if (m_BP->useCondition && !m_BP->condition.IsEmpty())
+                {
+                    m_pDriver->QueueCommand(new GdbCmd_AddBreakpointCondition(m_pDriver, m_BP), DebuggerDriver::High);
+                }
+
+                // ignore count
+                if (m_BP->useIgnoreCount && m_BP->ignoreCount > 0)
+                {
+                    wxString cmd;
+                    cmd << _T("ignore ") << wxString::Format(_T("%d"), (int) m_BP->index) << _T(" ") << wxString::Format(_T("%d"), (int) m_BP->ignoreCount);
+                    m_pDriver->QueueCommand(new DebuggerCmd(m_pDriver, cmd), DebuggerDriver::High);
+                }
+            }
+            else if (rePendingBreakpoint.Matches(output))
+            {
+                if (!m_BP->func.IsEmpty())
+                    m_pDriver->Log(_("GDB workaround for constructor/destructor breakpoints activated."));
+
+                rePendingBreakpoint.GetMatch(output, 1).ToLong(&m_BP->index);
+
+                // conditional breakpoint
+                // condition can not be evaluated for pending breakpoints, so we only set a flag and do this later
+                if (m_BP->useCondition && !m_BP->condition.IsEmpty())
+                {
+                    m_BP->wantsCondition = true;
+                }
+
+                // ignore count
+                if (m_BP->useIgnoreCount && m_BP->ignoreCount > 0)
+                {
+                    wxString cmd;
+                    cmd << _T("ignore ") << wxString::Format(_T("%d"), (int) m_BP->index) << _T(" ") << wxString::Format(_T("%d"), (int) m_BP->ignoreCount);
+                    m_pDriver->QueueCommand(new DebuggerCmd(m_pDriver, cmd), DebuggerDriver::High);
+                }
+            }
+            else if (reDataBreakpoint.Matches(output))
+            {
+                reDataBreakpoint.GetMatch(output, 1).ToLong(&m_BP->index);
+            }
+            else if (reHWBreakpoint.Matches(output))
+            {
+                reHWBreakpoint.GetMatch(output, 1).ToLong(&m_BP->index);
+                reHWBreakpoint.GetMatch(output, 2).ToULong(&m_BP->address, 16);
+            }
+            else if (reTemporaryBreakpoint.Matches(output))
+                reTemporaryBreakpoint.GetMatch(output, 1).ToLong(&m_BP->index);
+            else
+                m_pDriver->Log(output); // one of the error responses
+
+            Manager::Get()->GetDebuggerManager()->GetBreakpointDialog()->Reload();
+        }
+};
+```
+
+</spoiler>
+
+Не надо забывать и о CDB, у него тоже есть аналогичная команда:
+
+<spoiler title="">
+
+```c++
+class CdbCmd_AddBreakpoint : public DebuggerCmd
+{
+        static int m_lastIndex;
+    public:
+        /** @param bp The breakpoint to set. */
+        CdbCmd_AddBreakpoint(DebuggerDriver* driver, cb::shared_ptr<DebuggerBreakpoint> bp)
+            : DebuggerCmd(driver),
+            m_BP(bp)
+        {
+            if (bp->enabled)
+            {
+                if (bp->index==-1)
+                    bp->index = m_lastIndex++;
+
+                wxString out = m_BP->filename;
+//                DebuggerGDB::ConvertToGDBFile(out);
+                QuoteStringIfNeeded(out);
+                // we add one to line,  because scintilla uses 0-based line numbers, while cdb uses 1-based
+                m_Cmd << _T("bu") << wxString::Format(_T("%ld"), (int) bp->index) << _T(' ');
+                if (m_BP->temporary)
+                    m_Cmd << _T("/1 ");
+                if (bp->func.IsEmpty())
+                    m_Cmd << _T('`') << out << _T(":") << wxString::Format(_T("%d"), bp->line) << _T('`');
+                else
+                    m_Cmd << bp->func;
+                bp->alreadySet = true;
+            }
+        }
+        void ParseOutput(const wxString& output)
+        {
+            // possible outputs (only output lines starting with ***):
+            //
+            // *** WARNING: Unable to verify checksum for Win32GUI.exe
+            // *** ERROR: Symbol file could not be found.  Defaulted to export symbols for C:\WINDOWS\system32\USER32.dll -
+            // *** ERROR: Symbol file could not be found.  Defaulted to export symbols for C:\WINDOWS\system32\GDI32.dll -
+            wxArrayString lines = GetArrayFromString(output, _T('\n'));
+            for (unsigned int i = 0; i < lines.GetCount(); ++i)
+            {
+                if (lines[i].StartsWith(_T("*** ")))
+                    m_pDriver->Log(lines[i]);
+            }
+        }
+
+        cb::shared_ptr<DebuggerBreakpoint> m_BP;
+};
+```
+
+</spoiler>
+
 ## IntellijIdea
 
 ## Eclipse
