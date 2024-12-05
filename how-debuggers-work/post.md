@@ -4032,9 +4032,6 @@ void DebuggerStepper::TrapStepOut(ControllerStackInfo *info, bool fForceTraditio
 - JDWP (Java Debug Wire Protocol) - коммуникационный протокол между отладчиком и JVM
 - JDI (Java Debug Interface) - интерфейс Java для взаимодействия с отладчиком (отладка Java через Java)
 
-<spoiler title="Визуализация JDPA">
-
-
 
 ```text
            Components                          Debugger Interfaces
@@ -4054,8 +4051,6 @@ void DebuggerStepper::TrapStepOut(ControllerStackInfo *info, bool fForceTraditio
                 | -------------- |
 
 ```
-
-</spoiler>
 
 Для отладки JVM определен свой протокол - [Java Debug Wire Protocol (JDWP)](https://docs.oracle.com/en/java/javase/21/docs/specs/jdwp/jdwp-spec.html).
 Он описывает коммуникационный протокол между JVM и отладчиком.
@@ -6529,12 +6524,7 @@ public abstract class MICommandFactory
 
 </spoiler>
 
-## Code Blocks
-
-- Графический интерфейс на wxWidgets
-- Парсится вывод отладчика с помощью регулярок
-- Поддерживается GDB и CDB: gdb_driver и cdb_driver
-- Запуск с помощью пайпов
+## Code::Blocks
 
 Code::Blocks - это кроссплатформенная IDE для C/C++/D/Fortran. Для визуальной части используется wxWidgets.
 
@@ -6912,7 +6902,7 @@ class GdbCmd_AddBreakpoint : public DebuggerCmd
 
 Не надо забывать и о CDB, у него тоже есть аналогичная команда:
 
-<spoiler title="">
+<spoiler title="CdbCmd_AddBreakpoint">
 
 ```c++
 class CdbCmd_AddBreakpoint : public DebuggerCmd
@@ -6964,9 +6954,293 @@ class CdbCmd_AddBreakpoint : public DebuggerCmd
 
 </spoiler>
 
+## Eclipse
+
+- Состоит из несколкьих пакетов
+- `org.eclipse.debug` - пакет (набор) с интерфейсами для реализации отладчиков
+- `org.eclipse.jdt.debug` - пакет для поддержки отладки JAVA (там их несколько)
+- Код для JAVA [здесь](https://github.com/eclipse-jdt/eclipse.jdt.debug.git)
+- Код для общей инфры [здесь](https://github.com/ifedorenko/eclipse.platform.debug)
+- Используется уже знакомая инфраструктура отладки - JDPA
+
+В пакете `org.eclipse.debug.core` содержатся интерфейсы, которые необходимо реализовать отладчику (например, `IBreakpoint` - это интерфейс точки останова), а также объекты бизнес-логики (например, `BreakpointManager` - класс, ответственный за упраление точками останова).
+
+Таким образом, пакет с отладчиком должен реализовать все необходимые интерфейсы. И тот самый `org.eclipse.jdt.debug` это делает. Например, `IJavaBreakpoint` - это еще один интерфейс точки останова, но уже для Java, затем идет `JavaBreakpoint` - это абстрактный класс Java точки останова реализиующий этот интерфейс, а вот затем все конкретные точки останова его реализуют: `JavaLineBreakpoint`, `JavaClasPrepareBreakpoint`...
+
+Я буду рассказывать об отладке Java (и его плагине), хотя eclipse поддерживает и другие языки.
+
+В инфраструктуре `eclipse`, чтобы создать плагин необходимо отнаследоваться от класса `Plugin`. Это делает класс `JDIDebugPlugin` и из названия становится понятно, что для отладки используется JDI, а также JDWP.
+
+Реализация отладчика находится в 2 пакетах: самого плагина и `com.sun.jdi`. По факту, расширение - это удобная обертка над `com.sun.jdi`. Последний  берет на себя инфраструктурные вопросы: запуск, подключение к JVM, отправка команд и т.д.
+
+Взаимодействие с JVM реализуется с помощью класса `com.sun.jdi.SocketListen`. То есть для подключения к JVM используется сокет. Далее, мы получаем инстанс класса `com.sun.jdi.VirtualMachine` - прокси для взаимодействия с JVM.
+
+Если говорить о самом расширнеии, то корнем всей иерархии является класс `JDIDebugTarget`, он представляет отлаживаемую JVM и все операции проводятся над ней. Когда мы хотим выполнить какую-либо операцию, то вначале выполняется наша логика проверка (расширение), а затем вызывается код `com.sun.jdi`. Причем каждый такой запрос представляется в виде объекта запроса (`Request`), а затем он отправляется по протоколу.
+
+Но давайте посмотрим как это все реализуется в коде. Для начала рассмотрим как выставляются точки останова. Как уже сказал, классов точек останова несколько, но логика их выставления везде одинакова - создаем запрос (`BreakpointRequest`), а затем настраиваем его (выставляем нужные поля).
+
+Стек вызовов примерно такой:
+
+<spoiler title="Выставление точки останова">
+
+```java
+/* org.eclipse.jdt.debug/model/org/eclipse/jdt/internal/debug/core/breakpoints/JavaBreakpoint.java */
+public abstract class JavaBreakpoint {
+    protected boolean createRequest(JDIDebugTarget target, ReferenceType type)
+        throws CoreException {
+    if (shouldSkipBreakpoint()) {
+        return false;
+    }
+    EventRequest[] requests = newRequests(target, type);
+    if (requests == null) {
+        return false;
+    }
+    fInstalledTypeName = type.name();
+    for (EventRequest request : requests) {
+        registerRequest(request, target);
+    }
+    return true;
+    }
+
+    protected void configureRequest(EventRequest request, JDIDebugTarget target)
+            throws CoreException {
+        request.setSuspendPolicy(getJDISuspendPolicy());
+        request.putProperty(JAVA_BREAKPOINT_PROPERTY, this);
+        configureRequestThreadFilter(request, target);
+        configureRequestHitCount(request);
+        configureInstanceFilters(request, target);
+        // Important: only enable a request after it has been configured
+        updateEnabledState(request, target);
+    }
+
+	protected void registerRequest(EventRequest request, JDIDebugTarget target)
+			throws CoreException {
+		if (request == null) {
+			return;
+		}
+		List<EventRequest> reqs = getRequests(target);
+		if (reqs.isEmpty()) {
+			fRequestsByTarget.put(target, reqs);
+		}
+		reqs.add(request);
+		target.addJDIEventListener(this, request);
+		// update the install attribute on the breakpoint
+		if (!(request instanceof ClassPrepareRequest)) {
+			incrementInstallCount();
+			// notification
+			fireInstalled(target);
+		}
+	}
+}
+
+/* org.eclipse.jdt.debug/model/org/eclipse/jdt/internal/debug/core/breakpoints/JavaLineBreakpoint.java */
+public class JavaLineBreakpoint extends JavaBreakpoint
+{
+    @Override
+	protected EventRequest[] newRequests(JDIDebugTarget target,
+			ReferenceType type) throws CoreException {
+		int lineNumber = getLineNumber();
+		List<Location> locations = determineLocations(lineNumber, type, target);
+		if (locations == null || locations.isEmpty()) {
+			// could be an inner type not yet loaded, or line information not
+			// available
+			return null;
+		}
+		locations = filterLocations(locations);
+		if (locations.isEmpty()) {
+			return null;
+		}
+		EventRequest[] requests = new EventRequest[locations.size()];
+		int i = 0;
+		for(Location location : locations) {
+			requests[i] = createLineBreakpointRequest(location, target);
+			i++;
+		}
+		return requests;
+	}
+
+	protected BreakpointRequest createLineBreakpointRequest(Location location,
+			JDIDebugTarget target) throws CoreException {
+		EventRequestManager manager = target.getEventRequestManager();
+        BreakpointRequest request = manager.createBreakpointRequest(location);
+        configureRequest(request, target);
+        return request;
+	}
+}
+
+```
+
+</spoiler>
+
+Но здесь только код *создания* запроса. Где же отправка по JDWP? Она в самом классе запроса. Базовая реализация запроса - класс `EventRequestImpl`. Вот он то и отправляет сетевые пакеты.
+
+<spoiler title="EventRequestImpl">
+
+```java
+/* org.eclipse.jdt.debug/jdi/org/eclipse/jdi/internal/request/EventRequestImpl.java */
+public abstract class EventRequestImpl extends MirrorImpl implements
+		EventRequest {
+	@Override
+	public synchronized void enable() {
+		if (isEnabled()) {
+			return;
+		}
+
+		initJdwpRequest();
+		try {
+			ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
+			DataOutputStream outData = new DataOutputStream(outBytes);
+			writeByte(eventKind(),
+					"event kind", EventImpl.eventKindMap(), outData); //$NON-NLS-1$
+			writeByte(
+					suspendPolicyJDWP(),
+					"suspend policy", EventRequestImpl.suspendPolicyMap(), outData); //$NON-NLS-1$
+			writeInt(modifierCount(), "modifiers", outData); //$NON-NLS-1$
+			writeModifiers(outData);
+
+			JdwpReplyPacket replyPacket = requestVM(JdwpCommandPacket.ER_SET,
+					outBytes);
+			defaultReplyErrorHandler(replyPacket.errorCode());
+			DataInputStream replyData = replyPacket.dataInStream();
+			fRequestID = RequestID.read(this, replyData);
+			virtualMachineImpl().eventRequestManagerImpl().addRequestIDMapping(this);
+		} catch (IOException e) {
+			defaultIOExceptionHandler(e);
+		} finally {
+			handledJdwpRequest();
+		}
+	}
+}
+```
+
+</spoiler>
+
+Это отправка, а где же обработка его ответа? Вернемся назад, в тот момент, когда добавляли запрос в класс `JDIDebugTarget`. Мы добавили не только запрос, но и специальный класс `Listener` - это колбэк, который вызывается после выполнения запроса. Обработка же ответов возлагается на класс `EventDispatcher` - для него запускается отдельный поток, в котором обрабатываются ответы от JVM.
+
+<spoiler title="Обработка результата запроса">
+
+```java
+public class JDIDebugTarget
+{
+    public JDIDebugTarget(ILaunch launch, VirtualMachine jvm, String name,
+			boolean supportTerminate, boolean supportDisconnect,
+			IProcess process, boolean resume) {
+		/* ... */
+		initialize();
+        /* ... */
+	}
+	protected synchronized void initialize() {
+		setEventDispatcher(new EventDispatcher(this));
+		/* ... */
+		plugin.asyncExec(() -> {
+			EventDispatcher dispatcher = getEventDispatcher();
+			if (dispatcher != null) {
+				Thread t = new Thread(
+						dispatcher,
+						JDIDebugModel.getPluginIdentifier()
+								+ JDIDebugModelMessages.JDIDebugTarget_JDI_Event_Dispatcher);
+				t.setDaemon(true);
+				t.start();
+			}
+		});
+	}
+}
+
+/* org.eclipse.jdt.debug/model/org/eclipse/jdt/internal/debug/core/EventDispatcher.java */
+public class EventDispatcher implements Runnable {
+	@Override
+	public void run() {
+        VirtualMachine vm = fTarget.getVM();
+        EventQueue q = vm.eventQueue();
+        while (!isShutdown()) {
+            EventSet eventSet;
+            try {
+                // Get the next event set.
+                eventSet = q.remove(1000);
+            } catch (VMDisconnectedException e) {
+                break;
+            }
+
+            dispatch(eventSet);
+        }
+	}
+
+	private void dispatch(EventSet eventSet) {
+		EventIterator iter = eventSet.eventIterator();
+		IJDIEventListener[] listeners = new IJDIEventListener[eventSet.size()];
+		boolean vote = false;
+		boolean resume = true;
+		int index = -1;
+		List<Event> deferredEvents = null;
+		while (iter.hasNext()) {
+			index++;
+			Event event = iter.nextEvent();
+			// Dispatch events to registered listeners, if any
+			IJDIEventListener listener = fEventHandlers.get(event.request());
+			listeners[index] = listener;
+			if (listener != null) {
+				if (listener instanceof IJavaLineBreakpoint) {
+					// Event dispatch to conditional breakpoints is deferred
+					// until after
+					// other listeners vote.
+					try {
+						if (((IJavaLineBreakpoint) listener).isConditionEnabled()) {
+							if (deferredEvents == null) {
+								deferredEvents = new ArrayList<>(5);
+							}
+							deferredEvents.add(event);
+							continue;
+						}
+					} catch (CoreException exception) {
+						JDIDebugPlugin.log(exception);
+					}
+				}
+				vote = true;
+				try {
+					try {
+						resume = listener.handleEvent(event, fTarget, !resume, eventSet) && resume;
+					} finally {
+						enableGCForExceptionEvent(event);
+					}
+				} catch (Throwable t) {
+					logHandleEventError(listener, event, t);
+				}
+				continue;
+			}
+
+			// Dispatch VM start/end events
+			if (event instanceof VMDeathEvent) {
+				fTarget.handleVMDeath((VMDeathEvent) event);
+				shutdown(); // stop listening for events
+			} else if (event instanceof VMDisconnectEvent) {
+				fTarget.handleVMDisconnect((VMDisconnectEvent) event);
+				shutdown(); // stop listening for events
+			} else if (event instanceof VMStartEvent) {
+				fTarget.handleVMStart((VMStartEvent) event);
+			} else {
+				// not handled
+			}
+		}
+        /* ... */
+	}
+}
+```
+
+</spoiler>
+
+Таким образом, процесс отладки такой:
+
+1. UI вызывает обработчик и он доходит до `JDIDebugTarget`
+2. Находится объект, ответственный за логику (если это точка останова, то вызывается ее код)
+3. Создается и регистрируется объект запроса
+5. Запрос отправляется по протоколу JDWP
+6. Регистрируется обработчик результата команды
+7. `EventDispatcher` получает ответ от JVM
+8. Вызывается обработчик запроса
+
 ## IntellijIdea
 
-## Eclipse
+TODO: 
 
 ## NetBeans
 
