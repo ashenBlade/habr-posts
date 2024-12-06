@@ -7238,21 +7238,323 @@ public class EventDispatcher implements Runnable {
 7. `EventDispatcher` получает ответ от JVM
 8. Вызывается обработчик запроса
 
-## IntellijIdea
+## Spyder
 
-TODO: 
+[Spyder](https://github.com/spyder-ide/spyder) - это научно-ориентированная IDE для Python. Соответственно, у нее есть интеграция с популярными DS библиотеками: NumPy, SciPy, Matplotlib, Pandas. Если когда-нибудь запускали PyCharm с Matplotlib, то справа высвечивались отформатированные таблицы и графики - здесь тоже самое.
 
-## NetBeans
+Для запуска кода используется IPython. Его логика выполнения отличается от ванильного Python, но не сильно.
 
-## Xcode
+Поддержка отладки также реализуется за счет плагинов. Есть 2 плагина: `ipythonconsole` - интерактивная консоль IPython, и `debugger` - сама функциональность отладчика. Первый предоставлет интерфейс для запуска команд отладчика (с помощью pdb), а `debugger` - вызывает команды отладчика (step over, breakpoint и т.д.).
+
+Поддерживается 4 команды: `next` (step over), `step` (step into), `return` (step out) и `continue` (продолжить выполенение). Но вот как они выполняются отличается от рассметренных вариантов ранее. Если уже работали с IPython, то знаете, что она запускает интерактивную консоль и для управляющих команд используется префикс `!`. Так вот, плагин `debugger` просто отправляет эти команды в консоль как текст. Например, когда мы нажимаем кнопку `step over`, то `!next` отправляется в консоль и выполняется.
+
+<spoiler title="Выполнение команд">
+
+```python
+# 
+class DebuggerWidget:
+    def setup(self):
+        # ...
+        next_action = self.create_action(
+            DebuggerWidgetActions.Next,
+            text=_("Execute current line"),
+            icon=self.create_icon('arrow-step-over'),
+            triggered=lambda: self.debug_command("next"),
+            register_shortcut=True
+        )
+
+        continue_action = self.create_action(
+            DebuggerWidgetActions.Continue,
+            text=_("Continue execution until next breakpoint"),
+            icon=self.create_icon('arrow-continue'),
+            triggered=lambda: self.debug_command("continue"),
+            register_shortcut=True
+        )
+
+        step_action = self.create_action(
+            DebuggerWidgetActions.Step,
+            text=_("Step into function or method"),
+            icon=self.create_icon('arrow-step-in'),
+            triggered=lambda: self.debug_command("step"),
+            register_shortcut=True
+        )
+
+        return_action = self.create_action(
+            DebuggerWidgetActions.Return,
+            text=_("Execute until function or method returns"),
+            icon=self.create_icon('arrow-step-out'),
+            triggered=lambda: self.debug_command("return"),
+            register_shortcut=True
+        )
+        # ...
+
+    def debug_command(self, command):
+        """Debug actions"""
+        self.sig_unmaximize_plugin_requested.emit()
+        widget = self.current_widget()
+        if widget is None:
+            return
+        widget.shellwidget.pdb_execute_command(command)
+
+# spyder/plugins/ipythonconsole/widgets/debugging.py
+class DebuggingWidget:
+    def pdb_execute_command(self, command):
+        """
+        Execute a pdb command
+        """
+        self._pdb_take_focus = False
+        self.pdb_execute(
+            self._pdb_cmd_prefix() + command, hidden=False,
+            echo_stack_entry=False, add_history=False)
+
+    def pdb_execute(self, line, hidden=False, echo_stack_entry=True,
+                    add_history=True):
+        # ...
+        self.executing.emit(line)
+        # ...
+```
+
+</spoiler>
+
+Но мы просто переложили ответственность за исполнение команд на другую сущность. Давайте рассмотрим то, как эти команды выполняет IPython. Для начала запуск.
+
+Хоть за запуск ответственнено ядро IPython, но при отладке мы можем добавить свои хуки - `magic`. Такие магические команды начинаются с `%`. Если IPython встречает такую команду, то вызывает ассоциированный с ним обработчик. Для отладки IDE регистрирует команду `debugfile`. При ее вызове управление передается `Pdb` - отладчику Python, о котором уже говорили. Но не конкретно ему - IPython и spyder создают свои классы, наследующиеся от Pdb (добавляют свою логику).
+
+Таким образом, запуск кода под отладкой имеет следующий вид:
+
+<spoiler title="Запуск под отладкой">
+
+```python
+# extenrnal-deps/spyder-kernels/spyder_kernels/customize/code_runner.py
+@magics_class
+class SpyderCodeRunner(Magics):
+    @runfile_arguments
+    @needs_local_scope
+    @line_magic
+    def debugfile(self, line, local_ns=None):
+        """
+        Debug a file.
+        """
+        args, local_ns = self._parse_runfile_argstring(
+            self.debugfile, line, local_ns)
+
+        with self._debugger_exec(args.canonic_filename, True) as debug_exec:
+            self._exec_file(
+                filename=args.filename,
+                canonic_filename=args.canonic_filename,
+                args=args.args,
+                wdir=args.wdir,
+                current_namespace=args.current_namespace,
+                exec_fun=debug_exec,
+                post_mortem=args.post_mortem,
+                context_globals=args.namespace,
+                context_locals=local_ns,
+            )
+
+    @contextmanager
+    def _debugger_exec(self, filename, continue_if_has_breakpoints):
+        """Get an exec function to use for debugging."""
+        if not self.shell.is_debugging():
+            debugger = SpyderPdb()
+            debugger.set_remote_filename(filename)
+            debugger.continue_if_has_breakpoints = continue_if_has_breakpoints
+            yield debugger.run
+            return
+
+    def _exec_file(
+        self,
+        filename=None,
+        args=None,
+        wdir=None,
+        post_mortem=False,
+        current_namespace=False,
+        exec_fun=None,
+        canonic_filename=None,
+        context_locals=None,
+        context_globals=None,
+    ):
+        # ...
+        self._exec_code(
+            file_code,
+            filename,
+            ns_globals,
+            ns_locals,
+            post_mortem=post_mortem,
+            exec_fun=exec_fun,
+            capture_last_expression=False,
+            global_warning=not current_namespace)
+        # ...
+
+    def _exec_code(
+        self,
+        code,
+        filename,
+        ns_globals,
+        ns_locals=None,
+        post_mortem=False,
+        exec_fun=None,
+        capture_last_expression=False,
+        global_warning=False,
+    ):
+        # ...
+        ast_code = ast.parse(self._transform_cell(code))
+        # ...
+        exec_encapsulate_locals(
+            ast_code, ns_globals, ns_locals, exec_fun, filename
+        )
+        # ...
+
+    def exec_encapsulate_locals(
+    code_ast, globals, locals, exec_fun=None, filename=None
+):
+    # exec_fun == SpyderPdb.run
+    exec_fun(compile(code_ast, filename, "exec"), globals, None)
+
+# external-deps/spyder-kernels/spyder_kernels/customize/spyderpdb.py
+class SpyderPdb(ipyPdb):
+    def run(self, cmd, globals=None, locals=None):
+        """Debug a statement executed via the exec() function.
+
+        globals defaults to __main__.dict; locals defaults to globals.
+        """
+        with DebugWrapper(self):
+            # Вызывает Bdb.run()
+            super(SpyderPdb, self).run(cmd, globals, locals)         
+```
+
+</spoiler>
+
+Далее, управление передается 
+
+Переопределяет встроенный `pdb.Bdb` - `SpyderPdb`.
+
+`SpyderCodeRunner` - класс, ответственный за исполнение кода. У него есть метод `debugcell` - отладка одной ячейки. Все уходит в общий метод `_exec_code`: парсит текст в байт-код и выполняет его (напомню, что в шаблоне).
+
+А сам код выполняет `SpyderPdb.run` - в нем тот самый exec(). `ast.parse` превращает код ячейки в объект модуля (`Module`). Таким образом, получаем `exec(compile(ast))`.Далее, мы отправляем команды напрямую в консоль IPython: `next`, `step`, `continue`.
+
+Но вопрос еще без ответа - как мы все-таки вызываем step XXX, continue и т.д.? Сейчас мы просто делегируем это консоли IPython. Ответ прост - инфраструктура отладчика.
+
+`Bdb` - это базовый класс отладчика. Он содержит в себе, назовем это, кодовую часть. А вот `Pdb` - это уже *интерактивный* отладчик. Что же в нем интерактивного? Возможность обрабатывать команды пользователя.
+
+Во-первых, у него есть метод `cmdloop` - цикл обработки команд, которые читаются с помощью `readline`. Затем эта команда парсится, причем: 1. команда, начинающаяся с `!` интерпретируется оболочкой (например, `!ls`), 2. имеется метод `default`, который должен возвращать обработчик по умолчанию для переданной команды. И главное - как же обработчики команд (`next`, `step` ...) находятся? Также, с помощью инфраструктуры, но уже самого Python: `getattr(self, 'do_' + cmd)` - таким образом мы получаем нужный нам обработчик, наример, `do_next` - обработчик step over (`getattr` - это функция, возвращающая нам атрибут объекта по переданному названию, а `cmd` - это название самой команды).
+
+Те команды, что отправляются отладчиком в IPython консоль имеют префикс `!`, то есть должны отправляться в оболочку, но этого не происходит. Почему? Из-за`SpyderPdb` - он преопределяет `default` таким образом, что этот знак убирается. В результате, это тоже самое, что и отправить `next` самому `Pdb`.
+
+Но хватит слов, давайте посмотрим на код:
+
+<spoiler title="Обработка команд">
+
+Я немного обманул: `cmdloop` - метод не самого `Pdb`, а его базового класса `Cmd`, но смысл прежний - обрабатываем пользовательский ввод в цикле.
+
+```python
+class Cmd:
+    def cmdloop(self, intro=None):
+        stop = None
+        while not stop:
+            # ...
+            line = self.stdin.readline()
+            # ...
+            stop = self.onecmd(line)
+            # ...
+
+    def onecmd(self, line):
+        cmd, arg, line = self.parseline(line)
+        if not line:
+            return self.emptyline()
+        if cmd is None:
+            return self.default(line)
+        self.lastcmd = line
+        if line == 'EOF' :
+            self.lastcmd = ''
+        if cmd == '':
+            return self.default(line)
+        else:
+            try:
+                func = getattr(self, 'do_' + cmd)
+            except AttributeError:
+                return self.default(line)
+            return func(arg)
+
+# external-deps/spyder-kernels/spyder_kernels/customize/spyderpdb.py
+class SpyderPdb(ipyPdb):
+    def default(self, line):
+        if line[:1] == '!':
+            line = line[1:]
+        # ...
+        cmd, arg, line = self.parseline(line)
+        # ...
+        cmd_func = getattr(self, 'do_' + cmd, None)
+        # ...
+        return cmd_func(arg)
+        # ...
+
+class Pdb(bdb.Bdb, cmd.Cmd):
+    def do_next(self, arg):
+        self.set_next(self.curframe)
+        return 1
+
+    def do_step(self, arg):
+        self.set_step()
+        return 1
+
+    def do_until(self, arg):
+        if arg:
+            try:
+                lineno = int(arg)
+            except ValueError:
+                self.error('Error in argument: %r' % arg)
+                return
+            if lineno <= self.curframe.f_lineno:
+                self.error('"until" line number is smaller than current '
+                           'line number')
+                return
+        else:
+            lineno = None
+        self.set_until(self.curframe, lineno)
+        return 1
+```
+
+</spoiler>
+
+За точки останова отвечает класс `BreakpointsManager`. И обрабатываются они также как и оговаривалось в секции про отладку Python - точки останова хранятся в поле самого `Bdb`. Мы пишем туда же:
+
+<spoiler title="Выставление точек останова">
+
+```python
+class SpyderPdb(ipyPdb):
+    def set_spyder_breakpoints(self, breakpoints):
+        """Set Spyder breakpoints."""
+        self.clear_all_breaks()
+        # -----Really deleting all breakpoints:
+        for bp in bdb.Breakpoint.bpbynumber:
+            if bp:
+                bp.deleteMe()
+        bdb.Breakpoint.next = 1
+        bdb.Breakpoint.bplist = {}
+        bdb.Breakpoint.bpbynumber = [None]
+        # -----
+        for fname, data in list(breakpoints.items()):
+            for linenumber, condition in data:
+                try:
+                    self.set_break(self.canonic(fname), linenumber,
+                                   cond=condition)
+                except ValueError:
+                    # Fixes spyder/issues/15546
+                    # The file is not readable
+                    pass
+
+    breakpoints = property(fset=set_spyder_breakpoints)
+```
+
+</spoiler>
 
 # Другие ОС
 
-Мы забрались слишком высоко - управляемые языки со своим рантаймом. Теперь пора вернуться вниз по иерархии и рассмотреть подробнее примеры каждого слоя. Начнем с операционных систем. Ранее мы рассмотрели только Linux. Пришло время для других. Начнем в Windows.
+Мы забрались слишком высоко - управляемые языки со своим рантаймом и IDE. Теперь пора вернуться вниз по иерархии и рассмотреть подробнее примеры каждого слоя. Начнем с операционных систем. Ранее мы рассмотрели только Linux. Начнем с Windows.
 
 ## Windows
 
-Отладка на Windows отличается как используемым API, так и инструментами.
+Отладка на Windows отличается как используемым API, так и инструментами (это ведь разные ОС).
 
 Во-первых, API. На Linux мы использовали (швейцарский нож) `ptrace`. Но в Windows пошли путем небольших функций делающих простые вещи. Для подключения функциональности отладки необходимо подключить соответствующий заголовок `<debugapi.h>`. В нем заключается основная функциональность связанная с отладкой.
 
