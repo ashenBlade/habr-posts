@@ -1159,143 +1159,106 @@ struct bpf_line_info {
 
 ### VMS
 
-[VMS]() - это формат отладочной информации, созданный для ОС OpenVMS
+[VMS](https://www.digiater.nl/openvms/freeware/v50/debug/alpha_dstrecrds.sdl) - это формат отладочной информации, созданный для ОС OpenVMS.
 
-*Информации я нашел оооооооооооооочень мало. Можно сказать, все что у меня было - исходники из gcc. Поэтому далее будет описание, сделанное по реверс инжинирингу этих исходников. Они кстатит тут, в [dwarf2ctf.cc]().*
+> Информации у меня было очень мало. Единственный документ, который указал в ссылке, - это описание структуры DST (Debug Symbol Table), генерируемый компилятором Alpha для отладчика VMS, в формате SDL
 
-TODO: добавить ссылку
+В VMS имеется собственный формат объектного файла и информация об отладочных символах в них встроена. В заголовке исполняемого файла имеется поле `IHD$W_SMDBGOFF` - адрес (смещение) до Debug Symbol Table.
 
-Заметки:
-- `.text` - секция кода
-- VMS Epoch и Unix epoch - различаются
-- FIT - file info table
-- LIT - line info table: file (его индекс), line number (сам номер) -> label + PC (???)
-- Метки (label) могут генерироваться автоматически, но макс. длина - 30 символов
-- gcc по умолчанию использует 32 битную архитектуру (PTR_SIZE = 4)
-- Для отладки регистрируются свои хуки (gcc_debug_hooks)
-- Метками помечаются (vmsdbgout.cc:250, gcc):
-  - Начало(??)/Конец TEXT
-  - Начало, пролог, эпилог, конец функции
-  - Начало, конец блока
-  - LINE CODE (???)
-  Есть и другие метки, они в макросах начинаются с ASM_OUTPUT...
+Сам DST состоит из последовательности DST записей. Каждая запись в начале имеет 2-байтный заголовок: размер и тип. Причем, это не хаотичный набор записей, а иерархичная структура - имеются открывающие и закрывающие записи, которые внутри себя хранят потомков. Например, имеется 2 записи Routine Bebin и Routine End, они определяют границы функции, а внутри них хранятся записи Data - переменные. Пример вложенности из документации:
 
-С этого момента копаюсь в binutils-gdb
+```text
+		Program Structure			DST Record Sequence
+		-----------------			-------------------
 
-- В vms-alpha.c (gdb) есть TODO 14 летней давности
+		MODULE M =				Module Begin M
+		    BEGIN
+		    VAR SYM_M1: INTEGER;		Data SYM_M1 (DTYPE_L)
+		    VAR SYM_M2: REAL;			Data SYM_M2 (DTYPE_F)
 
----
+		    ROUTINE R1 =			Routine Begin R1
+			BEGIN
+			VAR SYM_R11: BOOLEAN;		Data SYM_R11 (BOOLEAN)
+			VAR SYM_R12: INTEGER;		Data SYM_R12 (DTYPE_L)
+			END;				Routine End (for R1)
 
-Дальше из документа https://www.digiater.nl/openvms/freeware/v50/debug/alpha_dstrecrds.sdl
+		    ROUTINE R2 =			Routine Begin R2
+			BEGIN
+			VAR SYM_R21: DOUBLE;		Data SYM_R21 (DTYPE_D)
+			VAR SYM_R22: INTEGER;		Data SYM_R22 (DTYPE_L)
+			ROUTINE R2A =			Routine Begin R2A
+			    BEGIN
+			    VAR SYM_R2A: BYTE;		Data SYM_R2A (DTYPE_B)
+				BEGIN			Block Begin (no name)
+				VAR BLK_V1: WORD;	Data BLK_V1 (DTYPE_W)
+				ROUTINE R2BLKR =	Routine Begin R2BLKR
+				    BEGIN
+				    FOO:BEGIN		Block Begin FOO
+					VAR FOO_V:REAL;	Data FOO_V (DTYPE_F)
+					END;		Block End (for FOO)
 
-SDL - Specifiction and Description Language
+				    VAR R2BLK_V2:REAL;	Data R2BLK_V2 (DTYPE_F)
+				    END;		Routine End (for R2BLKR)
 
-DST хранит информацию о:
-- модули
-- функции
-- лексические блоки
-- метки
-- символы и зависимости между ними
-- строках исходного кода
-- типы данных (даже сложные)
+				VAR BLK_V2: DOUBLE;	Data BLK_V2 (DTYPE_D)
+				END;			Block End (for no name)
 
-DST предназначен для использования DEBUG и TRACEBACK утилитами и только для компилируемых яп (не интерпретируемых)
+			    END;			Routine End (for R2A)
 
-В DST есть 2 типа записей:
-- TBT - TODO
-- DBT
+			VAR SYM_R23: REAL;		Data SYM_R23 (DTYPE_F)
+			END;				Routine End (for R2)
 
-После работы линковщика для создания исполняемого приложения могут появиться еще 2 секции:
+		    END;				Module End
+```
 
-- Global Symbol Table (GST) - все глобальные символы пользовательской программы. Используется, если в DST нет нужной информации (в документации last resort) 
-- Debug Module Table (DMT) - вспомогательная таблица для DST, помогающая выполнить инициализацию быстрее, т.е. выступает в роли индекса.
+За объявление базовых типов (не структур) отвечают записи Type Specification DST Record.
 
-Найти DST:
-TOP -> IMAGE HEADER -> IHD$W_SYMDBGOFF -> IHS -> (IHS$L_DSTVBN, IHS$L_DSTBLKS) - положение и размер
- 
-DMT - запись на каждый модуль в DST.
-Используется для инициализации:
+У каждой Type записи есть общая часть - это общий для всех записей заголовок, название типа (строка), общая длина записи, а также `kind`. В зависимости от этого `kind` происходит дальнейшая обработка.
 
-- RST - RunTime Symbol Table
-- Program SAT - Program Static Address Table
+Всего определено 32 `kind`:
 
-Структура DST:
+```text
+CONSTANT (
+	DST$K_TS_ATOM,				{ 1, Atomic Type Spec
+	DST$K_TS_DSC,				{ 2, VAX Standard Desciptor Type Spec
+	DST$K_TS_IND,				{ 3, Indirect Type Spec
+	DST$K_TS_TPTR,				{ 4, Typed Pointer Type Spec
+	DST$K_TS_PTR,				{ 5, Pointer Type Spec
+	DST$K_TS_PIC,				{ 6, Pictured Type Spec
+	DST$K_TS_ARRAY,				{ 7, Array Type Spec
+	DST$K_TS_SET,				{ 8, Set Type Spec
+	DST$K_TS_SUBRANGE,			{ 9, Subrange Type Spec
+	DST$K_TS_ADA_DSC,			{ 10, ADA Descriptor Type Spec
+	DST$K_TS_FILE,				{ 11, File Type Spec
+	DST$K_TS_AREA,				{ 12, Area Type Spec (PL/I)
+	DST$K_TS_OFFSET,			{ 13, Offset Type Spec (PL/I)
+	DST$K_TS_NOV_LENG,			{ 14, Novel Length Type Spec
+	DST$K_TS_IND_TSPEC,			{ 15, DEBUG internally generated pointer to
+								{      Type Spec (cannot appear in DST)
+	DST$K_TS_SELF_REL_LABEL,	
+								{ 16, Self-Relative Label Type Spec (PL/I)
+	DST$K_TS_RFA,				{ 17, Record File Address Type Spec (BASIC)
+	DST$K_TS_TASK,				{ 18, Task Type Spec (ADA)
+	DST$K_TS_ADA_ARRAY,			{ 19, ADA Array Type Spec
+	DST$K_TS_XMOD_IND,			{ 20, Cross-Module Indirect Type Spec
+	DST$K_TS_CONSTRAINED,		{ 21, Constrained Type Spec (ADA)
+	DST$K_TS_MAYBE_CONSTR,		{ 22, Might-be-constrained Type Spec (ADA)
+	DST$K_TS_DYN_NOV_LENG,		{ 23, Dynamic Novel Length Type Spec
+	DST$K_TS_TPTR_D,			{ 24, Typed Pointer to descriptor
+	DST$K_TS_SCAN_TREE,			{ 25, SCAN Tree Type Spec
+	DST$K_TS_SCAN_TREEPTR,		{ 26, SCAN Treeptr Type Spec
+	DST$K_TS_INCOMPLETE,		{ 27, Incomplete Type Spec
+	DST$K_TS_BLISS_BLOCK,		{ 28, Bliss Block DST
+	DST$K_TS_TPTR_64,			{ 29, Typed 64-bit Pointer Type Spec
+	DST$K_TS_PTR_64,			{ 30, 64-bit Pointer Type Spec
+	DST$K_TS_REF,				{ 31, C++ Reference Type
+	DST$K_TS_REF_64				{ 32, C++ Reference Type, 64-bit pointer
+	) equals #minimum_ts_dtype
+          increment 1
+          counter #ts_dtype_counter;
+```
 
-- Состоит из последовательностей DST записей
-- Каждая запись имеет заголовок из 2 байт - длина и тип. Содержимое определяется типом.
-  
-Записи DST - из этой последовательности и состоит весь DST:
-- Module Begin DST - запись всегда перед Module DST
-  - Название модуля
-  - ЯП
-- Всякие разные таблицы (symbol information)
-- Module End DST - запись всегда после Module DST
-  - Просто помечает конец
-
-В конце абсолютно всех модулей (Module Begin/End) - Fixup DST записи - для релокации адресов
-
-Каждая запись 512 байт. Если последняя не влазит - заполняется 0.
-
-DMT - отмечает начало каждого Module Begin DST для каждого модуля
-
-Есть и вложенность. Ее много:
-- Routine Begin/End
-- Block Begin/End
-
-Даже записи (структуры) - это Begin/End:
-- Record Begin
-- Data x1
-- Data x2 ...
-- Record End
-
-Есть отдельная поддержка Variant из паскаля - Variant Set Begin/End
-
-Ada: Package Begin/End
-
-Prolog: Proglog List Record
-
-C++: template declaration
-
-Представление переменных:
-
-- Называются Data Symbols
-- Есть множество представлений, но все дают 3 детали: название, адрес, тип
-  - Standard Data DST - простейшая форма, описывающая простые, скалярные типы данных - int, float ...
-  - Descriptor Format DST - используется, когда данные описываются с помощью VAX Standard Descriptor (??? TODO)
-  - Separate Type Specification DST - определение составных типов данных (структур)
-  - Специализированные DST - например, типы перечисления из Bliss (TODO: ссылка на пример)
-- Дополнительная информация по блокам видимости и т.д. - неявная, получается из окружения (вложенные DST записи)
-- Название - Counted ASCII string (???)
-- Адрес - 5 байтов: 1 байт - тип, 4 байта - значение или адрес. Если не вмещается - указывает на область памяти, которая значение содержит
-- Тип - предтавляется семейством Type Specification DST (все дальнейшие название имеют суффикс Type Specification):
-  - Atomic - для скалярных типов (int, float, ...)
-  - Descriptor - для стандартных типов VAX
-  - Ada Descriptor - типы, которые описываются ADA'вским "расширенным дескриптором" (extended descriptor)
-  - Indirect - используется, когда целевой тип расположен в другой DST записи
-  - Cross-Module Indirect - как Indirect, но используется, когда тип определен в другом модуле
-  - Typed Pointer - типизированный указатель
-  - Pointer - не типизированный указатель (`void*`)
-  - Picture - используется для типа picture в COBOL и PL/I
-  - Array - массив
-  - Ada array - ADA'вский массив (разница в том, что используется тот же "расширенный дескриптор")
-  - Set - тип Set из Pascal
-  - Subrange - описывает диапазон значений порядкового типа данных (числа, перечисления)
-  - File - тип File из Pascal, PL/I
-  - Area - тип area из PL/I
-  - Offset - тип offset из PL/I
-  - Novel Length - используется для указания дочерних типов, которые идентичны своим родителям, но имеют другую длину. В качестве примера указаны PACKED records из Pascal (TODO: ссылка на это)
-  - Dynamic Novel Length - тоже самое что и Novel Length, но длина указывается другим способом
-  - Self-Relative Label - "self-relative" label из PL/I (TODO: что это, ссылка)
-  - Task - объекты типа task из ADA
-  - Constrained Record - используется для указания того, что этот тип "ограничен в смысле ADA" (constrained in the ADA sense) - структура, в которой дискриминанты (определяют тип variant) имеют известное, константное значение
-  - Might-Be-Constrained Record - используется для формальных параметров (передаваемый аргумент), которые НЕ constrained record, но известно, что реально передаваемое значение может быть constrained record
-  - Scan Tree - тип Tree data из Scan (TODO: ссылка на это)
-  - Scan Treeeptr - указатель типа Scan Tree (особый случай typed pointer)
-  - Incomplete - используется, когда Type Specification (реализация) находится в пакете ADA. Используется как заглушка
-  - Bliss block - тип BLOCK из Bliss
-
-  
-Поддерживаемые языки (есть свой код):
+Можете заметить, что поддерживаются и специфичные для некоторых ЯП типы. Поддерживаемых языков много:
 
 - Macro
 - Macro64
@@ -1315,57 +1278,125 @@ C++: template declaration
 - C++
 - Amacro
 
-Также есть специальная констнта для неизвестного языка.
-В этом случае, поддерживаются все языко-независимые записи, а также делаются некоторые предположения-ограничения:
+Но я отвлеклся. Вернемся к информации о типах.
 
-- Можно использовать общие (vanilla-flavored) выражения (expressions)
-- Идентификаторы допускают латинские символы, цифры, '$' и '_'
-- Для доступа к членам структур используются точки (в документации говорится record component selection) - A.B.C
+В отличие от предыдущих форматов, здесь информация о базовых типах предопределена. Базовый тип представляет запись `DST$K_TS_ATOM` - Atomic type. Все что эта запись хранит - байт типа. Они уже определены:
 
-Поддержка функций:
-- Routine Begin/End
-- Хранят - название функции, диапазон занимаемых адресов, адрес начала
-- Предполагается, что адрес начала также и точка входа
-- Если функция не определена (только сигнатура), то для нее отдельная запись Unallocated Routine DST
-- Для inline функций - Inline Instance DST
-- Для вложенных блоков - Block Begin/End DST (BEGIN/END - Bliss/PL/I, параграфы и секции в COBOL)
-- Для пролога и эпилога функций - Prolog/Epilog DST
+```text
+DSC$K_DTYPE_Z		= 0,	{ Unspecified (May not appear in DST).
+DSC$K_DTYPE_V		= 1,	{ Bit.
+DSC$K_DTYPE_BU		= 2,	{ Byte logical.
+DSC$K_DTYPE_WU		= 3,	{ Word logical.
+DSC$K_DTYPE_LU		= 4,	{ Longword logical.
+DSC$K_DTYPE_QU		= 5,	{ Quadword logical.
+DSC$K_DTYPE_B		= 6,	{ Byte integer.
+DSC$K_DTYPE_W		= 7,	{ Word integer.
+DSC$K_DTYPE_L		= 8,	{ Longword integer.
+DSC$K_DTYPE_Q		= 9,	{ Quadword integer.
+DSC$K_DTYPE_F		= 10,	{ Single-precision floating.
+DSC$K_DTYPE_D		= 11,	{ Double-precision floating.
+DSC$K_DTYPE_FC		= 12,	{ Complex.
+DSC$K_DTYPE_DC		= 13,	{ Double-precision Complex.
+DSC$K_DTYPE_T		= 14,	{ ASCII text string.
+DSC$K_DTYPE_NU		= 15,	{ Numeric string, unsigned.
+DSC$K_DTYPE_NL		= 16,	{ Numeric string, left separate sign.
+DSC$K_DTYPE_NLO		= 17,	{ Numeric string, left overpunched sign.
+DSC$K_DTYPE_NR		= 18,	{ Numeric string, right separate sign.
+DSC$K_DTYPE_NRO		= 19,	{ Numeric string, right overpunched sign
+DSC$K_DTYPE_NZ		= 20,	{ Numeric string, zoned sign.
+DSC$K_DTYPE_P		= 21,	{ Packed decimal string.
+DSC$K_DTYPE_ZI		= 22,	{ Sequence of instructions.
+DSC$K_DTYPE_ZEM		= 23,	{ Procedure entry mask.
+DSC$K_DTYPE_DSC 	= 24,	{ Descriptor, used for arrays of
+							{      dynamic strings
+DSC$K_DTYPE_OU		= 25,	{ Octaword logical
+DSC$K_DTYPE_O		= 26,	{ Octaword integer
+DSC$K_DTYPE_G		= 27,	{ Double precision G floating, 64 bit
+DSC$K_DTYPE_H		= 28,	{ Quadruple precision floating, 128 bit
+DSC$K_DTYPE_GC		= 29,	{ Double precision complex, G floating
+DSC$K_DTYPE_HC		= 30,	{ Quadruple precision complex, H floating
+DSC$K_DTYPE_CIT		= 31, 	{ COBOL intermediate temporary
+DSC$K_DTYPE_BPV		= 32,	{ Bound Procedure Value
+DSC$K_DTYPE_BLV		= 33,	{ Bound Label Value
+DSC$K_DTYPE_VU		= 34,	{ Bit Unaligned
+DSC$K_DTYPE_ADT		= 35,	{ Absolute Date-Time
+					= 36,	{ Unused (not supported by DEBUG)
+DSC$K_DTYPE_VT		= 37,   { Varying Text
+DSC$K_DTYPE_T2		= 38, 	{ 16-bit char
+DSC$K_DTYPE_VT2		= 39,	{ 16-bit varying char
+```
 
+Таким образом, `int32` мы представим такой записью:
 
-Представление структур (составных типов):
-- Record Begin/End DST
-- Каждый член структуры - Data Object DST
-- Если есть вложенные структуры, то НЕобязательно, чтобы их DST записи были вложены друг в друга. То есть DST вложенных структур могут хранится на одном уровне с родительскими.
-- Отдельно описывается поддержка Variant типа в Pascal - отдельные Variant Begin/End DST с Varint Value DST, определяющими сами варианты типа.
+| Type            | Length | Type Spec Kind  | Atomic Type      |
+| --------------- | ------ | --------------- | ---------------- |
+| `DST$K_TYPSPEC` | 2      | `DST$K_TS_ATOM` | `DSC$K_DTYPE_LU` |
 
-Другие замечания:
-- В отличие от других форматов здесь нет отдельной таблицы строк - все строки включаются в записи (хранятся в них)
-- Большое количество хаков для разных яп, в частности Bliss
+Теперь, перейдем к представлении структур. Если посмотрите на значения Type specification, то не найдете упоминания о структурах. Для определения структур использутся другая запись - Record. Причем это не 1 запись, а 2 - Begin и End, а ее поля хранятся между ними, их представляют записи Data DST Record (их несколько разновидностей).
 
-Отображение исходного кода на инструкции:
-- Line Number PC-Correlation DST record
-- отображение строк кода на PC
-- В записи хранятся инструкции, которые необходимо выполнить, чтобы получить готовую таблицу инструкций
-- Можно сказать, что это виртуальная машина, в которой есть глобальные переменные: текущие строка, стейтмент, PC и т.д.
-- Некоторые команды:
-  - Delta-PC - вычисляем отображение текущей строки на адрес инструкции
-  - DST$K_SET_PC_W - выставить значение PC в указанное
-  - DST$K_SET_STMTNUM - выставляет значение номера текущего стейтмента в указанное
+В заголовке хранится общая информация: название структуры, флаги. Но количество полей не хранится. Во-первых, мы и так сможем найти конец структуры с помощью Record End, а, во-вторых, кроме записей полей могут содержаться записи объявления типа.
 
-- Имеются специальные Source File Correlation DST записи - позволяют DEBUG отображать исходный код в время отладки. Они тоже содержат в себе команды, которые надо выполнить для получения результирующей таблицы.
-- Переменные:
-  - LINE_NUM - номер текущей строки
-  - SRC_FILE - id текущего файла исходника
-  - SRC_REC - номер записи, для поддержки RMS - Record Management Services (набор вспомогательных системных сервисов)
-- Некоторые команды:
-  - DECLARE - создает соотношение между номером строки и адресом инструкции.
-  - DST$K_SRC_DECLFILE - определяет новый файл с исходниками для которого будем создавать соотношения.
-  - DST$K_SRC_SETLNUM - выставляет значение LINE_NUM в указанное значение.
-  
-Таким образом, чтобы получить таблицу соответсвия исходного кода и инструкций, необходимо выполнить программу "своей виртуальной машины".
+В документации дано такое представление записей структуры:
 
+```text
+Program Structure			DST Record Sequence
+-----------------			-------------------
+							Data REC1 (SepTypSpec)
+TYPE RECTYP =					Record Begin (RECTYP)
+	RECORD OF
+	COMP1: INTEGER;					Data COMP1 (DTYPE_L)
+	COMP2: REAL;					Data COMP2 (DTYPE_F)
+	COMP3: DOUBLE;					Data COMP3 (DTYPE_D)
+	END;						Record End (for RECTYP)
+VAR REC1: RECTYP;
+VAR REC2: RECTYP;			Data REC2 (SepTypSpec)
+							Type Spec DST record
+								(Indirect Type Spec
+								 pointing to RECTYP)
+```
 
----
+Из этой схемы становится понятно, что:
+
+1. Тип структуры укызывается при необходимости прямо после определения переменной
+2. Он определяется единожды, а затем мы ссылаемся на него (`Indirect Type Spec`)
+
+Record Begin рассмотрели, Record End - это просто маркер (там ничего нет), поэтому рассмотрим поближе Data запись. Одно из таких значений Data записей - `Standard Data DST`. Также можете заметить, что она используется и для определения переменных. Храненит в себе `Atomic` типы (примитивные) и состоит из названия (название поля или переменной), `kind` и полей расположения (регистр и смещение). Для определения базового типа это достаточно.
+
+Здесь есть 3 `Standard Data DST`: `COMP1`, `COMP2` и `COMP3`. Их типы указываются в скобках - Long, Float, Double.
+
+Но вот если тип этой переменной сложный (читай структура), то используется уже другая Data запись - `Separate Type Specification DST Record`. В ней также имеется поле для названия, но вот внутри себя она хранит не код встроенного типа, а ничего. Если мы встретили структуру, то дальше должно идти определение этой структуры. Это мы видим в переменной `REC1` - переменная определяется с помощью `Seperate Type Specification`, а после идет само определение структуры.
+
+Чтобы избавиться от постоянного дублирования используется следующий подход - мы определяем структуру единожды, а далее просто ссылаемся на нее. Это используется во второй переменной `REC2`. В таком случае, после `Separate Type Specification` будет идти запись типа `Indirect Type Specification` (для нее имеется константа `DST$K_TS_IND`). Внутри себя она имеет единственное поле `DST$L_TS_IND_PTR` - байтовое смещение с начала всего DST на нужную запись (такой, персистентый указатель).
+
+С типам закончили, давайте рассмотрим механизм хранения строк исходного кода.
+
+За это отвечает `Line Number PC-Corrlation DST Record`. Внутри себя она хранит массив не пар `Line Number` - `PC`, а команды. Эти команды манипулируют состоянием машины состояний. Сами команды имеют разный размер: первым байтом всегда идет opcode (код операции), а далее 1, 2 или 4 байта параметр. Также отдельно стоит специальный opcode - отрицательный. Тогда, это 1 байтная команда "увеличить PC на указнное значение байтов" (абсолютное значение этого opcode) и параметров не передается. Всего команд, исключая отрицательную ранее, 21:
+
+```text
+DST$K_DELTA_PC_W,		{  1, Delta-PC Word command
+DST$K_INCR_LINUM,		{  2, Increment Line Number Byte command
+DST$K_INCR_LINUM_W,		{  3, Increment Line Number Word command
+DST$K_SET_LINUM_INCR,	{  4, Set Line Number Increment Byte command
+DST$K_SET_LINUM_INCR_W,	{  5, Set Line Number Increment Word command
+DST$K_RESET_LINUM_INCR,	{  6, Reset Line Number Increment command
+DST$K_BEG_STMT_MODE,	{  7, Begin Statement Mode command
+DST$K_END_STMT_MODE,	{  8, End Statement Mode command
+DST$K_SET_LINUM,		{  9, Set Line Number Word command
+DST$K_SET_PC,			{ 10, Set Relative PC Byte command
+DST$K_SET_PC_W,			{ 11, Set Relative PC Word command
+DST$K_SET_PC_L,			{ 12, Set Relative PC Longword command
+DST$K_SET_STMTNUM,		{ 13, Set Statement Number Byte command
+DST$K_TERM,				{ 14, Terminate Line Byte command
+DST$K_TERM_W,			{ 15, Terminate Line Word command
+DST$K_SET_ABS_PC,		{ 16, Set Absolute PC Longword command
+DST$K_DELTA_PC_L,		{ 17, Delta-PC Longword command
+DST$K_INCR_LINUM_L,		{ 18, Increment Line Number Longword command
+DST$K_SET_LINUM_B,		{ 19, Set Line Number Byte command
+DST$K_SET_LINUM_L,		{ 20, Set Line Number Longword command
+DST$K_TERM_L			{ 21, Terminate Line Longword command
+```
+
+Состояние, которым они манипулируют состоят из 7 переменных. Основными можно назвать `CURRENT_LINE` (текущая строка) и `CURRENT_PC` (текущий PC). Также есть 2 режима работы, которые зависят от флага `CURRENT_STMT_MODE`: если он выставлен, то мы как бы говорим, что выполняем очередной стейтмент, но при этом остаемся на текущей строке. Это полезно, для ЯП, поддерживающих возможность указания нескольких стейтментов в 1 строке (например, в C их можно указать через `;`).
 
 ### CodeView и PDB
 
