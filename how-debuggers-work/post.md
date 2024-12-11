@@ -7554,15 +7554,12 @@ class EnterInterpOnlyModeClosure {
 
 Дальше мы будем препарировать Python, точнее его интерпретатор CPython. Он сильно отличается от предыдущих. И не только тем, что он только интерпретируемый.
 
-Главное отличие - как реализована отладка, точнее отладчик.
-Отладчик Python реализован в Python: точки останова, шаги, вычисления выражений - это все в самом языке.
-Встроенный модуль `bdb` содержит 2 класса:
+Главное отличие - как реализована отладка, точнее отладчик. Отладчик Python реализован в Python: точки останова, шаги, вычисления выражений - это все в самом языке. Встроенный модуль `bdb` содержит 2 класса:
 
 - `Bdb` - базовый класс отладчика: шаги, трейсинг, вычисление выражений, запуск/останов
 - `Breakpoint` - класс точки останова: создание, удаление, (де)активация
 
-Замечание: я не говорил, что отладчик *полностью* реализован в Python. На самом деле весь отладчик реализован поверх единственной функции из модуля `sys` - `settrace`.
-Эта функция сохраняет колбек, который будет вызываться при любом интересном событии интерпретатора:
+Но я не говорил, что отладчик *полностью* реализован в Python. На самом деле весь отладчик реализован поверх единственной функции из модуля `sys` - `settrace`. Эта функция сохраняет колбек, который будет вызываться при любом интересном событии интерпретатора:
 
 - Вызов/начало/продолжение/возвращение функции
 - Исполнение новой строки (исходного) кода
@@ -7570,8 +7567,7 @@ class EnterInterpOnlyModeClosure {
 - Обработка исключений
 - Корутины
 
-Как можно догадаться, работа отладчика заключается в том, чтобы корректно обработать эти события.
-Этим и занимается метод `Bdb.trace_dispatch` (он и регистрируется в `sys.settrrace`):
+Как можно догадаться, работа отладчика заключается в том, чтобы корректно обработать эти события. Этим и занимается метод `Bdb.trace_dispatch` (он и регистрируется в `sys.settrrace`):
 
 <spoiler title="Bdb.trace_dispatch">
 
@@ -7622,18 +7618,27 @@ def trace_dispatch(self, frame, event, arg):
 
 </spoiler>
 
-> Если посмотреть на код, то можно заметить, что некоторый события возвращают функции.
-> Это не спроста: колбек функция должна возвращать функцию, которая будет использоваться для трассировки нового `scope`'а.
-> То есть, есть глобальная функция трассировщик, которая в зависимости от окружения, может переопределить поведение следующего трассировщика.
+За `trace` отвечают события:
 
-Последний вопрос - как это все запустить? Когда мы отлаживаем код, то не вставляем явных вызовов `sys.set_trace` (это функция, запускающая отладчик).
-Ответ тоже простой - отдельный модуль `pdb`.
+- `line` - выполняется новая строка кода
+- `call` - была вызвана функция
+- `return` - функция возвращается (выход из нее)
+- `exception` - возникло исключение
 
-Главное что в нем есть - класс `Pdb`, интерактивный отладчик. Он наследуется от `Bdb` и использует его функциональность (так обычно и создают отладчики).
-Идя ниже по стеку вызовов находим то, как реализуется отладка (стек вызовов):
+> Если посмотреть в документацию, то можно найти событие `opcode` - оно вызывается, когда интерпретатор собирается выполнить очередную инструкцию. Но в Python это не особо нужно
+
+Но можете заметить также события с префиксом `c_`. Они относятся не к `settrace`, а к `setprofile` и работают с C-функциями. Точно не знаю почему их добавили, но предполагаю что для совместимости и устранения багов, так как для обеих функций используется 1 подсистема. Это подтверждает еще и то, что для этих событий нет обработчика (возвращается та же функция).
+
+Если посмотреть на код, то можно заметить, что некоторые события возвращают функции. Это не спроста: колбек функция должна возвращать функцию, которая будет использоваться для трассировки нового `scope`'а. То есть, есть глобальная функция трассировщик, которая в зависимости от окружения/аргументов, может переопределить поведение следующего трассировщика.
+
+Последний вопрос - как это все запустить? Когда мы отлаживаем код, то не вставляем явных вызовов `sys.set_trace` (это функция, запускающая отладчик). Ответ тоже простой - отдельный (встроенный) модуль `pdb`.
+
+Главное что в нем есть - класс `Pdb`, интерактивный отладчик. Он наследуется от `Bdb` и использует его функциональность (так обычно и создают отладчики). В принципе нам даже не нужно иметь IDE для отладки - достаточно вызвать отладчик из консоли: `python -m pdb script.py`, либо вообще из кода - `import pdb; pdb.set_trace()` (в новых версиях это можно заменить на единственный вызов `breakpoint()`). После этого отладчик запустится и нам станет доступна интерактивная консоль. Какие команды дефолтный `Pdb` понимает есть в [документации](https://docs.python.org/3/library/pdb.html#debugger-commands).
+
+Перейдем к функциональности. Если запускать через модуль, то идя ниже по стеку вызовов находим то, как реализуется отладка (стек вызовов):
 
 - `pdb.main` - получаем цель для выполнения (модуль/скрипт)
-- `target.code` - получаем код цели (сейчас получаем строку):
+- `target.code` - получаем код цели:
   - скрипт - читаем файл и компилируем его: `exec(compile(fp.read()!r, path, 'exec'))` (это простая строка!)
   - модуль - используем вспомогательный модуль `runpy` для получения кода модуля
 - `Pdb._run` - выполняем цель
@@ -7642,19 +7647,45 @@ def trace_dispatch(self, frame, event, arg):
   - `sys.settrace(self.trace_dispatch)` - регистрируем колбэк для отладки
   - `exec(cmd)` - выполняем переданный код
 
+<spoiler title="Стек вызовов">
+
+```python
+def main():
+    # ...
+    pdb = Pdb()
+    pdb._run(target)
+    # ...
+
+class Pdb(bdb.Bdb, cmd.Cmd):
+    def _run(self, target: Union[_ModuleTarget, _ScriptTarget]):
+        # ...
+        self.run(target.code)
+
+class Bdb:
+    def run(self, cmd, globals=None, locals=None):
+        # ...
+        if isinstance(cmd, str):
+            cmd = compile(cmd, "<string>", "exec")
+        sys.settrace(self.trace_dispatch)
+        try:
+            exec(cmd, globals, locals)
+        finally:
+            self.quitting = True
+            sys.settrace(None)
+```
+
+</spoiler>
+
 Вот так и реализуется отладка. На этом этапе уже должно стать понятно, как реализуются всякие step XXX, точки останова и т.д., но для полноты картины рассмотрим.
 
 ### Точки останова
 
-Точку останова представляет класс `Breakpoint`. Это простой дата-класс, без логики.
-
-Хранение точек останова разделено:
+Точку останова представляет класс `Breakpoint`. Это простой дата-класс, без логики. Но вот их хранение разделено:
 
 - В `Pdb` хранится словарь файл -> номер строки где поставлена точка останова
-- В `Breakpoint` хранится статический словарь `breaks`: файл + номер строки -> список объектов `Breakpoint`.
+- В `Breakpoint` хранится статический словарь `breaks`: (файл + номер строки) -> список объектов `Breakpoint`.
 
-Точка останова зависит от номера строки, поэтому в `trace_dispatch` за проверку точек останова ответственна функция `dispatch_line`.
-Проверка находится в функции `break_here` и осуществляется так:
+Точка останова зависит от номера строки, поэтому в `trace_dispatch` за проверку точек останова ответственна функция `dispatch_line`. Проверка находится в функции `break_here` и осуществляется так:
 
 1. Проверяем, что в `Pdb` эта точка останова зарегистрирована
 2. Получаем список всех точек останова находящихся на этой строке
@@ -7669,39 +7700,34 @@ def trace_dispatch(self, frame, event, arg):
 <spoiler title="break_here">
 
 ```python
-def break_here(self, frame):
-    """Return True if there is an effective breakpoint for this line.
+class Bdb:
+    def break_here(self, frame):
+        """Return True if there is an effective breakpoint for this line.
 
-    Check for line or function breakpoint and if in effect.
-    Delete temporary breakpoints if effective() says to.
-    """
-    filename = self.canonic(frame.f_code.co_filename)
-    if filename not in self.breaks:
-        return False
-    lineno = frame.f_lineno
-    if lineno not in self.breaks[filename]:
-        # The line itself has no breakpoint, but maybe the line is the
-        # first line of a function with breakpoint set by function name.
-        lineno = frame.f_code.co_firstlineno
+        Check for line or function breakpoint and if in effect.
+        Delete temporary breakpoints if effective() says to.
+        """
+        filename = self.canonic(frame.f_code.co_filename)
+        if filename not in self.breaks:
+            return False
+        lineno = frame.f_lineno
         if lineno not in self.breaks[filename]:
+            # The line itself has no breakpoint, but maybe the line is the
+            # first line of a function with breakpoint set by function name.
+            lineno = frame.f_code.co_firstlineno
+            if lineno not in self.breaks[filename]:
+                return False
+
+        # flag says ok to delete temp. bp
+        (bp, flag) = effective(filename, lineno, frame)
+        if bp:
+            self.currentbp = bp.number
+            if (flag and bp.temporary):
+                self.do_clear(str(bp.number))
+            return True
+        else:
             return False
 
-    # flag says ok to delete temp. bp
-    (bp, flag) = effective(filename, lineno, frame)
-    if bp:
-        self.currentbp = bp.number
-        if (flag and bp.temporary):
-            self.do_clear(str(bp.number))
-        return True
-    else:
-        return False
-```
-
-</spoiler>
-
-<spoiler title="effective">
-
-```python
 def effective(file, line, frame):
     """Return (active breakpoint, delete temporary flag) or (None, None) as
        breakpoint to act upon.
@@ -7755,6 +7781,69 @@ def effective(file, line, frame):
 
 </spoiler>
 
+А кто все это дело вызывает? Функция трассировщик - на событие новой строки кода вызывается свое событие. Вы уже 
+
+<spoiler title="Вызов трассировщика">
+
+```python
+    def trace_dispatch(self, frame, event, arg):
+        """Dispatch a trace function for debugged frames based on the event.
+
+        This function is installed as the trace function for debugged
+        frames. Its return value is the new trace function, which is
+        usually itself. The default implementation decides how to
+        dispatch a frame, depending on the type of event (passed in as a
+        string) that is about to be executed.
+
+        The event can be one of the following:
+            line: A new line of code is going to be executed.
+            call: A function is about to be called or another code block
+                  is entered.
+            return: A function or other code block is about to return.
+            exception: An exception has occurred.
+            c_call: A C function is about to be called.
+            c_return: A C function has returned.
+            c_exception: A C function has raised an exception.
+
+        For the Python events, specialized functions (see the dispatch_*()
+        methods) are called.  For the C events, no action is taken.
+
+        The arg parameter depends on the previous event.
+        """
+        if self.quitting:
+            return # None
+        if event == 'line':
+            return self.dispatch_line(frame)
+        if event == 'call':
+            return self.dispatch_call(frame, arg)
+        if event == 'return':
+            return self.dispatch_return(frame, arg)
+        if event == 'exception':
+            return self.dispatch_exception(frame, arg)
+        if event == 'c_call':
+            return self.trace_dispatch
+        if event == 'c_exception':
+            return self.trace_dispatch
+        if event == 'c_return':
+            return self.trace_dispatch
+        print('bdb.Bdb.dispatch: unknown debugging event:', repr(event))
+        return self.trace_dispatch
+
+    def dispatch_line(self, frame):
+        """Invoke user function and return trace function for line event.
+
+        If the debugger stops on the current line, invoke
+        self.user_line(). Raise BdbQuit if self.quitting is set.
+        Return self.trace_dispatch to continue tracing in this scope.
+        """
+        if self.stop_here(frame) or self.break_here(frame):
+            self.user_line(frame)
+            if self.quitting: raise BdbQuit
+        return self.trace_dispatch
+```
+
+</spoiler>
+
 ### Шаги
 
 За шаги отвечают методы того же `Bdb`:
@@ -7769,6 +7858,50 @@ def effective(file, line, frame):
 - `returnframe` - фрейм, на котором надо остановиться при *выходе*
 - `stoplineno` - номер строки, на которой надо остановиться (остановиться на строке не меньшей, чем указано)
 
+<spoiler title="Реализация set_XXX">
+
+```python
+class Bdb:
+    def set_step(self):
+        """Stop after one line of code."""
+        # Issue #13183: pdb skips frames after hitting a breakpoint and running
+        # step commands.
+        # Restore the trace function in the caller (that may not have been set
+        # for performance reasons) when returning from the current frame.
+        if self.frame_returning:
+            caller_frame = self.frame_returning.f_back
+            if caller_frame and not caller_frame.f_trace:
+                caller_frame.f_trace = self.trace_dispatch
+        self._set_stopinfo(None, None)
+
+    def set_next(self, frame):
+        """Stop on the next line in or below the given frame."""
+        self._set_stopinfo(frame, None)
+
+    def set_return(self, frame):
+        """Stop when returning from the given frame."""
+        if frame.f_code.co_flags & GENERATOR_AND_COROUTINE_FLAGS:
+            self._set_stopinfo(frame, None, -1)
+        else:
+            self._set_stopinfo(frame.f_back, frame)
+
+    def _set_stopinfo(self, stopframe, returnframe, stoplineno=0):
+        """Set the attributes for stopping.
+
+        If stoplineno is greater than or equal to 0, then stop at line
+        greater than or equal to the stopline.  If stoplineno is -1, then
+        don't stop at all.
+        """
+        self.stopframe = stopframe
+        self.returnframe = returnframe
+        self.quitting = False
+        # stoplineno >= 0 means: stop at line >= the stoplineno
+        # stoplineno -1 means: don't stop at all
+        self.stoplineno = stoplineno
+```
+
+</spoiler>
+
 Таким образом, нужное поведение достигается различной комбинацией этих параметров:
 
 |                     | stopframe        | returnframe   | stoplineno |
@@ -7778,9 +7911,7 @@ def effective(file, line, frame):
 | step out            | предыдущий фрейм | текущий фрейм | 0          |
 | step out (корутина) | текущий фрейм    | None          | -1         |
 
-После при вызове колбэка определяем нужно ли останавливаться. В этой таблице более-менее все ясно кроме последней строки.
-Причина в деталях реализации: итерирование реализовано с помощью `while` цикла, который бросает исключение `StopIteration` по окончании. Генераторы - это сопрограммы, также итеративно возвращают значения, но и им новые значения также можно передать (с помощью `send`). Реализованы аналогично, но бросают `GeneratorExit` при окончании.
-Логическое окончание их работы наступает не тогда, когда их фрейм изменился, а тогда, когда было выброшено соответствующее исключение. Поэтому отследить их окончание с помощью `return` нельзя. Но мы можем отлеживать исключения - для них есть отдельные события и свой обработчик - `dispatch_exception`. В нем и проверяется подобная ситуация.
+После при вызове колбэка определяем нужно ли останавливаться. В этой таблице более-менее все ясно кроме последней строки. Причина в деталях реализации: итерирование реализовано с помощью `while` цикла, который бросает исключение `StopIteration` по окончании. Генераторы - это сопрограммы, также итеративно возвращают значения, но и им новые значения также можно передать (с помощью `send`). Реализованы аналогично, но бросают `GeneratorExit` при окончании. Логическое окончание их работы наступает не тогда, когда их фрейм изменился (при возвращении из функции), а тогда, когда было выброшено соответствующее исключение. Поэтому отследить их окончание с помощью `return` нельзя. Но мы можем отлеживать исключения - для них есть отдельные события и свой обработчик - `dispatch_exception`. В нем и проверяется подобная ситуация.
 
 <spoiler title="dispatch_exception">
 
@@ -7817,18 +7948,206 @@ def dispatch_exception(self, frame, arg):
 
 </spoiler>
 
+А как же мы проверяем что нужно остановиться? Проверка в методе `stop_here` внутри обработчика события `line`:
+
+<spoiler title="dispatch_line">
+
+```python
+class Bdb:
+    def dispatch_line(self, frame):
+        """Invoke user function and return trace function for line event.
+
+        If the debugger stops on the current line, invoke
+        self.user_line(). Raise BdbQuit if self.quitting is set.
+        Return self.trace_dispatch to continue tracing in this scope.
+        """
+        if self.stop_here(frame) or self.break_here(frame):
+            self.user_line(frame)
+            if self.quitting: raise BdbQuit
+        return self.trace_dispatch
+
+    def stop_here(self, frame):
+        "Return True if frame is below the starting frame in the stack."
+        # (CT) stopframe may now also be None, see dispatch_call.
+        # (CT) the former test for None is therefore removed from here.
+        if self.skip and \
+               self.is_skipped_module(frame.f_globals.get('__name__')):
+            return False
+        if frame is self.stopframe:
+            if self.stoplineno == -1:
+                return False
+            return frame.f_lineno >= self.stoplineno
+        if not self.stopframe:
+            return True
+        return False
+```
+
+</spoiler>
+
+Вопрос остался не покрытым - как же мы отправляем команды отладчику? В тех обработчиках, что я показывал мы сразу же возвращали обработчик и выполнение продолжалось. Все просто: `Bdb` - это базовый отладчик, он содержит основную логику, а вот наследники уже знают как эту функциональность использовать. Одного такого наследника мы знаем - `Pdb`. Как же он получает управление? С помощью хуков - методов, которые наследники должны переопределить своим кодом. Такие обработчики в названии имеют префикс `user_`. В той же логие шагов есть вызов обработчика `user_line`. В `Pdb` эта функция возобновляет интерактивную сессию:
+
+<spoiler title="Перехват управления">
+
+```python
+class Pdb(bdb.Bdb, cmd.Cmd):
+    def user_line(self, frame):
+        """This function is called when we stop or break at this line."""
+        if self._wait_for_mainpyfile:
+            if (self.mainpyfile != self.canonic(frame.f_code.co_filename)
+                or frame.f_lineno <= 0):
+                return
+            self._wait_for_mainpyfile = False
+        if self.bp_commands(frame):
+            self.interaction(frame, None)
+
+class Bdb:
+    def user_line(self, frame):
+        """Called when we stop or break at a line."""
+        pass
+```
+
+</spoiler>
+
+Python это конечно хорошо, но вы видели C? Нельзя не поговорить о питоне не затронув C, поэтому представляю эту подсистему событий: реализация `sys.settrace` и генерация события при переходе к новой строке:
+
+<spoiler title="Базовая часть">
+
+```c
+/* Python/sysmodule.c */
+static PyObject *
+sys_settrace(PyObject *self, PyObject *args)
+{
+    PyThreadState *tstate = _PyThreadState_GET();
+    if (args == Py_None) {
+        if (_PyEval_SetTrace(tstate, NULL, NULL) < 0) {
+            return NULL;
+        }
+    }
+    else {
+        if (_PyEval_SetTrace(tstate, trace_trampoline, args) < 0) {
+            return NULL;
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+/* Python/legacy_tracing.c */
+int
+_PyEval_SetTrace(PyThreadState *tstate, Py_tracefunc func, PyObject *arg)
+{
+    /* Call _PySys_Audit() in the context of the current thread state,
+       even if tstate is not the current thread state. */
+    PyThreadState *current_tstate = _PyThreadState_GET();
+    if (_PySys_Audit(current_tstate, "sys.settrace", NULL) < 0) {
+        return -1;
+    }
+
+    int delta = (func != NULL) - (tstate->c_tracefunc != NULL);
+    tstate->c_tracefunc = func;
+    PyObject *old_traceobj = tstate->c_traceobj;
+    tstate->c_traceobj = Py_XNewRef(arg);
+    Py_XDECREF(old_traceobj);
+    tstate->interp->sys_tracing_threads += delta;
+
+    uint32_t events = 0;
+    if (tstate->interp->sys_tracing_threads) {
+        events =
+            (1 << PY_MONITORING_EVENT_PY_START) | (1 << PY_MONITORING_EVENT_PY_RESUME) |
+            (1 << PY_MONITORING_EVENT_PY_RETURN) | (1 << PY_MONITORING_EVENT_PY_YIELD) |
+            (1 << PY_MONITORING_EVENT_RAISE) | (1 << PY_MONITORING_EVENT_LINE) |
+            (1 << PY_MONITORING_EVENT_JUMP) | (1 << PY_MONITORING_EVENT_BRANCH) |
+            (1 << PY_MONITORING_EVENT_PY_UNWIND) | (1 << PY_MONITORING_EVENT_PY_THROW) |
+            (1 << PY_MONITORING_EVENT_STOP_ITERATION) |
+            (1 << PY_MONITORING_EVENT_EXCEPTION_HANDLED);
+        if (tstate->interp->f_opcode_trace_set) {
+            events |= (1 << PY_MONITORING_EVENT_INSTRUCTION);
+        }
+    }
+    return _PyMonitoring_SetEvents(PY_MONITORING_SYS_TRACE_ID, events);
+}
+
+/* Python/instrumentation.c */
+int
+_PyMonitoring_SetEvents(int tool_id, _PyMonitoringEventSet events)
+{
+    assert(0 <= tool_id && tool_id < PY_MONITORING_TOOL_IDS);
+    PyInterpreterState *interp = _PyInterpreterState_Get();
+    assert(events < (1 << _PY_MONITORING_UNGROUPED_EVENTS));
+    if (check_tool(interp, tool_id)) {
+        return -1;
+    }
+    uint32_t existing_events = get_events(&interp->monitors, tool_id);
+    if (existing_events == events) {
+        return 0;
+    }
+    set_events(&interp->monitors, tool_id, events);
+    interp->monitoring_version++;
+    return instrument_all_executing_code_objects(interp);
+}
+
+/* Вызов самого обработчика на новой строке */
+/* Python/ceval.c */
+PyObject* _Py_HOT_FUNCTION
+_PyEval_EvalFrameDefault(PyThreadState *tstate, _PyInterpreterFrame *frame, int throwflag)
+{
+    /* ... */
+    _Py_call_instrumentation_line(tstate, frame, here, prev);
+    /* ... */
+}
+
+/* Pyhton/instrumentation.c */
+int
+_Py_call_instrumentation_line(PyThreadState *tstate, _PyInterpreterFrame* frame, _Py_CODEUNIT *instr, _Py_CODEUNIT *prev)
+{
+    /* ... */
+    PyInterpreterState *interp = tstate->interp;
+    int line = compute_line(code, i, line_data->line_delta);
+    int prev_index = (int)(prev - _PyCode_CODE(code));
+    int prev_line = _Py_Instrumentation_GetLine(code, prev_index);
+    if (prev_line == line) {
+        return;
+    }
+
+    PyObject *line_obj = PyLong_FromSsize_t(line);
+    PyObject *args[3] = { NULL, (PyObject *)code, line_obj };
+    int res = call_one_instrument(interp, tstate, &args[1],
+                                  2 | PY_VECTORCALL_ARGUMENTS_OFFSET,
+                                  tool, PY_MONITORING_EVENT_LINE);
+    /* ... */
+}
+
+static int
+call_one_instrument(
+    PyInterpreterState *interp, PyThreadState *tstate, PyObject **args,
+    Py_ssize_t nargsf, int8_t tool, int event)
+{
+    PyObject *instrument = interp->monitoring_callables[tool][event];
+    if (instrument == NULL) {
+        return 0;
+    }
+    int old_what = tstate->what_event;
+    tstate->what_event = event;
+    tstate->tracing++;
+    PyObject *res = _PyObject_VectorcallTstate(tstate, instrument, args, nargsf, NULL);
+    tstate->tracing--;
+    tstate->what_event = old_what;
+    if (res == NULL) {
+        return -1;
+    }
+    Py_DECREF(res);
+    return (res == &_PyInstrumentation_DISABLE);
+}
+```
+
+</spoiler>
+
 ## JavaScript
 
-Последним будем рассматривать NodeJS в качестве рантайма JavaScript.
-Но NodeJS основан на движке V8, поэтому мы скорее будем рассматривать V8. Поэтому я мои слова будут справедливы для любого рантайма, основанного на V8.
+Последним будем рассматривать JavaScript и в частности его рантайм NodeJS. Но NodeJS основан на движке V8, поэтому мы скорее будем рассматривать V8. Поэтому я мои слова будут справедливы для многих рантаймов, основанных на V8.
 
 Если движок встраивается, то разработчики для взаимодействия с отладчиком используют Inspector Protocol - протокол взаимодействия с отладчиком. Например, им пользуется Dev Tools в Chrome, но конечный пользователь им (протоколом) не пользуется.
 
-TODO:
-- V8DebuggerAgentImpl - есть функции stepOver, stepInto, stepOut, setbreakpoint и т.д. <-- искать
-
-Для начала опишу сам протокол инспектора.
-Во-первых, все команды предсталяются в виде JSON объектов примерно такой структуры:
+Для начала опишу сам протокол инспектора. Во-первых, все команды предсталяются в виде JSON объектов примерно такой структуры:
 
 ```json
 {
@@ -7866,9 +8185,9 @@ TODO:
 }
 ```
 
-Транспорт не оговаривается, но к инспектору обычно подключаются через HTTP, а в NodeJS через веб-сокеты (если запустить node с флагом `--inspect`, то будет выведен URL с веб-сокетом).
+Транспорт не оговаривается, но к инспектору обычно подключаются через HTTP, а в NodeJS через веб-сокеты (если запустить `node` с флагом `--inspect`, то будет выведен URL с веб-сокетом).
 
-Но это вопрос представления объекта сообщения. Другой момент - как он кодируется. Если отправляем по HTTP, то кодировка ему на откуп (текстовый/бинарный), но вот внутри все сериализованные сообщения представляются в кодировке CBOR - Concise Binary Object Representation (RFC 8949). Если очень коротко - это бинарный JSON: есть аналогичные литералы (true, false, null, undefined) и типы (строки, числа, объекты, массивы), нет строгой схемы. Он даже имеет CWT - аналог JWT, но для CBOR.
+Но это вопрос представления объекта сообщения. Другой момент - как он кодируется. Если отправляем по HTTP, то кодировка ему на откуп (текстовый/бинарный), но вот внутри все сериализованные сообщения представляются в кодировке [CBOR](https://cbor.io/) - Concise Binary Object Representation (RFC 8949). Если очень коротко - это бинарный JSON: есть аналогичные литералы (true, false, null, undefined) и типы (строки, числа, объекты, массивы), нет строгой схемы. Он даже имеет CWT - аналог JWT, но для CBOR.
 
 Строгой спецификации протокола я не нашел (возможно ее и нет), но все сообщения, используемые протоколом описываются в файле `js_protocol.pdl` (в репозитории V8), специальном формате, используемом для Chrome DevTools.
 
