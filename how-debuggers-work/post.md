@@ -3623,7 +3623,7 @@ set_debug_level (uint32_t dinfo, int extended, const char *arg,
 
 Для начала, историческая справка. `gdb` - это интеративный (в первую очередь) отладчик, поддерживающий широкий диапазон (копилируемых) ЯП. Он является частью GNU и тесно связан с другими проектами (активно их использует) - о них далее.
 
-На данный момент, последняя мажорная версия 15. Я буду рассматривать версию 14, но этот код будет корректен и для других версий, так как рассматривать буду базовую логику, которая вряд-ли поменяется.
+На данный момент, последняя мажорная версия 15 - ее я и буду рассматривать, но этот код будет корректен и для других версий, так как сконцентируемся на базовой логике, которая вряд-ли поменяется.
 
 <spoiler title="Отступы">
 
@@ -3665,20 +3665,14 @@ TODO: скриншот - так нагляднее
 - Файловые дескрипторы (`gdb_wait_for_event`)
 - Асинхронные события (`check_async_event_handlers`)
 
-Работа с командной строкой ведется как с файловым дескриптором. Также, файловый дескриптор используется и для уведомления о событиях отлаживаемого процесса (`linux-low.cc`):
+Командная строка (уведомление о вводе) и события отлаживаемого процесса - это все файловые дескрипторы: `stdin` и пайп (self-pipe trick).
 
-<spoiler title="Регистрая обработчиков событий">
+<spoiler title="Регистрация обработчиков событий">
 
-- gdb/main.c:captured_main_1:684 (new ui(stdin, stdout, stderr))
-- gdb/ui.h:ui ctor (FILE *, FILE *, FILE *)
-- gdb/ui.c:register_file_handler:164
-- gdbsupport/event-loop.cc:add_file_handler:270
-- gdbsupport/event-loop.cc:create_file_handler:311
-- 
-
-TODO: код
+Регистрация дескриптора командной строки (stdin/stdout). После, в обработчике события управление получает `readline`.
 
 ```c++
+
 /* gdb/main.c */
 static void
 captured_main_1 (struct captured_main_args *context)
@@ -3688,39 +3682,639 @@ captured_main_1 (struct captured_main_args *context)
     /* ... */
 }
 
+/* gdb/ui.c */
+ui::ui (FILE *instream_, FILE *outstream_, FILE *errstream_)
+  : input_fd (fileno (instream)),
+{ /* ... */ }
+
+void
+ui::register_file_handler ()
+{
+  if (input_fd != -1)
+    add_file_handler (input_fd, stdin_event_handler, this,
+		      string_printf ("ui-%d", num), true);
+}
+```
+
+Регистрация обработчика событий отлаживаемого процесса (в терминах gdb - target/inferrior). В начале, небольшое описание класса `event_pipe` - использует `pipe` и `self-pipe trick` для реализации дескриптора события.
+
+```c++
+/* gdbsupport/event-pipe.h */
+class event_pipe
+{
+public:
+    /* The file descriptor of the waitable file to use in the event
+       loop.  */
+  int event_fd () const
+  { return m_fds[0]; }
+
+private:
+  int m_fds[2] = { -1, -1 };
+}
+
+/* gdbsupport/event-pipe.cc */
+bool
+event_pipe::open_pipe ()
+{
+  if (is_open ())
+    return false;
+
+  if (gdb_pipe_cloexec (m_fds) == -1)
+    return false;
+
+  if (fcntl (m_fds[0], F_SETFL, O_NONBLOCK) == -1
+      || fcntl (m_fds[1], F_SETFL, O_NONBLOCK) == -1)
+    {
+      close_pipe ();
+      return false;
+    }
+
+  return true;
+}
+
+void
+event_pipe::mark ()
+{
+  int ret;
+
+  /* It doesn't really matter what the pipe contains, as long we end
+     up with something in it.  Might as well flush the previous
+     left-overs.  */
+  flush ();
+
+  do
+    {
+      ret = write (m_fds[1], "+", 1);
+    }
+  while (ret == -1 && errno == EINTR);
+
+  /* Ignore EAGAIN.  If the pipe is full, the event loop will already
+     be awakened anyway.  */
+}
+
+/* gdb/inf-ptrace.h */
+struct inf_ptrace_target : public inf_child_target
+{
+public:
+  /* ... */
+  int async_wait_fd () override
+  { return m_event_pipe.event_fd (); }
+  /* ... */
+private:
+  static event_pipe m_event_pipe;
+}
+
+/* gdb/linux-nat.c */
+void
+linux_nat_target::async (bool enable)
+{
+    /* ... */
+    add_file_handler (async_wait_fd (), handle_target_event, NULL,
+                      "linux-nat");
+    /* ... */
+}
+```
+
+А теперь сама регистрация обработчика. Здесь я указал только реализацию с `poll`. Есть другая - она использует `select` (обертку над ним).
+
+```c++
+/* gdbsupport/event-loop.cc */
+void
+add_file_handler (int fd, handler_func *proc, gdb_client_data client_data,
+		  std::string &&name, bool is_ui)
+{
+    /* ... */
+    create_file_handler (fd, POLLIN, proc, client_data, std::move (name),
+            is_ui);
+    /* ... */
+}
+
+static void
+create_file_handler (int fd, int mask, handler_func * proc,
+		     gdb_client_data client_data, std::string &&name,
+		     bool is_ui)
+{
+    /* ... */
+    struct pollfd new_fd;
+    new_fd.fd = fd;
+    new_fd.events = mask;
+    new_fd.revents = 0;
+    gdb_notifier.poll_fds.push_back (new_fd);
+    /* ... */
+}
 ```
 
 </spoiler>
 
-В проекте существует огромное количество файлов и каждый файл отвечает за свою функциональность.
-Каждый такой файл можно считать отдельным модулем со своими интерфейсом и состоянием.
-Их достаточно много и для автоматизации существует инфраструктура - каждый модуль определяет глобальную функцию `_initialize_XXX` (где XXX - название какой-либо фукциональности) и в момент сборки (через make) создается функция `initialize_files`, которая поочередно вызывает все эти функции.
-Например, в файле `breakpoint.c` находится функционал для работы с точками останова и для его инициализации существует функция `_initialize_breakpoint`.
+Но вот внезапные сигналы файловыми дескрипторами обработать не сможем. Для них используются уже `async_event`. Обработкой этих сигналов занимается функция `infrun_async_inferior_event_handler`. Но если опять посмотреть в глубь, то ничего сложного эта асинхронность из себя не представляет - мы просто вызываем `waitpid` для всех inferior'ов, а затем вызываем необходимые обработчики в зависимости от типа события:
 
-Для выполнения команд существует своя инфраструктура. Все команды регистрируются в едином реестре.
-Регистрация команды выполняется с помощью функции `add_cmd`, причем у функции команды должна быть следующая сигнатура:
+<spoiler title="Ожидание завершения">
 
-```c
-void cmd_simple_func_ftype (const char *args, int from_tty);
+```c++
+/* gdb/infrun.c */
+static void
+infrun_async_inferior_event_handler (gdb_client_data data)
+{
+  inferior_event_handler (INF_REG_EVENT);
+}
+
+/* gdb/inf-loop.c */
+void
+inferior_event_handler (enum inferior_event_type event_type)
+{
+  /* ... */
+  fetch_inferior_event ();
+  /* ... */
+}
+
+/* gdb/infrun.c */
+void
+fetch_inferior_event ()
+{
+  /* ... */
+  do_target_wait (waiton_ptid, &ecs, TARGET_WNOHANG);
+  /* ... */
+}
+
+/* gdb/infrun.c */
+static bool
+do_target_wait (ptid_t wait_ptid, execution_control_state *ecs,
+		target_wait_flags options)
+{
+  /* ... */
+  do_target_wait_1 (inf, wait_ptid, &ecs->ws, options);
+  /* ... */
+}
+
+/* gdb/infrun.c */
+static ptid_t
+do_target_wait_1 (inferior *inf, ptid_t ptid,
+		  target_waitstatus *status, target_wait_flags options)
+{
+  /* ... */
+  return target_wait (ptid, status, options);
+}
+
+/* gdb/target.c */
+ptid_t
+target_wait (ptid_t ptid, struct target_waitstatus *status,
+	     target_wait_flags options)
+{
+  /* ... */
+  ptid_t event_ptid = target->wait (ptid, status, options);
+  /* ... */
+}
+
+/* gdb/linux-nat.c */
+ptid_t
+linux_nat_target::wait (ptid_t ptid, struct target_waitstatus *ourstatus,
+			target_wait_flags target_options)
+{
+  /* ... */
+  event_ptid = linux_nat_wait_1 (ptid, ourstatus, target_options);
+  /* ... */
+}
+
+/* gdb/linux-nat.c */
+static ptid_t
+linux_nat_wait_1 (ptid_t ptid, struct target_waitstatus *ourstatus,
+		  target_wait_flags target_options)
+{
+  /* ... */
+  errno = 0;
+  lwpid = my_waitpid (-1, &status,  __WALL | WNOHANG);
+  /* ... */
+}
+
+/* gdb/nat/linux-waitpid.c */
+int
+my_waitpid (int pid, int *status, int flags)
+{
+  /* Обертка над waitpid обрабатывающая EINTR */
+  return gdb::handle_eintr (-1, ::waitpid, pid, status, flags);
+}
+
 ```
 
-Каждой команде помимо ее аргументов отдается флаг `from_tty` - исполняется ли в интерактивном терминале.
+</spoiler>
 
-Можно заметить, что все команды - это функции, не методы класса, и передаются только аргументы команды.
-Это потому что состояние хранится в глобальных переменных, либо получается через публичный интерфейс (но также хранится в `static` переменных).
+Таким образом, обработка событий от процесса поделилась на 2 типа событий: события файлового дескриптора и синхронное ожидание с помощью `waitpid`.
 
-В терминах gdb отлаживаемый процесс называется inferrior. Причина этого в том, что отлаживаться может не только процесс, но и core-dump или симулируемый процесс (не настоящий).
+В проекте существует огромное количество файлов и каждый файл отвечает за свою функциональность. Каждый такой файл можно считать отдельным модулем со своими интерфейсом и состоянием. Их достаточно много и для автоматизации существует инфраструктура - каждый модуль определяет глобальную функцию `_initialize_XXX` (где XXX - название какой-либо фукциональности) и в момент сборки (через `make`) создается функция `initialize_all_files`, которая поочередно вызывает все эти функции. Например, в файле `breakpoint.c` находится функционал для работы с точками останова и для его инициализации существует функция `_initialize_breakpoint`.
 
-gdb должен быть максимально кросс-платформенным и поддерживать самые разнообразные форматы отладки и объектных файлов.
-Это достигается с помощью абстракций.
+<spoiler title="Кодогенерация для инициализации">
+
+```c++
+/* gdb/breakpoint.c */
+void _initialize_breakpoint ();
+void
+_initialize_breakpoint ()
+{
+  struct cmd_list_element *c;
+
+  gdb::observers::solib_unloaded.attach (disable_breakpoints_in_unloaded_shlib,
+					 "breakpoint");
+  gdb::observers::free_objfile.attach (disable_breakpoints_in_freed_objfile,
+				       "breakpoint");
+  gdb::observers::memory_changed.attach (invalidate_bp_value_on_memory_change,
+					 "breakpoint");
+
+  /* Don't bother to call set_breakpoint_count.  $bpnum isn't useful
+     before a breakpoint is set.  */
+  breakpoint_count = 0;
+
+  tracepoint_count = 0;
+
+  add_com ("ignore", class_breakpoint, ignore_command, _("\
+Set ignore-count of breakpoint number N to COUNT.\n\
+Usage is `ignore N COUNT'."));
+
+  commands_cmd_element = add_com ("commands", class_breakpoint,
+				  commands_command, _("\
+Set commands to be executed when the given breakpoints are hit.\n\
+Give a space-separated breakpoint list as argument after \"commands\".\n\
+A list element can be a breakpoint number (e.g. `5') or a range of numbers\n\
+(e.g. `5-7').\n\
+With no argument, the targeted breakpoint is the last one set.\n\
+The commands themselves follow starting on the next line.\n\
+Type a line containing \"end\" to indicate the end of them.\n\
+Give \"silent\" as the first line to make the breakpoint silent;\n\
+then no output is printed when it is hit, except what the commands print."));
+
+  const auto cc_opts = make_condition_command_options_def_group (nullptr);
+  static std::string condition_command_help
+    = gdb::option::build_help (_("\
+Specify breakpoint number N to break only if COND is true.\n\
+Usage is `condition [OPTION] N COND', where N is an integer and COND\n\
+is an expression to be evaluated whenever breakpoint N is reached.\n\
+\n\
+Options:\n\
+%OPTIONS%"), cc_opts);
+
+  c = add_com ("condition", class_breakpoint, condition_command,
+	       condition_command_help.c_str ());
+  set_cmd_completer_handle_brkchars (c, condition_completer);
+
+  c = add_com ("tbreak", class_breakpoint, tbreak_command, _("\
+Set a temporary breakpoint.\n\
+Like \"break\" except the breakpoint is only temporary,\n\
+so it will be deleted when hit.  Equivalent to \"break\" followed\n\
+by using \"enable delete\" on the breakpoint number.\n\
+\n"
+BREAK_ARGS_HELP ("tbreak")));
+  set_cmd_completer (c, location_completer);
+
+  c = add_com ("hbreak", class_breakpoint, hbreak_command, _("\
+Set a hardware assisted breakpoint.\n\
+Like \"break\" except the breakpoint requires hardware support,\n\
+some target hardware may not have this support.\n\
+\n"
+BREAK_ARGS_HELP ("hbreak")));
+  set_cmd_completer (c, location_completer);
+
+  c = add_com ("thbreak", class_breakpoint, thbreak_command, _("\
+Set a temporary hardware assisted breakpoint.\n\
+Like \"hbreak\" except the breakpoint is only temporary,\n\
+so it will be deleted when hit.\n\
+\n"
+BREAK_ARGS_HELP ("thbreak")));
+  set_cmd_completer (c, location_completer);
+
+  cmd_list_element *enable_cmd
+    = add_prefix_cmd ("enable", class_breakpoint, enable_command, _("\
+Enable all or some breakpoints.\n\
+Usage: enable [BREAKPOINTNUM]...\n\
+Give breakpoint numbers (separated by spaces) as arguments.\n\
+With no subcommand, breakpoints are enabled until you command otherwise.\n\
+This is used to cancel the effect of the \"disable\" command.\n\
+With a subcommand you can enable temporarily."),
+		      &enablelist, 1, &cmdlist);
+
+  add_com_alias ("en", enable_cmd, class_breakpoint, 1);
+  /* ... */
+}
+
+/* gdb/init.c */
+void initialize_all_files ();
+void
+initialize_all_files ()
+{
+  std::vector<initialize_file_ftype *> functions =
+    {
+      /* ... */
+      _initialize_breakpoint,
+      /* ... */
+    };
+
+  /* If GDB_REVERSE_INIT_FUNCTIONS is set (any value), reverse the
+     order in which initialization functions are called.  This is
+     used by the testsuite.  */
+  if (getenv ("GDB_REVERSE_INIT_FUNCTIONS") != nullptr)
+    std::reverse (functions.begin (), functions.end ());
+
+  for (initialize_file_ftype *function : functions)
+    function ();
+}
+
+```
+
+</spoiler>
+
+Для выполнения команд также существует своя инфраструктура. Во-первых, все команды регистрируются в едином реестре (во время вызова `_initialize_XXX`). Во-вторых, не существует команды самой по себе - она принадлежит какому-то классу (даже может быть вложенность). Например, команды точек останова принадлежат классу `class_breakpoins`, а далее для нее регистрируются уже сами команды. Регистрация команды выполняется с помощью функции `add_cmd` (есть `add_com` - обертка над этой), причем у обработчика должна быть следующая сигнатура:
+
+```c
+/* 
+ * args - строка аргументов (без разбиения)
+ * from_tty - исполняется в интерактивном режиме
+ */
+typedef void cmd_simple_func_ftype (const char *args, int from_tty);
+```
+
+Можно заметить, что все команды - это функции, не методы класса, и передаются только аргументы команды. Это потому что состояние хранится в глобальных переменных, либо получается через публичный интерфейс (но также хранится в `static` переменных).
+
+В терминах `gdb` отлаживаемый процесс называется `inferrior`. Причина этого в том, что отлаживаться может не только процесс, но и core-dump или эмулируемый процесс (не настоящий).
+
+`gdb` должен быть максимально кросс-платформенным и поддерживать самые разнообразные форматы отладки и объектных файлов. Это достигается с помощью абстракций.
 
 Так, `gdbarch` - структура, которая представляет целевую платформу. Она хранит в себе не только состояние (например, размер переменной `long double`), но и функции взаимодействия (например, для получения `PC` регистра).
-Каждая поддерживаемая архитектура реализует все необходимые функции. Если указатель на функцию `NULL`, значит функциональность не реализована/поддерживается.
-Например, для функции `skip_main_prologue` нашел поддерживаемые архитектуры: x86_64, x86, FR-V, RS/6000, ARM.
 
-Для расширяемости многие части реализованы в виде интерфейса (в C стиле - структура с указателями).
-Многие из таких имеют суффикс `ops`.
-Например, есть интерфейсы для:
+<spoiler title="struct gdbarch">
+
+```c++
+/* gdb/gdbarch.c */
+struct gdbarch
+{
+  /* Has this architecture been fully initialized?  */
+  bool initialized_p = false;
+
+  /* An obstack bound to the lifetime of the architecture.  */
+  auto_obstack obstack;
+  /* Registry.  */
+  registry<gdbarch> registry_fields;
+
+  /* basic architectural information.  */
+  const struct bfd_arch_info * bfd_arch_info;
+  enum bfd_endian byte_order;
+  enum bfd_endian byte_order_for_code;
+  enum gdb_osabi osabi;
+  const struct target_desc * target_desc;
+
+  /* target specific vector.  */
+  gdbarch_tdep_up tdep;
+  gdbarch_dump_tdep_ftype *dump_tdep = nullptr;
+
+  int short_bit = 2*TARGET_CHAR_BIT;
+  int int_bit = 4*TARGET_CHAR_BIT;
+  int long_bit = 4*TARGET_CHAR_BIT;
+  int long_long_bit = 2*4*TARGET_CHAR_BIT;
+  int bfloat16_bit = 2*TARGET_CHAR_BIT;
+  const struct floatformat ** bfloat16_format = floatformats_bfloat16;
+  int half_bit = 2*TARGET_CHAR_BIT;
+  const struct floatformat ** half_format = floatformats_ieee_half;
+  int float_bit = 4*TARGET_CHAR_BIT;
+  const struct floatformat ** float_format = floatformats_ieee_single;
+  int double_bit = 8*TARGET_CHAR_BIT;
+  const struct floatformat ** double_format = floatformats_ieee_double;
+  int long_double_bit = 8*TARGET_CHAR_BIT;
+  const struct floatformat ** long_double_format = floatformats_ieee_double;
+  int wchar_bit = 4*TARGET_CHAR_BIT;
+  int wchar_signed = -1;
+  gdbarch_floatformat_for_type_ftype *floatformat_for_type = default_floatformat_for_type;
+  int ptr_bit = 4*TARGET_CHAR_BIT;
+  int addr_bit = 0;
+  int dwarf2_addr_size = 0;
+  int char_signed = -1;
+  gdbarch_read_pc_ftype *read_pc = nullptr;
+  gdbarch_write_pc_ftype *write_pc = nullptr;
+  gdbarch_virtual_frame_pointer_ftype *virtual_frame_pointer = legacy_virtual_frame_pointer;
+  gdbarch_pseudo_register_read_ftype *pseudo_register_read = nullptr;
+  gdbarch_pseudo_register_read_value_ftype *pseudo_register_read_value = nullptr;
+  gdbarch_pseudo_register_write_ftype *pseudo_register_write = nullptr;
+  gdbarch_deprecated_pseudo_register_write_ftype *deprecated_pseudo_register_write = nullptr;
+  int num_regs = -1;
+  int num_pseudo_regs = 0;
+  gdbarch_ax_pseudo_register_collect_ftype *ax_pseudo_register_collect = nullptr;
+  gdbarch_ax_pseudo_register_push_stack_ftype *ax_pseudo_register_push_stack = nullptr;
+  gdbarch_report_signal_info_ftype *report_signal_info = nullptr;
+  int sp_regnum = -1;
+  int pc_regnum = -1;
+  int ps_regnum = -1;
+  int fp0_regnum = -1;
+  gdbarch_stab_reg_to_regnum_ftype *stab_reg_to_regnum = no_op_reg_to_regnum;
+  gdbarch_ecoff_reg_to_regnum_ftype *ecoff_reg_to_regnum = no_op_reg_to_regnum;
+  gdbarch_sdb_reg_to_regnum_ftype *sdb_reg_to_regnum = no_op_reg_to_regnum;
+  gdbarch_dwarf2_reg_to_regnum_ftype *dwarf2_reg_to_regnum = no_op_reg_to_regnum;
+  gdbarch_register_name_ftype *register_name = nullptr;
+  gdbarch_register_type_ftype *register_type = nullptr;
+  gdbarch_dummy_id_ftype *dummy_id = default_dummy_id;
+  int deprecated_fp_regnum = -1;
+  gdbarch_push_dummy_call_ftype *push_dummy_call = nullptr;
+  enum call_dummy_location_type call_dummy_location = AT_ENTRY_POINT;
+  gdbarch_push_dummy_code_ftype *push_dummy_code = nullptr;
+  gdbarch_code_of_frame_writable_ftype *code_of_frame_writable = default_code_of_frame_writable;
+  gdbarch_print_registers_info_ftype *print_registers_info = default_print_registers_info;
+  gdbarch_print_float_info_ftype *print_float_info = default_print_float_info;
+  gdbarch_print_vector_info_ftype *print_vector_info = nullptr;
+  gdbarch_register_sim_regno_ftype *register_sim_regno = legacy_register_sim_regno;
+  gdbarch_cannot_fetch_register_ftype *cannot_fetch_register = cannot_register_not;
+  gdbarch_cannot_store_register_ftype *cannot_store_register = cannot_register_not;
+  gdbarch_get_longjmp_target_ftype *get_longjmp_target = nullptr;
+  int believe_pcc_promotion = 0;
+  gdbarch_convert_register_p_ftype *convert_register_p = generic_convert_register_p;
+  gdbarch_register_to_value_ftype *register_to_value = nullptr;
+  gdbarch_value_to_register_ftype *value_to_register = nullptr;
+  gdbarch_value_from_register_ftype *value_from_register = default_value_from_register;
+  gdbarch_pointer_to_address_ftype *pointer_to_address = unsigned_pointer_to_address;
+  gdbarch_address_to_pointer_ftype *address_to_pointer = unsigned_address_to_pointer;
+  gdbarch_integer_to_address_ftype *integer_to_address = nullptr;
+  gdbarch_return_value_ftype *return_value = nullptr;
+  gdbarch_return_value_as_value_ftype *return_value_as_value = default_gdbarch_return_value;
+  gdbarch_get_return_buf_addr_ftype *get_return_buf_addr = default_get_return_buf_addr;
+  gdbarch_dwarf2_omit_typedef_p_ftype *dwarf2_omit_typedef_p = default_dwarf2_omit_typedef_p;
+  gdbarch_update_call_site_pc_ftype *update_call_site_pc = default_update_call_site_pc;
+  gdbarch_return_in_first_hidden_param_p_ftype *return_in_first_hidden_param_p = default_return_in_first_hidden_param_p;
+  gdbarch_skip_prologue_ftype *skip_prologue = nullptr;
+  gdbarch_skip_main_prologue_ftype *skip_main_prologue = nullptr;
+  gdbarch_skip_entrypoint_ftype *skip_entrypoint = nullptr;
+  gdbarch_inner_than_ftype *inner_than = nullptr;
+  gdbarch_breakpoint_from_pc_ftype *breakpoint_from_pc = default_breakpoint_from_pc;
+  gdbarch_breakpoint_kind_from_pc_ftype *breakpoint_kind_from_pc = nullptr;
+  gdbarch_sw_breakpoint_from_kind_ftype *sw_breakpoint_from_kind = NULL;
+  gdbarch_breakpoint_kind_from_current_state_ftype *breakpoint_kind_from_current_state = default_breakpoint_kind_from_current_state;
+  gdbarch_adjust_breakpoint_address_ftype *adjust_breakpoint_address = nullptr;
+  gdbarch_memory_insert_breakpoint_ftype *memory_insert_breakpoint = default_memory_insert_breakpoint;
+  gdbarch_memory_remove_breakpoint_ftype *memory_remove_breakpoint = default_memory_remove_breakpoint;
+  CORE_ADDR decr_pc_after_break = 0;
+  CORE_ADDR deprecated_function_start_offset = 0;
+  gdbarch_remote_register_number_ftype *remote_register_number = default_remote_register_number;
+  gdbarch_fetch_tls_load_module_address_ftype *fetch_tls_load_module_address = nullptr;
+  gdbarch_get_thread_local_address_ftype *get_thread_local_address = nullptr;
+  CORE_ADDR frame_args_skip = 0;
+  gdbarch_unwind_pc_ftype *unwind_pc = default_unwind_pc;
+  gdbarch_unwind_sp_ftype *unwind_sp = default_unwind_sp;
+  gdbarch_frame_num_args_ftype *frame_num_args = nullptr;
+  gdbarch_frame_align_ftype *frame_align = nullptr;
+  gdbarch_stabs_argument_has_addr_ftype *stabs_argument_has_addr = default_stabs_argument_has_addr;
+  int frame_red_zone_size = 0;
+  gdbarch_convert_from_func_ptr_addr_ftype *convert_from_func_ptr_addr = convert_from_func_ptr_addr_identity;
+  gdbarch_addr_bits_remove_ftype *addr_bits_remove = core_addr_identity;
+  gdbarch_remove_non_address_bits_ftype *remove_non_address_bits = default_remove_non_address_bits;
+  gdbarch_memtag_to_string_ftype *memtag_to_string = default_memtag_to_string;
+  gdbarch_tagged_address_p_ftype *tagged_address_p = default_tagged_address_p;
+  gdbarch_memtag_matches_p_ftype *memtag_matches_p = default_memtag_matches_p;
+  gdbarch_set_memtags_ftype *set_memtags = default_set_memtags;
+  gdbarch_get_memtag_ftype *get_memtag = default_get_memtag;
+  CORE_ADDR memtag_granule_size = 0;
+  gdbarch_software_single_step_ftype *software_single_step = nullptr;
+  gdbarch_single_step_through_delay_ftype *single_step_through_delay = nullptr;
+  gdbarch_print_insn_ftype *print_insn = default_print_insn;
+  gdbarch_skip_trampoline_code_ftype *skip_trampoline_code = generic_skip_trampoline_code;
+  const solib_ops * so_ops = &solib_target_so_ops;
+  gdbarch_skip_solib_resolver_ftype *skip_solib_resolver = generic_skip_solib_resolver;
+  gdbarch_in_solib_return_trampoline_ftype *in_solib_return_trampoline = generic_in_solib_return_trampoline;
+  gdbarch_in_indirect_branch_thunk_ftype *in_indirect_branch_thunk = default_in_indirect_branch_thunk;
+  gdbarch_stack_frame_destroyed_p_ftype *stack_frame_destroyed_p = generic_stack_frame_destroyed_p;
+  gdbarch_elf_make_msymbol_special_ftype *elf_make_msymbol_special = nullptr;
+  gdbarch_coff_make_msymbol_special_ftype *coff_make_msymbol_special = default_coff_make_msymbol_special;
+  gdbarch_make_symbol_special_ftype *make_symbol_special = default_make_symbol_special;
+  gdbarch_adjust_dwarf2_addr_ftype *adjust_dwarf2_addr = default_adjust_dwarf2_addr;
+  gdbarch_adjust_dwarf2_line_ftype *adjust_dwarf2_line = default_adjust_dwarf2_line;
+  int cannot_step_breakpoint = 0;
+  int have_nonsteppable_watchpoint = 0;
+  gdbarch_address_class_type_flags_ftype *address_class_type_flags = nullptr;
+  gdbarch_address_class_type_flags_to_name_ftype *address_class_type_flags_to_name = nullptr;
+  gdbarch_execute_dwarf_cfa_vendor_op_ftype *execute_dwarf_cfa_vendor_op = default_execute_dwarf_cfa_vendor_op;
+  gdbarch_address_class_name_to_type_flags_ftype *address_class_name_to_type_flags = nullptr;
+  gdbarch_register_reggroup_p_ftype *register_reggroup_p = default_register_reggroup_p;
+  gdbarch_fetch_pointer_argument_ftype *fetch_pointer_argument = nullptr;
+  gdbarch_iterate_over_regset_sections_ftype *iterate_over_regset_sections = nullptr;
+  gdbarch_make_corefile_notes_ftype *make_corefile_notes = nullptr;
+  gdbarch_find_memory_regions_ftype *find_memory_regions = nullptr;
+  gdbarch_create_memtag_section_ftype *create_memtag_section = nullptr;
+  gdbarch_fill_memtag_section_ftype *fill_memtag_section = nullptr;
+  gdbarch_decode_memtag_section_ftype *decode_memtag_section = nullptr;
+  gdbarch_core_xfer_shared_libraries_ftype *core_xfer_shared_libraries = nullptr;
+  gdbarch_core_xfer_shared_libraries_aix_ftype *core_xfer_shared_libraries_aix = nullptr;
+  gdbarch_core_pid_to_str_ftype *core_pid_to_str = nullptr;
+  gdbarch_core_thread_name_ftype *core_thread_name = nullptr;
+  gdbarch_core_xfer_siginfo_ftype *core_xfer_siginfo = nullptr;
+  gdbarch_core_read_x86_xsave_layout_ftype *core_read_x86_xsave_layout = nullptr;
+  const char * gcore_bfd_target = 0;
+  int vtable_function_descriptors = 0;
+  int vbit_in_delta = 0;
+  gdbarch_skip_permanent_breakpoint_ftype *skip_permanent_breakpoint = default_skip_permanent_breakpoint;
+  ULONGEST max_insn_length = 0;
+  gdbarch_displaced_step_copy_insn_ftype *displaced_step_copy_insn = nullptr;
+  gdbarch_displaced_step_hw_singlestep_ftype *displaced_step_hw_singlestep = default_displaced_step_hw_singlestep;
+  gdbarch_displaced_step_fixup_ftype *displaced_step_fixup = NULL;
+  gdbarch_displaced_step_prepare_ftype *displaced_step_prepare = nullptr;
+  gdbarch_displaced_step_finish_ftype *displaced_step_finish = NULL;
+  gdbarch_displaced_step_copy_insn_closure_by_addr_ftype *displaced_step_copy_insn_closure_by_addr = nullptr;
+  gdbarch_displaced_step_restore_all_in_ptid_ftype *displaced_step_restore_all_in_ptid = nullptr;
+  ULONGEST displaced_step_buffer_length = 0;
+  gdbarch_relocate_instruction_ftype *relocate_instruction = NULL;
+  gdbarch_overlay_update_ftype *overlay_update = nullptr;
+  gdbarch_core_read_description_ftype *core_read_description = nullptr;
+  int sofun_address_maybe_missing = 0;
+  gdbarch_process_record_ftype *process_record = nullptr;
+  gdbarch_process_record_signal_ftype *process_record_signal = nullptr;
+  gdbarch_gdb_signal_from_target_ftype *gdb_signal_from_target = nullptr;
+  gdbarch_gdb_signal_to_target_ftype *gdb_signal_to_target = nullptr;
+  gdbarch_get_siginfo_type_ftype *get_siginfo_type = nullptr;
+  gdbarch_record_special_symbol_ftype *record_special_symbol = nullptr;
+  gdbarch_get_syscall_number_ftype *get_syscall_number = nullptr;
+  const char * xml_syscall_file = 0;
+  struct syscalls_info * syscalls_info = 0;
+  const char *const * stap_integer_prefixes = 0;
+  const char *const * stap_integer_suffixes = 0;
+  const char *const * stap_register_prefixes = 0;
+  const char *const * stap_register_suffixes = 0;
+  const char *const * stap_register_indirection_prefixes = 0;
+  const char *const * stap_register_indirection_suffixes = 0;
+  const char * stap_gdb_register_prefix = 0;
+  const char * stap_gdb_register_suffix = 0;
+  gdbarch_stap_is_single_operand_ftype *stap_is_single_operand = nullptr;
+  gdbarch_stap_parse_special_token_ftype *stap_parse_special_token = nullptr;
+  gdbarch_stap_adjust_register_ftype *stap_adjust_register = nullptr;
+  gdbarch_dtrace_parse_probe_argument_ftype *dtrace_parse_probe_argument = nullptr;
+  gdbarch_dtrace_probe_is_enabled_ftype *dtrace_probe_is_enabled = nullptr;
+  gdbarch_dtrace_enable_probe_ftype *dtrace_enable_probe = nullptr;
+  gdbarch_dtrace_disable_probe_ftype *dtrace_disable_probe = nullptr;
+  int has_global_solist = 0;
+  int has_global_breakpoints = 0;
+  gdbarch_has_shared_address_space_ftype *has_shared_address_space = default_has_shared_address_space;
+  gdbarch_fast_tracepoint_valid_at_ftype *fast_tracepoint_valid_at = default_fast_tracepoint_valid_at;
+  gdbarch_guess_tracepoint_registers_ftype *guess_tracepoint_registers = default_guess_tracepoint_registers;
+  gdbarch_auto_charset_ftype *auto_charset = default_auto_charset;
+  gdbarch_auto_wide_charset_ftype *auto_wide_charset = default_auto_wide_charset;
+  const char * solib_symbols_extension = 0;
+  int has_dos_based_file_system = 0;
+  gdbarch_gen_return_address_ftype *gen_return_address = default_gen_return_address;
+  gdbarch_info_proc_ftype *info_proc = nullptr;
+  gdbarch_core_info_proc_ftype *core_info_proc = nullptr;
+  gdbarch_iterate_over_objfiles_in_search_order_ftype *iterate_over_objfiles_in_search_order = default_iterate_over_objfiles_in_search_order;
+  struct ravenscar_arch_ops * ravenscar_ops = NULL;
+  gdbarch_insn_is_call_ftype *insn_is_call = default_insn_is_call;
+  gdbarch_insn_is_ret_ftype *insn_is_ret = default_insn_is_ret;
+  gdbarch_insn_is_jump_ftype *insn_is_jump = default_insn_is_jump;
+  gdbarch_program_breakpoint_here_p_ftype *program_breakpoint_here_p = default_program_breakpoint_here_p;
+  gdbarch_auxv_parse_ftype *auxv_parse = nullptr;
+  gdbarch_print_auxv_entry_ftype *print_auxv_entry = default_print_auxv_entry;
+  gdbarch_vsyscall_range_ftype *vsyscall_range = default_vsyscall_range;
+  gdbarch_infcall_mmap_ftype *infcall_mmap = default_infcall_mmap;
+  gdbarch_infcall_munmap_ftype *infcall_munmap = default_infcall_munmap;
+  gdbarch_gcc_target_options_ftype *gcc_target_options = default_gcc_target_options;
+  gdbarch_gnu_triplet_regexp_ftype *gnu_triplet_regexp = default_gnu_triplet_regexp;
+  gdbarch_addressable_memory_unit_size_ftype *addressable_memory_unit_size = default_addressable_memory_unit_size;
+  const char * disassembler_options_implicit = 0;
+  std::string * disassembler_options = 0;
+  const disasm_options_and_args_t * valid_disassembler_options = 0;
+  gdbarch_type_align_ftype *type_align = default_type_align;
+  gdbarch_get_pc_address_flags_ftype *get_pc_address_flags = default_get_pc_address_flags;
+  gdbarch_read_core_file_mappings_ftype *read_core_file_mappings = default_read_core_file_mappings;
+  gdbarch_use_target_description_from_corefile_notes_ftype *use_target_description_from_corefile_notes = default_use_target_description_from_corefile_notes;
+};
+```
+
+</spoiler>
+
+Если посмотрели на код, то могли заметить большое количество полей, название типа которых в конце имеет `_ftype`. Можно сказать, что `gdbarch` - это интерфейс, у которого все методы по умолчанию не реализованы (значит не поддерживаются). Каждая поддерживаемая архитектура записывает в эти поля свои обработчики (реализует их). Например, для функции `skip_main_prologue` нашел поддерживаемые архитектуры: `x86_64`, `x86`, `FR-V`, `RS/6000`, `ARM`.
+
+Доступ к этим методам выполняется с первоначальной проверкой, что этот метод реализован (не `NULL`). Причем выполняется эта проверка не вручную, а с помощью функций `gdbarch_XXX_p` (`XXX` - это название функций). Для того же `skip_main_prologue` будет следующий интерфейс доступа:
+
+<spoiler title="Доступ к skip_main_prologue">
+
+```c++
+/* gdb/gdbarch.c */
+bool
+gdbarch_skip_main_prologue_p (struct gdbarch *gdbarch)
+{
+  gdb_assert (gdbarch != NULL);
+  return gdbarch->skip_main_prologue != NULL;
+}
+
+CORE_ADDR
+gdbarch_skip_main_prologue (struct gdbarch *gdbarch, CORE_ADDR ip)
+{
+  gdb_assert (gdbarch != NULL);
+  gdb_assert (gdbarch->skip_main_prologue != NULL);
+  if (gdbarch_debug >= 2)
+    gdb_printf (gdb_stdlog, "gdbarch_skip_main_prologue called\n");
+  return gdbarch->skip_main_prologue (gdbarch, ip);
+}
+
+void
+set_gdbarch_skip_main_prologue (struct gdbarch *gdbarch,
+				gdbarch_skip_main_prologue_ftype skip_main_prologue)
+{
+  gdbarch->skip_main_prologue = skip_main_prologue;
+}
+
+```
+
+</spoiler>
+
+Но это не единственная точка расширяемости - многая часть функциональности реализована в виде интерфейса (структура с указателями на функции). Многие из таких имеют суффикс `ops`. Например, есть интерфейсы для:
 
 - Точек останова - `breakpoint_ops` (поставить точку останова)
 - Отлаживаемого процесса - `target_ops` (продолжить выполнение, присоединиться)
@@ -3730,46 +4324,32 @@ gdb должен быть максимально кросс-платформен
 - Записи трейса - `trace_file_write_ops` (открытие/закрытие файла, запись)
 - Вычисления адреса символа - `symbol_computed_ops` (описание расположения, получение значения)
 
-Есть много других, но о них не буду говорить.
-
-<spoiler title="О стиле кода">
-
-TODO: про отступы, стиль кода, смешение C и C++
-
-</spoiler>
-
-Моя машина - Linux, x86_64. Для нее будут использованы следующие ops/функции:
+Есть много других, но о них не буду говорить, но остановлюсь на моем сетапе - Linux, x86_64. Для нее будут использованы следующие ops/функции:
 
 - `svr4_so_ops` - взаимодействие с динамическими библиотеками SVR4
 - `code_breakpoint_ops` - дефолтный интерфейс создания точек останова
 - `amd64_linux_XXX` - семейство функций для работы с платформой - регистры, стек ... (находятся в `amd64-linux-tdep.c`)
 - `i386_gdbarch_tdep` - структура с платформо-зависимыми функциями (включает в себя `amd64_linux_XXX` функции выше)
 
-Теперь, рассмотрим то, как реализуется функциональность написанная ранее.
+Теперь, рассмотрим то, как реализуется функциональность отладчика.
 
 ### Старт
 
 Для начала, рассмотрим что происходит на старте: запуск процесса и чтение символов.
 
-Первым идет чтение символов запускаемого файла - как основные, так и отладочные.
-Я компилирую в ELF, поэтому для его чтения используется функция `elf_symfile_read`.
-
-Для чтения отладочных символов DWARF используется `cooked_index_worker`.
-Точнее это интерфейс, который реализуют 2 основных класса и каждый ответственнен за свою секцию:
+Первым идет чтение символов запускаемого файла - как основные, так и отладочные. Для обработки ELF файлов используется функция `elf_symfile_read`. Символы отладки использую DWARF - для них используется функция `cooked_index_worker`. Точнее это интерфейс, который реализуют 2 основных класса и каждый ответственнен за свою секцию:
 
 - `cooked_index_debug_names` - `.debug_names`
 - `cooked_index_debug_info` - `.debug_info`, `.debug_types` ...
 
-Первый - читает все строки из `.debug_names` секции.
-Более интересен второй, так как в `.debug_info` и `.debug_types` содержится основная отладочная информация - DIE.
+Первый - читает все строки из `.debug_names` секции. Более интересен второй, так как в `.debug_info` и `.debug_types` содержится основная отладочная информация - DIE.
 
-Логика обработки `.debug_info` (со всеми его DIE) содержится в методе `index_dies` класса `cooked_indexer`.
-Там находится большой `while` цикл, проходящийся по всем DIE и рекурсивно спускающийся к дочерним.
-Например, вот кусок обработки `DW_TAG_subprogram`:
+Логика обработки `.debug_info` (со всеми его DIE) содержится в методе `index_dies` класса `cooked_indexer`. Там находится большой `while` цикл, проходящийся по всем DIE и рекурсивно спускающийся к дочерним. Например, вот кусок обработки `DW_TAG_subprogram`:
 
 <spoiler title="Обработка DW_TAG_subprogram">
 
 ```c++
+/* gdb/dwarf2/read.c */
 const gdb_byte *
 cooked_indexer::index_dies (cutu_reader *reader,
 			    const gdb_byte *info_ptr,
@@ -3824,7 +4404,7 @@ cooked_indexer::index_dies (cutu_reader *reader,
 }
 ```
 
-Обратите внимание на функцию `recurse`. Она рекурсивно вызывает тот же метод `index_dies`, но в отличие от первого запуска уже передает указатель на родителя:
+Рекурсивная часть реализовано функцией `recurse` - рекурсивно вызывает тот же метод `index_dies`, но в отличие от первого запуска уже передает указатель на родителя (в самом начале передавался `NULL`):
 
 ```c++
 const gdb_byte *
@@ -3854,22 +4434,15 @@ cooked_indexer::recurse (cutu_reader *reader,
 
 </spoiler>
 
-Также стоит обратить внимание и на то как читаются отладочные символы.
-В больших программах отладочной информации много и прочитать их все в 1 поток может занять большое количество времени.
-Поэтому здесь вступает в работу фоновая многопоточная обработка.
+Также стоит обратить внимание и на то как читаются отладочные символы. В больших программах отладочной информации много и прочитать их все в 1 поток может занять большое количество времени. Поэтому здесь вступает в работу фоновая многопоточная обработка.
 
-В фоновом потоке запукается основная функция чтения отладочных символов.
-Если говорим о gdb, то это значит, что между моментом его запуска (или указания исполняемого файла) до момента когда символы необходимы (сам запуск) может пройти время.
-Поэтому чтобы впустую не останавливать работу эта часть переклаывается на фоновый поток и, когда происходит запуск (все отложенные операции надо применить), просто дожидаемся когда этот фоновый воркер закончит работу.
+В фоновом потоке запукается основная функция чтения отладочных символов - `cooked_index_worker::start`. Но так как к моменту запуска отлаживаемого процесса символы еще могут быть не считаны, то дополнительно используется лок, который ожидает `gdb`.
 
-Но это еще не все. Для большей оптимизации эта работа распараллеливается.
-У нас есть множество CU, которые между собой не связаны. Это и есть точка распараллеливания.
-Но будет плохо если 1 поток возьмет 2 CU по 100Мб, а другой тоже 2, но по 1Мб.
-Поэтому для распределения CU используется их размер - каждому выделяется примерно равное количество CU по размеру (сумма размеров CU / количество потоков).
+Но это еще не все. Для большей оптимизации эта работа распараллеливается. У нас есть множество CU, которые между собой не связаны. Это и есть точка распараллеливания. Но будет плохо если 1 поток возьмет 2 CU по 100Мб, а другой тоже 2, но по 1Мб. Поэтому для распределения CU используется их размер - каждому выделяется примерно равное количество CU по размеру (сумма размеров CU / количество потоков).
 
 <spoiler title="Иллюстрация">
 
-В комментариях я нашел такую интересную иллюстрацию того как организовано чтение отладочных символов с точки зрения работы кода.
+В комментариях `gdb/dwarf2/cooked-index.h` я нашел такую интересную иллюстрацию того как организовано чтение отладочных символов с точки зрения работы кода.
 
 ```c++
 /* The main index of DIEs.
@@ -3932,10 +4505,9 @@ cooked_indexer::recurse (cutu_reader *reader,
 
 Перейдем к точкам останова.
 
-В gdb имеется общая структура `breakpoint`. Она может представлять не только точки останова, но трейспоинты ([tracepoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Tracepoints.html)), и вотчпоинты ([watchpoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Set-Watchpoints.html)).
-Дополнительно, они разделяются на `Software` и `Hardware` - последние реализуются с помощью поддержки железа (как можно догадаться). Например, с их помощью можно реализовать отслеживание изменения какого-либо участка памяти (data breakpoint).
+В `gdb` имеется общая структура `breakpoint`. Она может представлять не только точки останова, но tracepoint'ы ([tracepoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Tracepoints.html)), и watchpoint'ы ([watchpoint](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/Set-Watchpoints.html)). Дополнительно идет разделение на `Software` (программные) и `Hardware` (аппаратные) точки останова - последние реализуются с помощью поддержки железа (как можно догадаться). Например, они используются для реализации отслеживания изменения какого-либо участка памяти (data breakpoint).
 
-В перечислении `bp_loc_type` хранятся различаемые типы точек останова:
+Перечисление `bp_loc_type` хранит различаемые типы точек останова:
 
 ```c
 enum bp_loc_type
@@ -3949,16 +4521,12 @@ enum bp_loc_type
 };
 ```
 
-Чтобы поставить точку останова необходимо вызвать большое количество функций.
-По большей части это все абстракции.
-
-Но логика выставления точки останова практически такая же как написали мы: находим адрес инструкции, читаем старое значение, заменяем первый байт на `0xCC`, записываем и сохраняем старое значение.
-TODO: ссылка
-Эта логика хранится в [`default_memory_insert_breakpoint`](gdb/mem-break.c)
+Чтобы поставить точку останова необходимо вызвать большое количество функций. По большей части это все абстракции. Но логика выставления точки останова практически такая же как написали мы: находим адрес инструкции, читаем старое значение, заменяем первый байт на `0xCC`, записываем и сохраняем старое значение. Эта логика хранится в функции `default_memory_insert_breakpoint`.
 
 <spoiler title="default_memory_insert_breakpoint">
 
 ```c++
+/* gdb/mem-break.c */
 /* Insert a breakpoint on targets that don't have any better
    breakpoint support.  We read the contents of the target location
    and stash it, then overwrite it with a breakpoint instruction.
@@ -4007,32 +4575,24 @@ default_memory_insert_breakpoint (struct gdbarch *gdbarch,
 
 </spoiler>
 
-> Также стоит отметить, что точки останова выставляются лениво - только после продолжения выполнения (команда `continue`).
-> До этого изменения просто накапливаются.
+Но перед тем как переходить к следующему шагу, надо рассмотреть то, как происходит работа с памятью отлаживаемого процесса. Здесь также используется своя инфраструктура. Функции `target_read_raw_memory` и `target_write_raw_memory` можно назвать интерфейсом этой инфраструктуры - чтение и запись, соответственно.
+Платформо-зависимые функции хранятся в интерфейсе `target_ops` (см. выше). Здесь нам интересна функция/поле `to_xfer_partial`. Функции которые занимаются чтением/записью памяти имеют в себе `xfer` (`X transFER`) - потому что в ядре своем имеется единственная функция, логика которой зависит от передаваемых аргументов.
 
-Но перед тем как переходить к следующему шагу, надо рассмотреть то, как происходит работа с памятью отлаживаемого процесса.
-Здесь также используется своя инфраструктура.
-Функции `target_read_raw_memory` и `target_write_raw_memory` можно назвать интерфейсом этой инфраструктуры - чтение и запись, соответственно.
-Платформо-зависимые функции хранятся в `target_ops` (см. выше). Здесь нам интересна функция/поле `to_xfer_partial`.
-Функции которые занимаются чтением/записью памяти имеют в себе `xfer` (`X transFER`) - потому что в ядре своем имеется одна и та же функция, а ее логика зависит от передаваемых аргументов.
+`gdb` хранит внутри вебя кэш памяти процесса. Когда происходит запрос на чтение или запись, то вначале информация ищется в нем.
 
-gdb хранит внутри вебя кэш памяти процесса. Когда происходит запрос на чтение или запись, то вначале информация ищется в нем.
-Этот кэш называется 
-
-Теперь вопрос - как ведется работа с памятью в процессе? В своем отладчике я использовал `ptrace`. Это рабочий подход, но если потребуется прочитать большой участок памяти, то могут возникнуть проблемы с производительностью.
-Эта задача решается тем, что мы читаем из файла памяти процесса - `/proc/<PID>/mem`.
-Для чтения/записи используются `pread64` и `pwrite64` соответственно (либо обычные `read`/`write` если отсутствуют).
+Теперь вопрос - как ведется работа с памятью в процессе? В своем отладчике я использовал `ptrace` для чтения/записи в его адресное пространство. Это рабочий подход, но если потребуется прочитать большой участок памяти, то могут возникнуть проблемы с производительностью. В реальном мире эта задача решается тем, что мы используем `procfs` - читаем из файла памяти процесса: `/proc/<PID>/mem`. Для чтения/записи используются системные вызовы `pread64` и `pwrite64` соответственно (либо обычные `read`/`write` если отсутствуют).
 
 Сама функция для чтения/записи памяти из файла:
 
 <spoiler title="linux_proc_xfer_memory_partial_fd">
 
 ```c++
+/* gdb/linux-nat.c */
+
 /* Helper for linux_proc_xfer_memory_partial and
    proc_mem_file_is_writable.  FD is the already opened /proc/pid/mem
    file, and PID is the pid of the corresponding process.  The rest of
    the arguments are like linux_proc_xfer_memory_partial's.  */
-
 static enum target_xfer_status
 linux_proc_xfer_memory_partial_fd (int fd, int pid,
 				   gdb_byte *readbuf, const gdb_byte *writebuf,
@@ -4088,23 +4648,19 @@ linux_proc_xfer_memory_partial_fd (int fd, int pid,
 
 </spoiler>
 
-> У этого подхода есть преимущество - мы можем продолжить читать память даже если какой-то поток будет уничтожен.
-> Более того - это файл, значит мы можем читать память даже тогда, когда все потоки запущены (`ptrace` такое не допускает)
+> У этого подхода есть преимущество - мы можем продолжить читать память даже если какой-то поток будет уничтожен. Более того - это файл, значит мы можем читать память даже тогда, когда все потоки запущены (`ptrace` такое не допускает)
 
-Но это возможно только если `/proc/<PID>/mem` файл доступен для записи. Для устаревших ядер (в документации указывается ядро RHEL6) происходит откат к `ptrace` реализации.
-
-Логика чтения с помощью `ptrace` заключена в функции `inf_ptrace_peek_poke`.
-Она довольно проста - последовательно вызываем `ptrace` пока буфер не окажется нужной длины.
-Единственное, что хочется отметить - `ptrace` обернут своей функцией `gdb_ptrace`.
+Но это возможно только если `/proc/<PID>/mem` файл доступен для записи. Для устаревших ядер (примером в документации указывается ядро RHEL6) происходит откат к `ptrace` реализации. Ее логика работы заключена в функции `inf_ptrace_peek_poke`. Она довольно проста - последовательно вызываем `ptrace` пока буфер не окажется нужной длины. Единственное, что хочется отметить - `ptrace` обернут своей функцией `gdb_ptrace`.
 
 <spoiler title="inf_ptrace_peek_poke">
 
 ```c++
+/* gdb/inf-ptrace.c */
+
 /* Transfer data via ptrace into process PID's memory from WRITEBUF, or
    from process PID's memory into READBUF.  Start at target address ADDR
    and transfer up to LEN bytes.  Exactly one of READBUF and WRITEBUF must
    be non-null.  Return the number of transferred bytes.  */
-
 static ULONGEST
 inf_ptrace_peek_poke (ptid_t ptid, gdb_byte *readbuf,
 		      const gdb_byte *writebuf,
@@ -4169,26 +4725,19 @@ inf_ptrace_peek_poke (ptid_t ptid, gdb_byte *readbuf,
 
 </spoiler>
 
-Кроме этих способов есть еще один - системные вызовы `process_vm_readv` и `process_vm_writev`.
-Они позволяют читать и писать в адресное пространство другого процесса, причем передать за раз можно несколько буферов (для передачи используется вектор, `v` в названии).
-Но его использование отклонили из-за нескольких проблем:
+Кроме этих способов есть еще один - системные вызовы `process_vm_readv` и `process_vm_writev`. Они позволяют читать и писать в адресное пространство другого процесса, причем передать за раз можно несколько буферов (векторное чтение, `v` в названии). Но его использование отклонили из-за нескольких проблем:
 
 1. `process_vm_writev` не позволяет записывать в RO страницы. Это критический недостаток, так как именно таким способом и ставятся точки останова.
 2. `process_vm_*v` может вызвать гонку в моменты, когда дочерний процесс вызывает какой-либо `exec`, так как адресное пространство будет изменено.
 
-TODO: amd64_analyze_prologue - определение пролога функции своими руками, amd64_skip_prologue - пропуск пролога
-
 <spoiler title="Различные точки останова">
 
-TODO: про различные точки останова: longjmp, watchpoint, momentary и т.д.
-
-В gdb существует большое количество типов точек останова.
-Хоть они все и делают одно и то же (останавливают работу дочернего процесса), различается метод их обработки.
-Их виды описаны в перечислении `bptype`:
+В gdb существует большое количество типов точек останова. Хоть они все и делают одно и то же (останавливают работу дочернего процесса), различается метод их обработки. Их виды описаны в перечислении `bptype`:
 
 ```c++
-/* Type of breakpoint.  */
+/* gdb/breakpoint.h */
 
+/* Type of breakpoint.  */
 enum bptype
   {
     bp_none = 0,		/* Eventpoint has been deleted */
@@ -4327,54 +4876,70 @@ enum bptype
 - `bp_step_resume`
 - `bp_finish`
 
-Первые 2 для реализации step over и step in, а 3 - для step out.
+Первые 2 для реализации одного шага инструкции, step over и step in, а 3 - для step out.
 
 </spoiler>
 
 ### Step in/out/over
 
-Теперь самая интересная часть - шаги в коде.
-Пойдем также - step in, step over, step out. У gdb другое именование - step, next и fininsh соответственно.
-Я буду использовать step XXX именование для единообразия.
+Теперь самая интересная часть - шаги в коде. Пойдем также - step in, step over, step out. У gdb другое именование - step, next и fininsh соответственно. Я буду использовать step XXX именование для единообразия.
+
+Но в начале рассмотрим шаг инструкции.
+
+#### Single instruction step
+
+Семантика step over и step in распространяется и на инструкции. Только здесь эту логику реализовать немного проще - мы точно знаем какие инструкции могут вызвать ветвление. Их надо просто декодировать и определить.
+
+Начнем с простого - step in. Тут все просто - нужно вызвать `ptrace(PTRACE_SINGLESTEP)`. Эта логика содержится в методе `i386_linux_nat_target::low_resume`.
+
+<spoiler title="Шаг инструкции step in">
+
+```c++
+/* gdb/i386-linux-nat.c */
+void
+i386_linux_nat_target::low_resume (ptid_t ptid, int step, enum gdb_signal signal)
+{
+  /* ... */
+  if (step)
+    {
+      /* ... */
+      request = PTRACE_SINGLESTEP;
+      /* ... */
+    }
+  /* ... */
+  ptrace (request, pid, 0, gdb_signal_to_host (signal));
+}
+```
+
+</spoiler>
+
+Более интересная ситуация со step over. Как уже сказал, нам нужно обойти инструкцию ветвления, но вот никакого декодирования инструкции не происходит. Все довольно просто - мы выполняем 1 шаг (`PTRACE_SINGLESTEP`) и сохраняем информацию о том, что начали шаг step over. Когда получаем сигнал остановки, то проверяем не в процессе ли мы шага. Если так, то ставим точку останова на адресе возврата. Описание того, как это происходит в следующей секции.
 
 #### Step over
 
-Обработка step over разделена на 2 части: запуск и обработка останова.
-Вспомним, что архитектура событийно-ориентированная, поэтому эти 2 части можно описать так:
+Обработка step over разделена на 2 части: запуск и обработка останова. Вспомним, что архитектура событийно-ориентированная, поэтому эти 2 части можно описать так:
 
 - Запуск - настройка окружения и запуск процесса
 - Обработка останова - решаем что делать, когда процесс остановился
 
-И вот тут начинается разница с нашей реализацией. В dumbugger я ставил точку останова на все строки внутри этой функции, а после удалял.
-В gdb используется другой подход:
+И вот тут начинается разница с реализацией dumbugger - я ставил точку останова на все строки внутри этой функции, а после удалял. В gdb используется другой подход: выполняем по одной инструкции до тех пор пока текущая строка не поменяется, а если мы встретим вызов функции, то ставим точку останова на адрес возврата.
 
-> Выполняем по одной инструкции до тех пор пока текущая строка не поменяется.
-> Но если мы встретим вызов функции, то ставим точку останова на адрес возврата.
+Работает это таким образом. На этапе запуска вызывается `step_1`. Главное что она выполняет - инициализирует `thread_control_state`. Это структура, которая хранит состояние для выполнения логики `step`. Например, диапазон PC текущей строки, фрейм, в котором начали выполнение, и т.д.
 
-Работает это таким образом. На этапе запуска вызывается `step_1`.
-Главное что она выполняет - инициализирует `thread_control_state`.
-Это структура, которая хранит состояние для выполнения логики `step`.
-Например, диапазон PC текущей строки, фрейм, в котором начали выполнение, и т.д.
+После того, как подготовили свое состояние, начинаем выполнять по одной инструкции - `ptrace(PTRACE_SINGLESTEP)`. На этом завершается 1-ая и начинается 2-ая часть. Она заключается в постоянной обработке остановки дочернего процесса - каждый раз после его остановки соответствующий сигнал будет отправляться gdb (событийно-ориентированная архитектура).
 
-После того, как определились начинаем выполнять по одной инструкции - `ptrace(PTRACE_SINGLESTEP)`.
-На этом завершается 1 и начинается 2 часть.
-Она заключается в постоянной обработке остановки дочернего процесса - каждый раз после его остановки соответствующий сигнал будет отправляться gdb (событийно-ориентированная архитектура).
-
-Когда мы выполняем инструкции, у нас есть 2 исхода - переходим к следующей инструкции или вызываем функцию.
-Каждый раз, когда мы останавливаемся, то проверяем где:
+Когда мы выполняем инструкции, у нас есть 2 исхода - переходим к следующей инструкции или вызываем функцию (ветвления по типу `jmp` или `loop` - это к step in). Каждый раз мы проверяем где остановились
 
 1. В том же диапазоне инструкций
 2. Вышли за диапазон, но заметили, что находимся в начале какой-то функции
 3. Вышли за диапазон
 
-3-ий случай - завершение работы. На этом можно вернуть управление пользователю и продолжать выполнять его команды.
-Но нас интересуют 2 остальных.
+3-ий случай - завершение шага. На этом можно вернуть управление пользователю и продолжать выполнять его команды. Но нас интересуют 2 остальных.
 
-Если мы находимся в том же диапазоне, то продолжаем выполнение. Но выполняем по одной инструкции за раз.
-Благодаря этому нам не надо постоянно перезаписывать память процесса (ставить точки останова).
-Обнаруживаем это с помощью такой проверки:
+Если мы находимся в том же диапазоне, то продолжаем выполнение. Но выполняем по одной инструкции за раз. Благодаря этому нам не надо постоянно перезаписывать память процесса (ставить точки останова). Обнаруживаем это с помощью такой проверки:
 
 ```c++
+/* gdb/infrun.c */
 if (pc_in_thread_step_range (ecs->event_thread->stop_pc (),
 			     ecs->event_thread)
     && (execution_direction != EXEC_REVERSE
@@ -4385,11 +4950,10 @@ if (pc_in_thread_step_range (ecs->event_thread->stop_pc (),
   }
 ```
 
-Но что если мы вызывали функцию? gdb в этом случае ставит точку на адресе возврата и продолжает выполнение.
-По возвращении выполняет ту же самую проверку (3 варианта выше).
-За эту ситуацию отвечает этот код:
+Но что если мы вызывали функцию? `gdb` в этом случае ставит точку на адресе возврата и продолжает выполнение. По возвращении выполняет ту же самую проверку (3 варианта выше). За эту ситуацию отвечает этот код:
 
 ```c++
+/* gdb/infrun.c */
 if ((get_stack_frame_id (frame)
      != ecs->event_thread->control.step_stack_frame_id)
     && get_frame_type (frame) != SIGTRAMP_FRAME
@@ -4410,17 +4974,69 @@ if ((get_stack_frame_id (frame)
   }
 ```
 
-Можно заметить, что для проверки функций используется структура `frame_id`.
-gdb для каждой функции создает свой уникальный слепок. Он вычисляется в функции `compute_frame_id`.
-Внутри же вызывается функция из поля `this_id` - именно в ней и содержится основная логика.
-Например, для моей программы вызвалась `dwarf2_frame_this_id`, так как я использовал символы отладки DWARF.
+Можно заметить, что для проверки функций используется структура `frame_id`. gdb для каждой функции создает свой уникальный слепок (просто структура с полями). Он вычисляется в функции `compute_frame_id`. Внутри же вызывается функция из поля `this_id` - именно в ней и содержится основная логика. Например, для моей программы вызвалась `dwarf2_frame_this_id`, так как я использовал символы отладки DWARF.
+
+<spoiler title="Вычисление слепка фрейма">
+
+```c++
+/* gdb/frame.c */
+static void
+compute_frame_id (const frame_info_ptr &fi)
+{
+  /* ... */
+  unsigned int entry_generation = get_frame_cache_generation ();
+  /* Mark this frame's id as "being computed.  */
+  fi->this_id.p = frame_id_status::COMPUTING;
+
+  /* Find the unwinder.  */
+  if (fi->unwind == NULL)
+    frame_unwind_find_by_frame (fi, &fi->prologue_cache);
+  
+  /* Find THIS frame's ID.  */
+  /* Default to outermost if no ID is found.  */
+  fi->this_id.value = outer_frame_id;
+  fi->unwind->this_id (fi, &fi->prologue_cache, &fi->this_id.value);
+}
+
+/* gdb/dwarf2/frame.c */
+static void
+dwarf2_frame_this_id (const frame_info_ptr &this_frame, void **this_cache,
+		      struct frame_id *this_id)
+{
+  struct dwarf2_frame_cache *cache =
+    dwarf2_frame_cache (this_frame, this_cache);
+
+  if (cache->unavailable_retaddr)
+    (*this_id) = frame_id_build_unavailable_stack (get_frame_func (this_frame));
+  else if (cache->undefined_retaddr)
+    return;
+  else
+    (*this_id) = frame_id_build (cache->cfa, get_frame_func (this_frame));
+}
+
+/* gdb/frame.c */
+struct frame_id
+frame_id_build (CORE_ADDR stack_addr, CORE_ADDR code_addr)
+{
+  struct frame_id id = null_frame_id;
+
+  id.stack_addr = stack_addr;
+  id.stack_status = FID_STACK_VALID;
+  id.code_addr = code_addr;
+  id.code_addr_p = true;
+  return id;
+}
+```
+
+</spoiler>
 
 #### Step in
 
-На самом деле, step in и step over - это один и тот же код, просто изначальные условия (`thread_control_state`) немного отличаются: поле `step_over_calls` для `step over` равно `STEP_OVER_ALL`, а для `step in` - `STEP_OVER_NONE`.
-Эту разницу можно увидеть так (флаг `skip_subroutines`):
+На самом деле, step in и step over - это один и тот же код, просто изначальные условия (`thread_control_state`) немного отличаются: поле `step_over_calls` для `step over` равно `STEP_OVER_ALL`, а для `step in` - `STEP_OVER_NONE`. Эту разницу можно увидеть так (см. арг. `skip_subroutines`):
 
 ```c++
+/* gdb/infcmd.c */
+
 /* Step until outside of current statement.  */
 static void
 step_command (const char *count_string, int from_tty)
@@ -4440,11 +5056,14 @@ step_1 (int skip_subroutines, int single_inst, const char *count_string)
 { /* ... */ }
 ```
 
-В таком случае, проверка на `STEP_OVER_ALL` (см. код выше) не сработает и мы пойдем дальше.
-А дальше нас ждем другое условие, под которое мы попадаем:
+В таком случае, проверка на `STEP_OVER_ALL` (см. код выше) не сработает и мы пойдем дальше. А дальше нас ждем другое условие, под которое мы попадаем:
 
 ```c++
+/* gdb/infrun.c */
+static void
+process_event_stop_test (struct execution_control_state *ecs)
 {
+  /* ... */
   struct symtab_and_line tmp_sal;
 
   tmp_sal = find_pc_line (ecs->stop_func_start, 0);
@@ -4459,6 +5078,7 @@ step_1 (int skip_subroutines, int single_inst, const char *count_string)
          handle_step_into_function (gdbarch, ecs);
        return;
     }
+  /* ... */
 }
 ```
 
@@ -4466,11 +5086,7 @@ step_1 (int skip_subroutines, int single_inst, const char *count_string)
 
 #### Step out
 
-Step out реализован немного по другому.
-Вначале мы также выставляем точку остнова. Ставим ее на адрес возврата и продолжаем выполнение.
-Состояние программы представляется как цепочка фреймов (вызовов функций).
-Для получения адреса возврата нам нужно получить предыдущий фрейм в этой цепочке и получить его PC ().
-Предыдущий фрейм находится с помощью функции `get_prev_frame`.
+Step out реализован немного по другому. Вначале мы также выставляем точку остнова: ставим ее на адрес возврата и продолжаем выполнение. Состояние программы представляется как цепочка фреймов (вызовов функций). Для получения адреса возврата нам нужно получить предыдущий фрейм в этой цепочке и получить его PC. Предыдущий фрейм находится с помощью функции `get_prev_frame`.
 
 В функции `finish_forward` заключаются действия 1-ой части - ставим точку останова и продолжаем работу:
 
@@ -4490,8 +5106,6 @@ finish_forward (struct finish_command_fsm *sm, const frame_info_ptr &frame)
 					     get_stack_frame_id (frame),
 					     bp_finish);
 
-  set_longjmp_breakpoint (tp, frame_id);
-
   /* We want to print return value, please...  */
   tp->control.proceed_to_finish = 1;
 
@@ -4499,42 +5113,151 @@ finish_forward (struct finish_command_fsm *sm, const frame_info_ptr &frame)
 }
 ```
 
-Когда точка останова выставлена, то процесс продолжает работу, и после остановки удаляется.
+Когда точка останова выставлена, то процесс продолжает работу. При остановке точка удаляется.
 
-Из интересного - обнаружение `main` - входной точки. В случае step out это важно, так как выходить за пределы `main` нет смысла.
-За это отвечает функция `inside_main_func`. Ее логика проста: получаем название входной точки (символ) и проверяем, что текущий фрейм не этой функции.
-2-ая часть проста - надо проверить адрес. Но 1-ая часть не тривиальна, так как в разных ЯП разное название входной точки.
-Но это решается просто - функция `main_name` возвращает символ входной точки.
-В начале проверяется, что есть символы специфичные для ЯП: `__gnat_ada_main_program_name` (ADA), `D main` (D), `main.main` (go), `_p__M0_main_program` или `pascal_main_program` (Pascal).
-Если не нашлись, то используется стандартный `main`.
+Если помните, то в dumbugger после возвращения из функции я дополнительно выполнял код до следующей строки. Так вот - gdb этого не делает, поэтому кода не будет.
+
+Из интересного - обнаружение `main` - входной точки. В случае step out это важно, так как выходить за пределы `main` нет смысла. За это отвечает функция `inside_main_func`. Ее логика проста: получаем название входной точки (символ) и проверяем, что текущий фрейм не этой функции. 2-ая часть проста - надо проверить адрес. Но 1-ая часть не тривиальна, так как в разных ЯП разное название входной точки. Но это решается просто - функция `main_name` возвращает символ входной точки. В начале проверяется, что есть символы специфичные для ЯП: `__gnat_ada_main_program_name` (ADA), `D main` (D), `main.main` (go), `_p__M0_main_program` или `pascal_main_program` (Pascal). Если не нашлись, то используется стандартный `main`.
+
+<spoiler title="Обнаружение названия входной точки">
+
+```c++
+/* gdb/ada-lang.c */
+/* The name of the symbol to use to get the name of the main subprogram.  */
+static const char ADA_MAIN_PROGRAM_SYMBOL_NAME[]
+  = "__gnat_ada_main_program_name";
+
+/* gdb/d-lang.c */
+/* The name of the symbol to use to get the name of the main subprogram.  */
+static const char D_MAIN[] = "D main";
+
+/* Pascal */
+/* All GPC versions until now (2007-09-27) also define a symbol called
+   '_p_initialize'.  Check for the presence of this symbol first.  */
+static const char GPC_P_INITIALIZE[] = "_p_initialize";
+
+/* The name of the symbol that GPC uses as the name of the main
+   procedure (since version 20050212).  */
+static const char GPC_MAIN_PROGRAM_NAME_1[] = "_p__M0_main_program";
+
+/* Older versions of GPC (versions older than 20050212) were using
+   a different name for the main procedure.  */
+static const char GPC_MAIN_PROGRAM_NAME_2[] = "pascal_main_program";
+
+/* gdb/symtab.c */
+static void
+find_main_name (void)
+{
+  /* ... */
+  new_main_name = ada_main_name ();
+  if (new_main_name != NULL)
+    {
+      set_main_name (pspace, new_main_name, language_ada);
+      return;
+    }
+
+  new_main_name = d_main_name ();
+  if (new_main_name != NULL)
+    {
+      set_main_name (pspace, new_main_name, language_d);
+      return;
+    }
+
+  new_main_name = go_main_name ();
+  if (new_main_name != NULL)
+    {
+      set_main_name (pspace, new_main_name, language_go);
+      return;
+    }
+
+  new_main_name = pascal_main_name ();
+  if (new_main_name != NULL)
+    {
+      set_main_name (pspace, new_main_name, language_pascal);
+      return;
+    }
+
+  /* The languages above didn't identify the name of the main procedure.
+     Fallback to "main".  */
+  set_main_name (pspace, "main", language_unknown);
+}
+
+
+/* gdb/go-lang.c */
+/* The main function in the main package.  */
+static const char GO_MAIN_MAIN[] = "main.main";
+
+/* gdb/frame.c */
+static bool
+inside_main_func (const frame_info_ptr &this_frame)
+{
+  if (current_program_space->symfile_object_file == nullptr)
+    return false;
+
+  CORE_ADDR sym_addr = 0;
+  const char *name = main_name ();
+  bound_minimal_symbol msymbol
+    = lookup_minimal_symbol (name, NULL,
+			     current_program_space->symfile_object_file);
+
+  if (msymbol.minsym != nullptr)
+    sym_addr = msymbol.value_address ();
+
+  /* Favor a full symbol in Fortran, for the case where the Fortran main
+     is also called "main".  */
+  if (msymbol.minsym == nullptr
+      || get_frame_language (this_frame) == language_fortran)
+    {
+      /* In some language (for example Fortran) there will be no minimal
+	 symbol with the name of the main function.  In this case we should
+	 search the full symbols to see if we can find a match.  */
+      struct block_symbol bs = lookup_symbol (name, nullptr,
+					      SEARCH_FUNCTION_DOMAIN, nullptr);
+
+      /* This lookup should always yield a block-valued symbol.  */
+      if (bs.symbol != nullptr && bs.symbol->aclass () == LOC_BLOCK)
+	{
+	  const struct block *block = bs.symbol->value_block ();
+	  gdb_assert (block != nullptr);
+	  sym_addr = block->start ();
+	}
+      else if (msymbol.minsym == nullptr)
+	return false;
+    }
+
+  /* Convert any function descriptor addresses into the actual function
+     code address.  */
+  sym_addr = (gdbarch_convert_from_func_ptr_addr
+	      (get_frame_arch (this_frame), sym_addr,
+	       current_inferior ()->top_target ()));
+
+  return sym_addr == get_frame_func (this_frame);
+}
+```
+
+</spoiler>
 
 ### Отображение значений
 
-Так как значения типов зависят от языка, то и за отображение ответственнен он (ЯП).
-Другая важная функциональность - вывод состояния (значения переменных, адресов памяти и т.д.).
-В gdb есть 2 команды для печати:
+Так как значения типов зависят от языка, то и за отображение ответственнен он (ЯП). Другая важная функциональность - вывод состояния (значения переменных, адресов памяти и т.д.). В gdb есть 2 команды для печати:
 
 - `x` - скалярное значение по переданному адресу
 - `print` - вычисление выражение и вывод результата в соответствии с его реальным типом
 
-Они разные, но в конечном счете обе используют одни и те же функции, только с разными аргументами.
-Можно выделить 2 функции:
+Они разные, но в конечном счете обе используют одни и те же функции, только с разными аргументами. Можно выделить 2 функции:
 
 - `value_print_scalar_formatted`
 - `value_print`
 
-Вначале рассмотрим 1 функцию. Она выводит в лог скалярное значение.
-Максимальная типизация - указание размера числа и знаковость.
-Спускаясь ниже по стеку вызовов, за саму печать разных форматов чисел используются разные функции:
+Вначале рассмотрим первую функцию. Она выводит в лог скалярное значение. Максимальная типизация - указание размера числа и знаковость. Спускаясь ниже по стеку вызовов, за саму печать разных форматов чисел используются разные функции:
 
-- `print_XXX_chars` - число указанной длинны в указанном XXX основании, например, `print_hex_chars`
+- `print_XXX_chars` - число указанной длинны в указанном `XXX` основании, например, `print_hex_chars`
 - `print_floating` - число с плавающей точкой
 - `print_address` - адрес
 
 Многие из этих функций достойны внимания.
 
-- `print_octal_chars` - выводит число в восьмеричной системе. Загвоздка заключается в том, что каждая цифра представляется 3 битами - не кратно 4.
-  Поэтому было принято решение - разлить логику на циклы по 3 шага. В каждом происходит перенос оставшихся бит на следующий шаг. Таким образом, за 3 шага мы обрабатываем 24 бита = 3 байта.
+- `print_octal_chars` - выводит число в восьмеричной системе. Загвоздка заключается в том, что каждая цифра представляется 3 битами - не кратно 4. Поэтому было принято решение - разделить логику на циклы по 3 шага. В каждом происходит перенос оставшихся бит на следующий шаг. Таким образом, за 3 шага мы обрабатываем 24 бита = 3 байта. Идея аналогична base64.
 
 <spoiler title="print_octal_chars">
 
@@ -4633,43 +5356,25 @@ print_octal_chars (struct ui_file *stream, const gdb_byte *valaddr,
 
 </spoiler>
 
-- `print_decimal_chars` - эта функция выводит число в десятичном представлении.
-  В ней используется достаточно интересный алгоритм - он переводит в десятичное представление шестандцатеричное любой длины (то есть не только кратное 2 - short, int, long).
+- `print_decimal_chars` - эта функция выводит число в десятичном представлении. В ней используется достаточно интересный алгоритм - он переводит в десятичное представление шестандцатеричное *любой* длины в байтах (то есть не только кратное 2 - `short`, `int`, `long`).
 
 <spoiler title="print_decimal_chars">
 
-В идее этого алгоритма, то что число представляется в виде потока байт, а сам байт - это 2 шестнадцатеричных числа.
-Все что нам нужно - это пройтись по всем этим числам и сконвертировать.
+В идее этого алгоритма, то что число представляется в виде потока байт, а сам байт - это 2 шестнадцатеричных числа. Все что нам нужно - это пройтись по всем этим числам и сконвертировать.
 
-Для хранения результирующего числа используется вектор.
-Количество цифр мы уже можем оценить - оно точно не больше чем количество шестнадцатеричных умноженное в 2 раза (так как шестнадцатеричное число может быть больше 10).
-Поэтому, этот вектор сразу инициализируем этим количеством.
-Сам этот вектор будет хранить цифры нашего десятичного числа.
+Для хранения результирующего числа используется вектор. Количество цифр мы уже можем оценить - оно точно не больше чем количество шестнадцатеричных умноженное в 2 раза (так как шестнадцатеричное число может быть больше 10). Поэтому, этот вектор сразу инициализируем этим количеством. Сам этот вектор будет хранить цифры нашего десятичного числа.
 
-Теперь переходим к самой идее.
-Здесь используется примерно тот же алгоритм, что и при обычном переводе числа из 16-ого основания в 10-е.
-Работа происходит итерациями. На каждой итерации мы проходимся по всем полубайтам (шестнадцатеричным цифрам) исходного числа от MSB до LSB.
+Теперь переходим к самой идее. Здесь используется примерно тот же алгоритм, что и при обычном переводе числа из 16-ого основания в 10-е. Работа происходит итерациями. На каждой итерации мы проходимся по всем полубайтам (шестнадцатеричным цифрам) исходного числа от MSB до LSB.
 
-Как мы добавим *шестнадцатеричное* число к *десятичному*?
-Переведем его в десятичное основание и сложим.
-Но наше число хранится в виде вектора цифр - нам придется также раскладывать число по разрядам и складывать.
-Это накладно поэтому используется другой подход.
+Как мы добавим *шестнадцатеричное* число к *десятичному*? Переведем его в десятичное основание и сложим. Но наше число хранится в виде вектора цифр - нам придется также раскладывать число по разрядам и складывать. Это накладно поэтому используется другой подход.
 
-Мы берем очередной полубайт и складываем его с нашей *первой цифрой*.
-А затем лавинно переносим в следующий разряд переполнение.
+Мы берем очередной полубайт и складываем его с нашей *первой цифрой*. А затем лавинно переносим в следующий разряд переполнение.
 
-Еще одна важная деталь - мы проходим от MSB до LSB.
-Если мы будем просто складывать числа и делать простой перенос, то знание о разрядах потеряется.
-То есть, просто складывая мы не получим корректного ответа, если в числе будет больше 1 байта.
-Для учета разряда в алгоритме сделан такой подход: перед тем как переходить к следующему полубайту предыдущее число сдвигается на 1 разряд (умножается на 16).
-Если мы умножим каждую цифру в десятичном числе на 16, то мы сдвинем влево шестнадцатеричное на 1 разряд (припишем справа `0`).
-А теперь магия - если к этому числу добавить очередной полубайт, то получится то же самое число до этого разряда.
+Еще одна важная деталь - мы проходим от MSB до LSB. Если мы будем просто складывать числа и делать простой перенос, то знание о разрядах потеряется. То есть, просто складывая мы не получим корректного ответа, если в числе будет больше 1 байта. Для учета разряда в алгоритме сделан такой подход: перед тем как переходить к следующему полубайту предыдущее число сдвигается на 1 разряд (умножается на 16). Если мы умножим каждую цифру в десятичном числе на 16, то мы сдвинем влево шестнадцатеричное на 1 разряд (припишем справа `0`). А теперь магия - если к этому числу добавить очередной полубайт, то получится то же самое число до этого разряда.
 
-Таким образом, в конце каждой итерации у нас на руках десятичное представление для шестнадцатеричного числа до N разряда (с начала).
-Как только мы доходим до 0 разряда, то алгоритм завершен.
+Таким образом, в конце каждой итерации у нас на руках десятичное представление для шестнадцатеричного числа до N разряда (с начала). Как только мы доходим до 0 разряда, то алгоритм завершен.
 
-Чтобы лучше понять, рассмотрим такой пример - перевод числа `4D2` (это десятичное 1234).
-В шагах я буду указывать что находится в векторе цифр:
+Чтобы лучше понять, рассмотрим такой пример - перевод числа `4D2` (это десятичное 1234). В шагах я буду указывать что находится в векторе цифр:
 
 | Цифра (итерация) | Вектор      |
 | ---------------- | ----------- |
@@ -4691,7 +5396,10 @@ print_octal_chars (struct ui_file *stream, const gdb_byte *valaddr,
 
 P.S. цифры в векторе в обратном порядке
 
+P.P.S. `NIBBLE` - полубайт. Интересная игра слов: `byte` - кусок, `nibble` - огрызок.
+
 ```c++
+/* gdb/valprint.c */
 void
 print_decimal_chars (struct ui_file *stream, const gdb_byte *valaddr,
 		     unsigned len, bool is_signed,
@@ -4829,17 +5537,17 @@ print_decimal_chars (struct ui_file *stream, const gdb_byte *valaddr,
 
 </spoiler>
 
-- `print_floating` - выводит число с плавающей точкой. Здесь интересно то, что для работы с плавающей точкой используется интерфейс - `target_float_ops`.
-   На моей машине используется формат float IEEE 754 одинарной точности, поэтому для работы с ней используется структура `floatformat`.
-   Для вывода значения используется 3 шага: 1) создается строку форматирования, 2) конвертируем в формат float исполняемой машины и 3) выводим с помощью `printf`.
+- `print_floating` - выводит число с плавающей точкой. Здесь интересно то, что для работы с плавающей точкой используется интерфейс - `target_float_ops`. На моей машине используется формат float IEEE 754 одинарной точности, поэтому для работы с ней используется структура `floatformat`. Для вывода значения используется 3 шага:
+    1. создаем строку форматирования
+    2. конвертируем в формат float исполняемой машины
+    3. выводим с помощью `printf`
 
-- `print_binary_chars` - выводит двоичное представление числа. Здесь все просто - проходим по всем битам и выводим.
-  Но даже здесь есть интересная часть - обнаружение ниббла без всех нулей.
-  Если такой встретился, то мы должны вывести его весь. Причина этого куска проста - нибблы равные 0000 отображаются просто как 0 (чтобы уменьшить занимаемое место)
+- `print_binary_chars` - выводит двоичное представление числа. Здесь все просто - проходим по всем битам и выводим. Но даже здесь есть интересная деталь - обнаружение ниббла без всех нулей. Если такой встретился, то мы должны вывести его весь. Причина проста - нибблы равные 0000 отображаются просто как 0 (чтобы уменьшить занимаемое место).
 
-<spoiler title="print_binary-char">
+<spoiler title="print_binary_chars">
 
 ```c++
+/* gdb/valprint.c */
 void
 print_binary_chars (struct ui_file *stream, const gdb_byte *valaddr,
 		    unsigned len, enum bfd_endian byte_order, bool zero_pad,
@@ -4897,19 +5605,16 @@ print_binary_chars (struct ui_file *stream, const gdb_byte *valaddr,
 
 </spoiler>
 
-Когда дело доходит до `print` ситуация иная. Ему на вход поступает выражение из родного ЯП.
-Его нужно не только вычислить (для получения результата), но и понять тип для его корректного отображения.
+Когда дело доходит до команды `print` ситуация иная. Ему на вход поступает *выражение* из родного ЯП. Его нужно не только вычислить (для получения результата), но и понять тип для его корректного отображения.
 
-ЯП представляется базовым классом `language_defn` - от него наследуются все конкретные ЯП.
-Например, для C это будет класс `c_language`. Также есть и для ADA, D, rust и др.
-В этом классе нам интересен метод `value_print`. Он печатает переданное значение.
-Для языка C реализация есть в функции `c_value_print_inner`.
+Информация о ЯП представляется базовым классом `language_defn` - от него наследуются все конкретные ЯП. Например, для C это будет класс `c_language`. Также есть и для ADA, D, rust и др. В этом классе нам интересен метод `value_print` - он печатает переданное значение. Опять же для C реализация есть в функции `c_value_print_inner`.
 
-Если посмотреть в нее, то можно заметить уже знакомый шаблон: проверяем `typedef`, а затем выводим в соответствии с типом (gdb использует внутренние типы, общие для многих ЯП, как например, массив или целое число).
+Если посмотреть в нее, то можно заметить уже знакомый шаблон: проверяем `typedef`, а затем выводим в соответствии с типом (gdb использует внутреннее представление типов, общие для многих ЯП, как например, массив или целое число).
 
 <spoiler title="c_value_print_inner">
 
 ```c++
+/* gdb/c-valprint.c */
 void
 c_value_print_inner (struct value *val, struct ui_file *stream, int recurse,
 		     const struct value_print_options *options)
@@ -4962,19 +5667,11 @@ c_value_print_inner (struct value *val, struct ui_file *stream, int recurse,
 
 </spoiler>
 
-Как выводятся целые числа (TYPE_CODE_INT, TYPE_CODE_CHAR) знаем - `value_print_scalar_formatted` (вызывается внутри).
-Рассмотрим то, как выводится структура (TYPE_CODE_STRUCT).
+Как выводятся целые числа (`TYPE_CODE_INT`, `TYPE_CODE_CHAR`) знаем - `value_print_scalar_formatted` (вызывается внутри). Рассмотрим то, как выводится структура (`TYPE_CODE_STRUCT`).
 
-За ее отображение отвечает функция `cp_print_value_fields`.
-Отображение полей структуры можно грубо описать циклом по каждому полю: выводим название поля и его значение.
-Для представления типов используется структура `type`. Она хранит в себе всю информацию о типе, который представляет.
-Поля структуры (у типа) хранятся в виде массива и доступ к ним происходит аналогично - по индексу.
-Само поле представляется структурой `field`. У нее есть интересующий нас метод - `name`, он возвращает название поля.
+За ее отображение отвечает функция `cp_print_value_fields`. Отображение полей структуры можно грубо описать циклом по каждому полю: выводим название поля и его значение. Для представления типов используется структура `type`. Она хранит в себе всю информацию о типе, который представляет. Поля структуры (у типа) хранятся в виде массива и доступ к ним происходит аналогично - по индексу. Само поле представляется структурой `field`. У нее есть интересующий нас метод - `name`, он возвращает название поля.
 
-Но для получения поля структуры используется не `type` и не `field` - структура `value`.
-Это структура, которая представляет какое-либо значение, но о своем типе не знает.
-И в нем нам нужен метод `primitive_field` - он позволяет получить значение (другой `value`) поля. Но так как `value` о своем типе не знает, то мы его передаем (сам тип родительской структуры).
-Если посмотреть на реализацию `primitive_field`, то можно увидеть уже знакомые шаги:
+Но для получения поля структуры используется не `type` и не `field` - структура `value`. Она представляет какое-либо значение, но о своем типе не знает. Там есть метод `primitive_field` - он позволяет получить значение (другой `value`) поля. Но так как `value` о своем типе не знает, то мы его передаем отдельно (сам тип родительской структуры). Если посмотреть на реализацию `primitive_field`, то можно увидеть уже знакомые шаги:
 
 - Получаем тип родителя и поля
 - Проверяем их `typedef`
@@ -4984,6 +5681,7 @@ c_value_print_inner (struct value *val, struct ui_file *stream, int recurse,
 <spoiler title="primitive_field">
 
 ```c++
+/* gdb/value.c */
 struct value *
 value::primitive_field (LONGEST offset, int fieldno, struct type *arg_type)
 {
@@ -5033,24 +5731,22 @@ value::primitive_field (LONGEST offset, int fieldno, struct type *arg_type)
 }
 ```
 
-Далее, для вывода значения используется функция `common_val_print`.
-Но как уже ранее было сказано, значения (их отображение и интерпретация) часто зависят от ЯП, поэтому в реальности вывод значения делегируется самому ЯП - методу `value_print` класса `language_defn`.
-Таким образом, мы входим в рекурсию.
+Далее, для вывода значения используется функция `common_val_print`. Но как уже ранее было сказано, значения (их отображение и интерпретация) часто зависят от ЯП, поэтому в реальности вывод значения делегируется самому ЯП - методу `value_print` класса `language_defn`. Таким образом, мы входим в рекурсию.
 
 </spoiler>
 
-### Цепочка вызовов
+### Backtrace
 
-Теперь перейдем к backtrace, отображении цепочки вызовов до текущей функции.
-Здесь все просто - вся логика это просто цикл, в котором мы идем к каждому предыдущему фрейму и отображаем информацию о нем.
-Это реализуется в цикле:
+Теперь перейдем к команде `backtrace`, отображении цепочки вызовов до текущей функции. Вся логика это просто цикл, в котором мы идем по каждому фрейму, начиная с текущего, и отображаем информацию о нем. Это реализуется в цикле:
+
+<spoiler title="backtrace_command_1">
 
 ```c++
+/* gdb/stack.c */
 static void
 backtrace_command_1 (const frame_print_options &fp_opts,
 		     const backtrace_cmd_options &bt_opts,
 		     const char *count_exp, int from_tty)
-
 {
   frame_info_ptr fi;
   int count;
@@ -5080,12 +5776,150 @@ backtrace_command_1 (const frame_print_options &fp_opts,
 }
 ```
 
-За отображение информации о фрейме (часть `print_frame_info`) отвечает функция `print_frame`.
+</spoiler>
+
+Но эта функция особо ничего не говорит нам, так как в ней используется уже готовый код получения предыдущего фрейма.
+
+На самом деле, реализация не так проста. В dumbugger я просто проиходил по фреймам, используя `RBP` и адрес возврата. Но если пользовались gdb, то знаете, что он дополнительно выводит значения аргументов. Для того, чтобы реализовать подобное используются символы отладки и интерфейс ЯП совместно: символы отладки говорят как получить стек вызовов, а ЯП выводит значения переданных аргументов. Это очень платформо-зависимая часть (регистры процессора, символы отладки, C), поэтому объясню для моего сетапа.
+
+Представим, что текущий фрейм нам известен и нам нужно найти предыдущий. За развертку стека отвечает интерфейс `frame_unwind` и в нем имеется метод `prev_register` - он и возвращает значение предыдущего регистра. Вспомним, что наивная (dumbugger) реализация просто читала адрес возврата из фрейма (базу фрейма находили через `RBP`), но в реальном мире опять не все так просто. Из-за различных оптимизаций некоторая информация могла стереться/видоизмениться и нам придется искать пути, чтобы ее найти. А кто это знает? Правильно - символы отладки. В моем случае, интерфейс `frame_unwind` принадлежит DWARF, а сам метод `prev_register` реализует `dwarf2_frame_prev_register`.
+
+<spoiler title="dwarf2_frame_prev_register">
+
+Замечание: `regnum` равен 16, это `RIP`.
+
+```c++
+static struct value *
+dwarf2_frame_prev_register (const frame_info_ptr &this_frame, void **this_cache,
+			    int regnum)
+{
+  struct gdbarch *gdbarch = get_frame_arch (this_frame);
+  struct dwarf2_frame_cache *cache =
+    dwarf2_frame_cache (this_frame, this_cache);
+  CORE_ADDR addr;
+  int realnum;
+
+  switch (cache->reg[regnum].how)
+    {
+    case DWARF2_FRAME_REG_UNDEFINED:
+      /* If CFI explicitly specified that the value isn't defined,
+	 mark it as optimized away; the value isn't available.  */
+      return frame_unwind_got_optimized (this_frame, regnum);
+   
+    /*------------
+     * Идем сюда
+     *------------*/
+    case DWARF2_FRAME_REG_SAVED_OFFSET:
+      addr = cache->cfa + cache->reg[regnum].loc.offset;
+      return frame_unwind_got_memory (this_frame, regnum, addr);
+
+    case DWARF2_FRAME_REG_SAVED_REG:
+      realnum = dwarf_reg_to_regnum_or_error
+	(gdbarch, cache->reg[regnum].loc.reg);
+      return frame_unwind_got_register (this_frame, regnum, realnum);
+
+    case DWARF2_FRAME_REG_SAVED_EXP:
+      addr = execute_stack_op (cache->reg[regnum].loc.exp.start,
+			       cache->reg[regnum].loc.exp.len,
+			       cache->addr_size,
+			       this_frame, cache->cfa, 1,
+			       cache->per_objfile);
+      return frame_unwind_got_memory (this_frame, regnum, addr);
+
+    case DWARF2_FRAME_REG_SAVED_VAL_OFFSET:
+      addr = cache->cfa + cache->reg[regnum].loc.offset;
+      return frame_unwind_got_constant (this_frame, regnum, addr);
+
+    case DWARF2_FRAME_REG_SAVED_VAL_EXP:
+      addr = execute_stack_op (cache->reg[regnum].loc.exp.start,
+			       cache->reg[regnum].loc.exp.len,
+			       cache->addr_size,
+			       this_frame, cache->cfa, 1,
+			       cache->per_objfile);
+      return frame_unwind_got_constant (this_frame, regnum, addr);
+
+    case DWARF2_FRAME_REG_UNSPECIFIED:
+      /* GCC, in its infinite wisdom decided to not provide unwind
+	 information for registers that are "same value".  Since
+	 DWARF2 (3 draft 7) doesn't define such behavior, said
+	 registers are actually undefined (which is different to CFI
+	 "undefined").  Code above issues a complaint about this.
+	 Here just fudge the books, assume GCC, and that the value is
+	 more inner on the stack.  */
+      if (regnum < gdbarch_num_regs (gdbarch))
+	return frame_unwind_got_register (this_frame, regnum, regnum);
+      else
+	return nullptr;
+
+    case DWARF2_FRAME_REG_SAME_VALUE:
+      return frame_unwind_got_register (this_frame, regnum, regnum);
+
+    case DWARF2_FRAME_REG_CFA:
+      return frame_unwind_got_address (this_frame, regnum, cache->cfa);
+
+    case DWARF2_FRAME_REG_CFA_OFFSET:
+      addr = cache->cfa + cache->reg[regnum].loc.offset;
+      return frame_unwind_got_address (this_frame, regnum, addr);
+
+    case DWARF2_FRAME_REG_RA_OFFSET:
+      addr = cache->reg[regnum].loc.offset;
+      regnum = dwarf_reg_to_regnum_or_error
+	(gdbarch, cache->retaddr_reg.loc.reg);
+      addr += get_frame_register_unsigned (this_frame, regnum);
+      return frame_unwind_got_address (this_frame, regnum, addr);
+
+    case DWARF2_FRAME_REG_FN:
+      return cache->reg[regnum].loc.fn (this_frame, this_cache, regnum);
+
+    default:
+      internal_error (_("Unknown register rule."));
+    }
+}
+```
+
+</spoiler>
+
+Можете заметить, что для получения адреса возврата мы просто читаем его со стека (`DWARF2_FRAME_REG_SAVED_OFFSET`) по известному смещению - `addr = cache->cfa + cache->reg[regnum].loc.offset`. Правое слагаемое нам понятно - это само смещение (оно равно `-8`). Но вот о левом пока не говорили: что такое `cfa`? CFA - Canonical Frame Address. Можно сказать, что это адрес, по которому начинается фрейм функции. В DWARF ей посвещена отдельная секция с описанием того, как с ней работать. Почему это не так просто - даны пояснения.
+
+<spoiler title="Почему вычисление CFA не просто">
+
+Когда нам нужно развернуть стек, то выполняется виртуальное развертывание - мы "в голове" выполняем код. Но чтобы сделать это в architecture-independent way необходимо учитывать следующее:
+
+> Prologue and epilogue code is not always in distinct blocks at the beginning and end of a subroutine. It is common to duplicate the epilogue code at the site of each return from the code. Sometimes a compiler breaks up the register save/unsave operations and moves them into the body of the subroutine to just where they are needed.
+
+Пролог и эпилог функции необязательно будут строго в ее начале и конце. Эпилог может дублироваться для всех инструкций возвращения. Сам компилятор может вынести код сохранения/загрузки регистров прямо в тело самой функции (где необходимы).
+
+> Compilers use different ways to manage the call frame. Sometimes they use a frame pointer register, sometimes not
+
+Различные компиляторы используют разные средства управления фреймом: могут использовать frame pointer register (для x86 это `EBP`, base pointer), а могут и нет
+
+> The algorithm to compute CFA changes as you progress through the prologue and epilogue code. (By definition, the CFA value does not change.)
+
+Алгоритмы вычисления CFA не всегда останется таким же каким и был в начале - он может меняться.
+
+> Some subroutines have no call frame.
+
+У некоторых функций вообще может не быть своего фрейма (листовые функции)
+
+> Sometimes a register is saved in another register that by convention does not need to be saved.
+
+Некоторые регистры могут сохраняться в других scratch регистрах (scratch регистры не сохраняются при вызове другой функции)
+
+> Some architectures have special instructions that perform some or all of the register management in one instruction, leaving special information on the stack that indicates how registers are saved.
+
+В некоторых архитектурах есть особые инструкции, которые управляют множеством регистров. А как эти регистры сохранились, информация хранится на стеке.
+
+> Some architectures treat return address values specially. For example, in one architecture, the call instruction guarantees that the low order two bits will be zero and the return instruction ignores those bits. This leaves two bits of storage that are available to other uses that must be treated specially.
+
+В некоторых архитектурах есть ограничения на адрес возврата. Например, последние 2 бита адреса игнорируются. Их могут использовать в своих нуждах
+
+</spoiler>
+
+Так как же мы этот CFA получаем? Вычисляем выражения. Оно хранится в атрибуте `DW_AT_frame_base`, а инструкции имеют префикс `DW_OP_`. Чаще всего я встречал единственную операцию `DW_OP_call_frame_cfa` - она просто читает `RBP`.
 
 # Особенности управляемых языков
 
-До этого момента мы говорили о C (возможно C++), но большая часть разработчиков использует более высокоуровневые языки - Python, Java, C#, JavaScript.
-Есть и другие ЯП, но рассмотрю только их.
+До этого момента мы говорили о C (возможно C++), но это низкоуровневый язык (относительно). Значительная часть разработчиков использует более высокоуровневые языки - Python, Java, C#, JavaScript. В них процесс отладки устроен по другому и мы это рассмотрим. Есть и другие ЯП, но рассмотрю только их.
 
 ## C\#
 
