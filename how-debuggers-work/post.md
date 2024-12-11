@@ -5925,72 +5925,579 @@ dwarf2_frame_prev_register (const frame_info_ptr &this_frame, void **this_cache,
 
 TODO: структура события добавить код (а то он один без структуры события)
 
-В директории `src/coreclr/debug` - все экспортируемые платформой сущности, используемые для отладки.
-Директория `di` - debug interface. В ней содержится публичный интерфейс.
+Начнем с C\#, а точнее было бы сказать с платформы .NET реализации самих Microsoft. Репозиторий находится [тут](https://github.com/dotnet/runtime). Я буду рассматривать 8 версию (.NET 8).
 
-Файлы:
+Для начала справка. `.NET` - это кроссплатформенный рантайм для IL (intermediate language) - промежуточного языка для виртуальной машины. Весь исполняемый код всегда JIT компилируется, без этапа интерпретации.
 
-- `breakpoint.cpp` - работа с точками останова
+### Архитектура
 
-DAC - Data Access Component (основной интерфейс для взаимодействия)
+В директории `src/coreclr/debug` содержатся все экспортируемые сущности, используемые для отладки.
 
-DBI - CLR debugger interface (COM)
+У отладчика разделяют 2 части - left-side и right-side:
 
-Файл `src/coreclr/pal/prebuilt/inc/cordebug.h` - объявления для вспомогательных файлов. Для взаимодействия с платформой (и отлаживаемым процессом) объявлен свой интерфейс.
+- Left-side - отладчик на стороне самого процесса (RC, Runtime-Controller)
+- Right-side - это сторона запускающего (DI, Debugger Interface)
 
-> В `cordebug.h` он сгенерирован с помощью компилятора MIDL и имеет реализацию как для C++, так и для C - интерфейсы (класс с нулевыми виртуальными функциями) и структура + функции соответственно.
+Таким образом, процесс отладки - это взаимодействие отладчика на строне отлаживаемого процесса и отладчика с нашей стороны. Рассматривать будем LHS - способ взаимодействия с управляемым кодом. Файлы для LHS/RC описаны в директории `ee` (execution engine), а для RHS/DI - в `di` (debug engine).
 
-Существует большое количество интерфейсов и все они ответственны за свою область. Например, существует интерфейс ``
+Для взаимодействия между LHS и RHS используются события. Структура `DebuggerIPCEvent` представляет такое событие. Можно заметить, что используется IPC. Все IPC события описаны в файле `src/coreclr/debug/inc/dgbipceventtypes.h`, причем в обе строны - как RHS -> LHS, так и наоборот.
 
-Главный момент здесь в том, что рантайм сделан кросс-платформенным и он различает HOST (где запускается) и TARGET (на какой машине должен запускаться). Эта разница чувствуется, когда дамп с линукса отлаживается на Windows. Поэтому некоторая часть работы отдается конвертации форматов и т.п.
+<spoiler title="DebuggerIPCEvent">
 
-Класс `DebugInterface` - COM отладчик (интерфейс к нему)
+```c++
+/* src/coreclr/debug/inc/dbgipcevents.h */
 
-Дополнительно, имеется 2 интерфейса отладки - DAC и DBI:
+//
+// Event structure that is passed between the Runtime Controller and the
+// Debugger Interface. Some types of events are a fixed size and have
+// entries in the main union, while others are variable length and have
+// more specialized data structures that are attached to the end of this
+// structure.
+//
+struct MSLAYOUT DebuggerIPCEvent
+{
+    DebuggerIPCEvent*       next;
+    DebuggerIPCEventType    type;
+    DWORD             processId;
+    DWORD             threadId;
+    VMPTR_AppDomain   vmAppDomain;
+    VMPTR_Thread      vmThread;
 
-- DBI - интерфейс отладчика CLR.
-- DAC, Data Access Component - современный инт
+    HRESULT           hr;
+    bool              replyRequired;
+    bool              asyncSend;
 
-Мы взаимодействуем в DBI, а он в свою очередь все запросы конвертирует в интерфейс DAC. Для этого выделен отдельный интерфейс `IDacDbiInterface`.
+    union MSLAYOUT
+    {
+        struct MSLAYOUT
+        {
+            // Pointer to a BOOL in the target.
+            CORDB_ADDRESS pfBeingDebugged;
+        } LeftSideStartupData;
 
-У отладчика разделяют 2 части - left-side и right-side. Left-side - отладчик на стороне самого процесса (RC, Runtime-Controller); Right-side - это сторона запускающего (DI, Debugger Interface). Таким образом, процесс отладки - это взаимодействие отладчика на строне отлаживаемого процесса и отладчика с нашей стороны. Сейчас рассматривать будем LHS - способ взаимодействия с управляемым кодом. Файлы для LHS/RC описаны в директории `ee` (часто можно увидеть аббревиатуру EE - Execution Engine), а для RHS/DI - в `di`.
+        struct MSLAYOUT
+        {
+            // Module whose metadata is being updated
+            // This tells the RS that the metadata for that module has become invalid.
+            VMPTR_DomainAssembly vmDomainAssembly;
 
-Что до RHS, то его интерфейс описан в файле `src/coreclr/pal/prebuilt/inc/cordebug.h` - приведены основные интерфейсы отладчика.
-Если реализовывать свой отладчик, то скорее всего использовать нужно эту часть - левая остается на рантайме (предположение).
+        } MetadataUpdateData;
 
-Для взаимодействия между LHS и RHS используются события.
-Структура `DebuggerIPCEvent` представляет такое событие.
-Можно заметить, что используется IPC.
-Все IPC события описаны в файле `src/coreclr/debug/inc/dgbipceventtypes.h`, причем в обе строны - как RHS -> LHS, так и наоборот.
+        struct MSLAYOUT
+        {
+            // Handle to CLR's internal appdomain object.
+            VMPTR_AppDomain vmAppDomain;
+        } AppDomainData;
 
-> Для отправки событий используются различные стратегии в зависимости от цели (я нашел 4 реализации).
-> Но если отлаживаемый процесс находится локально, то используется механизм общей памяти - событие записывается в память отлаживаемого процесса (DCB, Debugger IPC Control Block), а затем выставляется Condition Variable и LHS узнает о событии.
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+        } AssemblyData;
+
+#ifdef TEST_DATA_CONSISTENCY
+        // information necessary for testing whether the LS holds a lock on data
+        // the RS needs to inspect. See code:DataTest::TestDataSafety and
+        // code:IDacDbiInterface::TestCrst for more information
+        struct MSLAYOUT
+        {
+            // the lock to be tested
+            VMPTR_Crst vmCrst;
+            // indicates whether the LS holds the lock
+            bool       fOkToTake;
+        } TestCrstData;
+
+        // information necessary for testing whether the LS holds a lock on data
+        // the RS needs to inspect. See code:DataTest::TestDataSafety and
+        // code:IDacDbiInterface::TestCrst for more information
+        struct MSLAYOUT
+        {
+            // the lock to be tested
+            VMPTR_SimpleRWLock vmRWLock;
+            // indicates whether the LS holds the lock
+            bool               fOkToTake;
+        } TestRWLockData;
+#endif // TEST_DATA_CONSISTENCY
+
+        // Debug event that a module has been loaded
+        struct MSLAYOUT
+        {
+            // Module that was just loaded.
+            VMPTR_DomainAssembly vmDomainAssembly;
+        }LoadModuleData;
+
+
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+            LSPTR_ASSEMBLY debuggerAssemblyToken;
+        } UnloadModuleData;
+
+
+        // The given module's pdb has been updated.
+        // Queury PDB from OOP
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+        } UpdateModuleSymsData;
+
+        DebuggerMDANotification MDANotification;
+
+        struct MSLAYOUT
+        {
+            LSPTR_BREAKPOINT breakpointToken;
+            mdMethodDef  funcMetadataToken;
+            VMPTR_DomainAssembly vmDomainAssembly;
+            bool         isIL;
+            SIZE_T       offset;
+            SIZE_T       encVersion;
+            LSPTR_METHODDESC  nativeCodeMethodDescToken; // points to the MethodDesc if !isIL
+            CORDB_ADDRESS codeStartAddress;
+        } BreakpointData;
+
+        struct MSLAYOUT
+        {
+            mdMethodDef funcMetadataToken;
+            VMPTR_Module pModule;
+        } DisableOptData;
+
+        struct MSLAYOUT
+        {
+            LSPTR_BREAKPOINT breakpointToken;
+        } BreakpointSetErrorData;
+
+        struct MSLAYOUT
+        {
+#ifdef FEATURE_DATABREAKPOINT
+            CONTEXT context;
+#else
+            int dummy;
+#endif
+        } DataBreakpointData;
+
+        struct MSLAYOUT
+        {
+            LSPTR_STEPPER        stepperToken;
+            VMPTR_Thread         vmThreadToken;
+            FramePointer         frameToken;
+            bool                 stepIn;
+            bool                 rangeIL;
+            bool                 IsJMCStop;
+            unsigned int         totalRangeCount;
+            CorDebugStepReason   reason;
+            CorDebugUnmappedStop rgfMappingStop;
+            CorDebugIntercept    rgfInterceptStop;
+            unsigned int         rangeCount;
+            COR_DEBUG_STEP_RANGE range; //note that this is an array
+        } StepData;
+
+        struct MSLAYOUT
+        {
+            // An unvalidated GC-handle
+            VMPTR_OBJECTHANDLE GCHandle;
+        } GetGCHandleInfo;
+
+        struct MSLAYOUT
+        {
+            // An unvalidated GC-handle for which we're returning the results
+            LSPTR_OBJECTHANDLE GCHandle;
+
+            // The following are initialized by the LS in response to our query:
+            VMPTR_AppDomain vmAppDomain; // AD that handle is in (only applicable if fValid).
+            bool            fValid; // Did the LS determine the GC handle to be valid?
+        } GetGCHandleInfoResult;
+
+        // Allocate memory on the left-side
+        struct MSLAYOUT
+        {
+            ULONG      bufSize;             // number of bytes to allocate
+        } GetBuffer;
+
+        // Memory allocated on the left-side
+        struct MSLAYOUT
+        {
+            void        *pBuffer;           // LS pointer to the buffer allocated
+            HRESULT     hr;                 // success / failure
+        } GetBufferResult;
+
+        // Free a buffer allocated on the left-side with GetBuffer
+        struct MSLAYOUT
+        {
+            void        *pBuffer;           // Pointer previously returned in GetBufferResult
+        } ReleaseBuffer;
+
+        struct MSLAYOUT
+        {
+            HRESULT     hr;
+        } ReleaseBufferResult;
+
+        // Apply an EnC edit
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;      // Module to edit
+            DWORD cbDeltaMetadata;              // size of blob pointed to by pDeltaMetadata
+            CORDB_ADDRESS pDeltaMetadata;       // pointer to delta metadata in debuggee
+                                                // it's the RS's responsibility to allocate and free
+                                                // this (and pDeltaIL) using GetBuffer / ReleaseBuffer
+            CORDB_ADDRESS pDeltaIL;             // pointer to delta IL in debugee
+            DWORD cbDeltaIL;                    // size of blob pointed to by pDeltaIL
+        } ApplyChanges;
+
+        struct MSLAYOUT
+        {
+            HRESULT hr;
+        } ApplyChangesResult;
+
+        struct MSLAYOUT
+        {
+            mdTypeDef   classMetadataToken;
+            VMPTR_DomainAssembly vmDomainAssembly;
+            LSPTR_ASSEMBLY classDebuggerAssemblyToken;
+        } LoadClass;
+
+        struct MSLAYOUT
+        {
+            mdTypeDef   classMetadataToken;
+            VMPTR_DomainAssembly vmDomainAssembly;
+            LSPTR_ASSEMBLY classDebuggerAssemblyToken;
+        } UnloadClass;
+
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+            bool  flag;
+        } SetClassLoad;
+
+        struct MSLAYOUT
+        {
+            VMPTR_OBJECTHANDLE vmExceptionHandle;
+            bool        firstChance;
+            bool        continuable;
+        } Exception;
+
+        struct MSLAYOUT
+        {
+            VMPTR_Thread   vmThreadToken;
+        } ClearException;
+
+        struct MSLAYOUT
+        {
+            void        *address;
+        } IsTransitionStub;
+
+        struct MSLAYOUT
+        {
+            bool        isStub;
+        } IsTransitionStubResult;
+
+        struct MSLAYOUT
+        {
+            CORDB_ADDRESS    startAddress;
+            bool             fCanSetIPOnly;
+            VMPTR_Thread     vmThreadToken;
+            VMPTR_DomainAssembly vmDomainAssembly;
+            mdMethodDef      mdMethod;
+            VMPTR_MethodDesc vmMethodDesc;
+            SIZE_T           offset;
+            bool             fIsIL;
+            void *           firstExceptionHandler;
+        } SetIP; // this is also used for CanSetIP
+
+        struct MSLAYOUT
+        {
+            int iLevel;
+
+            EmbeddedIPCString<MAX_LOG_SWITCH_NAME_LEN + 1> szCategory;
+            Ls_Rs_StringBuffer szContent;
+        } FirstLogMessage;
+
+        struct MSLAYOUT
+        {
+            int iLevel;
+            int iReason;
+
+            EmbeddedIPCString<MAX_LOG_SWITCH_NAME_LEN + 1> szSwitchName;
+            EmbeddedIPCString<MAX_LOG_SWITCH_NAME_LEN + 1> szParentSwitchName;
+        } LogSwitchSettingMessage;
+
+        // information needed to send to the RS as part of a custom notification from the target
+        struct MSLAYOUT
+        {
+            // Domain file for the domain in which the notification occurred
+            VMPTR_DomainAssembly vmDomainAssembly;
+
+            // metadata token for the type of the CustomNotification object's type
+            mdTypeDef    classToken;
+        } CustomNotification;
+
+        struct MSLAYOUT
+        {
+            VMPTR_Thread vmThreadToken;
+            CorDebugThreadState debugState;
+        } SetAllDebugState;
+
+        DebuggerIPCE_FuncEvalInfo FuncEval;
+
+        struct MSLAYOUT
+        {
+            CORDB_ADDRESS argDataArea;
+            LSPTR_DEBUGGEREVAL debuggerEvalKey;
+        } FuncEvalSetupComplete;
+
+        struct MSLAYOUT
+        {
+            RSPTR_CORDBEVAL funcEvalKey;
+            bool            successful;
+            bool            aborted;
+            void           *resultAddr;
+
+            // AppDomain that the result is in.
+            VMPTR_AppDomain vmAppDomain;
+
+            VMPTR_OBJECTHANDLE vmObjectHandle;
+            DebuggerIPCE_ExpandedTypeData resultType;
+        } FuncEvalComplete;
+
+        struct MSLAYOUT
+        {
+            LSPTR_DEBUGGEREVAL debuggerEvalKey;
+        } FuncEvalAbort;
+
+        struct MSLAYOUT
+        {
+            LSPTR_DEBUGGEREVAL debuggerEvalKey;
+        } FuncEvalRudeAbort;
+
+        struct MSLAYOUT
+        {
+            LSPTR_DEBUGGEREVAL debuggerEvalKey;
+        } FuncEvalCleanup;
+
+        struct MSLAYOUT
+        {
+            void           *objectRefAddress;
+            VMPTR_OBJECTHANDLE vmObjectHandle;
+            void           *newReference;
+        } SetReference;
+
+        struct MSLAYOUT
+        {
+            NameChangeType  eventType;
+            VMPTR_AppDomain vmAppDomain;
+            VMPTR_Thread    vmThread;
+        } NameChange;
+
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+            BOOL             fAllowJitOpts;
+            BOOL             fEnableEnC;
+        } JitDebugInfo;
+
+        // EnC Remap opportunity
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+            mdMethodDef funcMetadataToken ;        // methodDef of function with remap opportunity
+            SIZE_T          currentVersionNumber;  // version currently executing
+            SIZE_T          resumeVersionNumber;   // latest version
+            SIZE_T          currentILOffset;       // the IL offset of the current IP
+            SIZE_T          *resumeILOffset;       // pointer into left-side where an offset to resume
+                                                   // to should be written if remap is desired.
+        } EnCRemap;
+
+        // EnC Remap has taken place
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+            mdMethodDef funcMetadataToken;         // methodDef of function that was remapped
+        } EnCRemapComplete;
+
+        // Notification that the LS is about to update a CLR data structure to account for a
+        // specific edit made by EnC (function add/update or field add).
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+            mdToken         memberMetadataToken;   // Either a methodDef token indicating the function that
+                                                   // was updated/added, or a fieldDef token indicating the
+                                                   // field which was added.
+            mdTypeDef       classMetadataToken;    // TypeDef token of the class in which the update was made
+            SIZE_T          newVersionNumber;      // The new function/module version
+        } EnCUpdate;
+
+        struct MSLAYOUT
+        {
+            void      *oldData;
+            void      *newData;
+            DebuggerIPCE_BasicTypeData type;
+        } SetValueClass;
+
+
+        // Event used to tell LS if a single function is user or non-user code.
+        // Same structure used to get function status.
+        // @todo - Perhaps we can bundle these up so we can set multiple funcs w/ 1 event?
+        struct MSLAYOUT
+        {
+            VMPTR_DomainAssembly vmDomainAssembly;
+            mdMethodDef     funcMetadataToken;
+            DWORD           dwStatus;
+        } SetJMCFunctionStatus;
+
+        struct MSLAYOUT
+        {
+            TASKID      taskid;
+        } GetThreadForTaskId;
+
+        struct MSLAYOUT
+        {
+            VMPTR_Thread vmThreadToken;
+        } GetThreadForTaskIdResult;
+
+        struct MSLAYOUT
+        {
+            CONNID     connectionId;
+        } ConnectionChange;
+
+        struct MSLAYOUT
+        {
+            CONNID     connectionId;
+            EmbeddedIPCString<MAX_LONGPATH> wzConnectionName;
+        } CreateConnection;
+
+        struct MSLAYOUT
+        {
+            void               *objectToken;
+            CorDebugHandleType handleType;
+        } CreateHandle;
+
+        struct MSLAYOUT
+        {
+            VMPTR_OBJECTHANDLE vmObjectHandle;
+        } CreateHandleResult;
+
+        // used in DB_IPCE_DISPOSE_HANDLE event
+        struct MSLAYOUT
+        {
+            VMPTR_OBJECTHANDLE vmObjectHandle;
+            CorDebugHandleType handleType;
+        } DisposeHandle;
+
+        struct MSLAYOUT
+        {
+            FramePointer                  framePointer;
+            SIZE_T                        nOffset;
+            CorDebugExceptionCallbackType eventType;
+            DWORD                         dwFlags;
+            VMPTR_OBJECTHANDLE            vmExceptionHandle;
+        } ExceptionCallback2;
+
+        struct MSLAYOUT
+        {
+            CorDebugExceptionUnwindCallbackType eventType;
+            DWORD                               dwFlags;
+        } ExceptionUnwind;
+
+        struct MSLAYOUT
+        {
+            VMPTR_Thread vmThreadToken;
+            FramePointer frameToken;
+        } InterceptException;
+
+        struct MSLAYOUT
+        {
+            VMPTR_Module vmModule;
+            void * pMetadataStart;
+            ULONG nMetadataSize;
+        } MetadataUpdateRequest;
+    };
+};
+```
+
+</spoiler>
+
+В поле `type` хранится сам тип события. Оно определяет содержимое этого перечисления. У каждого значения есть префикс `DB_IPCE_`.
+
+Для отправки событий используются различные стратегии в зависимости от цели. Если отлаживаемый процесс находится локально, то используется механизм общей памяти - событие записывается в память отлаживаемого процесса (DCB, Debugger IPC Control Block), а затем выставляется Condition Variable и LHS узнает о событии.
+
+<spoiler title="Отправка события в общую память">
+
+```c++
+/* src/coreclr/debug/di/localeventchannel.cpp */
+HRESULT LocalEventChannel::SendEventToLeftSide(DebuggerIPCEvent * pEvent, SIZE_T eventSize)
+{
+    HRESULT hr       = E_FAIL;
+    BOOL    fSuccess = FALSE;
+
+    // Copy the event into the shared memory segment.
+    hr = SafeWriteBuffer(RemoteReceiveBuffer(eventSize), reinterpret_cast<BYTE *>(pEvent));
+    if (FAILED(hr))
+    {
+        return hr;
+    }
+
+    // Tell the runtime controller there is an event ready.
+    fSuccess = SetEvent(m_rightSideEventAvailable);
+
+    if (!fSuccess)
+    {
+        ThrowHR(HRESULT_FROM_GetLastError());
+    }
+
+    return S_OK;
+}
+```
+
+</spoiler>
 
 Рассмотрим как реализуются основные операции.
 
 ### Точки останова
 
-Событие для точек останова:
+У точки останова 2 события:
 
-- `DB_IPCE_BREAKPOINT_ADD` - выставление точки остнова
-- `DB_IPCE_BREAKPOINT_REMOVE` - удаление точки останова
+- `DB_IPCE_BREAKPOINT_ADD` - выставление
+- `DB_IPCE_BREAKPOINT_REMOVE` - удаление
 
-Сама точка останова представляется классом `DebuggerBreakpoint`.
-Так как код управляемый и JIT компилируется, то в процессе выполнения наш код может быть либо уже скомпилирован в нативный, либо хранится все еще в IL.
-Этот класс отвечает за оба случая.
+Сама точка останова представляется классом `DebuggerBreakpoint`. Так как код управляемый и JIT компилируется, то в процессе выполнения наш код может быть либо уже скомпилированым в нативный, либо все еще в IL. Этот класс отвечает за оба случая.
 
-> Можно заметить, что используется паттерн RAII - функция выставления точки останова вызывается из конструктора.
+<spoiler title="RAII">
 
-Для выставления точки останова в машинном коде используется функция `AddBindAndActivateNativeManagedPatch`.
-Выставление точки останова и патчинг очень похожи. Это отражается и в коде:
+Можно заметить, что используется паттерн RAII - функция выставления точки останова вызывается из конструктора.
+
+```c++
+DebuggerBreakpoint::DebuggerBreakpoint(Module *module,
+                                       mdMethodDef md,
+                                       AppDomain *pAppDomain,
+                                       SIZE_T offset,
+                                       bool native,
+                                       SIZE_T ilEnCVersion,  // must give the EnC version for non-native bps
+                                       MethodDesc *nativeMethodDesc,  // use only when m_native
+                                       DebuggerJitInfo *nativeJITInfo,  // optional when m_native, null otherwise
+                                       bool nativeCodeBindAllVersions,
+                                       BOOL *pSucceed
+                                       )
+                                       : DebuggerController(NULL, pAppDomain)
+{
+    if (native && !nativeCodeBindAllVersions)
+    {
+        (*pSucceed) = AddBindAndActivateNativeManagedPatch(nativeMethodDesc, nativeJITInfo, offset, LEAF_MOST_FRAME, pAppDomain);
+    }
+    else
+    {
+        (*pSucceed) = AddILPatch(pAppDomain, module, md, NULL, ilEnCVersion, offset, !native);
+    }
+}
+```
+
+</spoiler>
+
+
+Для выставления точки останова в машинном коде используется метод `AddBindAndActivateNativeManagedPatch`. Выставление точки останова и применение патчей схожи. Это отражается и в коде:
 
 - класс `DebuggerControllerPatch` представляет изменения в коде
 - метод `DebuggerController::ApplyPatch` применяет переданный патч
 - в глобальном переменной-массиве `g_patches` хранятся все патчи (точки останова)
 
-Инструкция точки останова платформо-зависимая. Это отражается и в реализации.
-За выставление точки останова (непосредственно по адресу) ответственна функция `CORDbgInsertBreakpoint`.
-У нее есть множество реализаций - на каждую поддерживаемую архитектуру:
+Инструкция точки останова платформо-зависимая. За ее выставление (непосредственно по адресу) ответственнен метод `CORDbgInsertBreakpoint`. У нее есть множество реализаций - на каждую поддерживаемую архитектуру:
 
 - `x86_64`
 - `x86`
@@ -5998,9 +6505,10 @@ DBI - CLR debugger interface (COM)
 - `RISC-V`
 - `ARM`
 
-Если посмотрим на реализацию x86_64, то увидим знакомые действия:
+Если посмотрим на реализацию x86_64, то увидим знакомые действия.
 
 ```c++
+/* src/coreclr/debug/inc/amd64 */
 inline void CORDbgInsertBreakpoint(UNALIGNED CORDB_ADDRESS_TYPE *address)
 {
     *((unsigned char*)address) = 0xCC; // int 3 (single byte patch)
@@ -6008,45 +6516,279 @@ inline void CORDbgInsertBreakpoint(UNALIGNED CORDB_ADDRESS_TYPE *address)
 }
 ```
 
-За патч в IL код отвечается функция `AddILPatch`.
-Здесь нельзя просто взять и вписать инструкцию останова, так как один и тот же код может быть за-JIT-ен множество раз - причина generic'и.
-Поэтому используется такой подход: мы также создаем патч, но не применяем его - он будет применен уже после JIT компиляции.
-Когда код будет скомпилирован, то для него будет создан новый патч - и вот уже он будет применен.
-Такой патч (для IL кода еще не скомпилированного) называется Primary Patch и за его выставление ответственна функция `AddILPrimaryPatch`.
+<spoiler title="Другие архитектуры">
 
-TODO: при достижении точки останова что делаем
-При достижении точки останова мы также создаем событие - `DB_IPCE_BREAKPOINT`.
-Только оно идет уже в обратную сторону - LHS -> RHS.
+Ради интереса добавлю реализации и для других поддерживаемых архитектур.
 
-Когда мы хотим продолжить выполнение, то точку останова (инструкцию) нужно убрать.
+ARM
+
+```c++
+/* src/coreclr/debug/inc/arm/primitives.h */
+#ifdef __linux__
+#define CORDbg_BREAK_INSTRUCTION (USHORT)0xde01
+#else
+#define CORDbg_BREAK_INSTRUCTION (USHORT)0xdefe
+#endif
+
+
+/* src/coreclr/debug/inc/arm_primitives.h */
+inline void CORDbgInsertBreakpointExImpl(UNALIGNED CORDB_ADDRESS_TYPE *address)
+{
+    LIMITED_METHOD_CONTRACT;
+
+    CORDbgSetInstruction(address, CORDbg_BREAK_INSTRUCTION);
+}
+```
+
+LoongSon
+
+```c++
+/* src/coreclr/debug/inc/loongarch64/primitives.h */
+#define CORDbg_BREAK_INSTRUCTION (LONG)0x002A0005
+
+inline void CORDbgInsertBreakpointExImpl(UNALIGNED CORDB_ADDRESS_TYPE *address)
+{
+    LIMITED_METHOD_CONTRACT;
+
+    CORDbgSetInstruction(address, CORDbg_BREAK_INSTRUCTION);
+}
+```
+
+Risc-V
+
+```c++
+/* src/coreclr/debug/inc/riscv64/primitives.h */
+#define CORDbg_BREAK_INSTRUCTION (LONG)0x00100073
+
+inline void CORDbgInsertBreakpoint(UNALIGNED CORDB_ADDRESS_TYPE *address)
+{
+    LIMITED_METHOD_CONTRACT;
+
+    CORDbgSetInstruction(address, CORDbg_BREAK_INSTRUCTION);
+}
+```
+
+</spoiler>
+
+За патч в IL код отвечается функция `AddILPatch`. Но нельзя просто взять и вписать инструкцию останова, так как один и тот же код может быть за-JIT-ен множество раз - причина generic'и. Поэтому используется такой подход: мы также создаем патч, но не применяем его - он будет применен уже после JIT компиляции. Когда код будет скомпилирован, то для него будет создан новый патч - и вот уже он будет применен. Такой патч (для IL кода еще не скомпилированного) называется Primary Patch и за его выставление ответственна функция `AddILPrimaryPatch`.
+
+
+<spoiler title="ApplyPatch">
+
+```c++
+/* src/coreclr/debug/ee/controller.cpp */
+bool DebuggerController::ApplyPatch(DebuggerControllerPatch *patch)
+{
+    if (patch->IsNativePatch())
+    {
+        if (patch->fSaveOpcode)
+        {
+            // We only used SaveOpcode for when we've moved code, so
+            // the patch should already be there.
+            patch->opcode = patch->opcodeSaved;
+            return true;
+        }
+
+        LPVOID baseAddress = (LPVOID)(patch->address);
+
+#if !defined(HOST_OSX) || !defined(HOST_ARM64)
+        DWORD oldProt;
+
+        if (!VirtualProtect(baseAddress,
+                            CORDbg_BREAK_INSTRUCTION_SIZE,
+                            PAGE_EXECUTE_READWRITE, &oldProt))
+        {
+            // we may be seeing unwriteable directly mapped executable memory.
+            // let's try copy-on-write instead,
+            if (!VirtualProtect(baseAddress,
+                CORDbg_BREAK_INSTRUCTION_SIZE,
+                PAGE_EXECUTE_WRITECOPY, &oldProt))
+            {
+                return false;
+            }
+        }
+#endif // !defined(HOST_OSX) || !defined(HOST_ARM64)
+
+        patch->opcode = CORDbgGetInstruction(patch->address);
+
+        CORDbgInsertBreakpoint((CORDB_ADDRESS_TYPE *)patch->address);
+        LOG((LF_CORDB, LL_EVERYTHING, "DC::ApplyPatch Breakpoint was inserted at %p for opcode %x\n",
+            patch->address, patch->opcode));
+
+#if !defined(HOST_OSX) || !defined(HOST_ARM64)
+        if (!VirtualProtect(baseAddress,
+                            CORDbg_BREAK_INSTRUCTION_SIZE,
+                            oldProt, &oldProt))
+        {
+            return false;
+        }
+#endif // !defined(HOST_OSX) || !defined(HOST_ARM64)
+    }
+// TODO: : determine if this is needed for AMD64
+#if defined(TARGET_X86) //REVISIT_TODO what is this?!
+    else
+    {
+        DWORD oldProt;
+
+        //
+        // !!! IL patch logic assumes reference insruction encoding
+        //
+        if (!VirtualProtect((void *) patch->address, 2,
+                            PAGE_EXECUTE_READWRITE, &oldProt))
+        {
+            if (!VirtualProtect((void*)patch->address, 2,
+                PAGE_EXECUTE_WRITECOPY, &oldProt))
+            {
+                return false;
+            }
+        }
+
+        patch->opcode = (unsigned int) *(unsigned short*)(patch->address+1);
+
+        ExecutableWriterHolder<BYTE> breakpointWriterHolder((BYTE*)patch->address, 2);
+        *(unsigned short *) (breakpointWriterHolder.GetRW()+1) = CEE_BREAK;
+
+        if (!VirtualProtect((void *) patch->address, 2, oldProt, &oldProt))
+        {
+            return false;
+        }
+    }
+#endif //TARGET_X86
+
+    return true;
+}
+```
+
+</spoiler>
+
 За удаление точки останова отвечает метод `UnapplyPatch` (противоположный `ApplyPatch`).
+
+<spoiler title="UnapplyPatch">
+
+```c++
+/* src/coreclr/debug/ee/controller.cpp */
+bool DebuggerController::UnapplyPatch(DebuggerControllerPatch *patch)
+{
+    if (patch->IsNativePatch())
+    {
+        if (patch->fSaveOpcode)
+        {
+            // We're doing this for MoveCode, and we don't want to
+            // overwrite something if we don't get moved far enough.
+            patch->opcodeSaved = patch->opcode;
+            InitializePRD(&(patch->opcode));
+            return true;
+        }
+
+        LPVOID baseAddress = (LPVOID)(patch->address);
+
+#if !defined(HOST_OSX) || !defined(HOST_ARM64)
+        DWORD oldProt;
+
+        if (!VirtualProtect(baseAddress,
+                            CORDbg_BREAK_INSTRUCTION_SIZE,
+                            PAGE_EXECUTE_READWRITE, &oldProt))
+        {
+            if (!VirtualProtect(baseAddress,
+                CORDbg_BREAK_INSTRUCTION_SIZE,
+                PAGE_EXECUTE_WRITECOPY, &oldProt))
+            {
+                //
+                // We may be trying to remove a patch from memory
+                // which has been unmapped. We can ignore the
+                // error in this case.
+                //
+                InitializePRD(&(patch->opcode));
+                return false;
+            }
+        }
+#endif // !defined(HOST_OSX) || !defined(HOST_ARM64)
+
+        CORDbgSetInstruction((CORDB_ADDRESS_TYPE *)patch->address, patch->opcode);
+
+        // VERY IMPORTANT to zero out opcode, else we might mistake
+        // this patch for an active one on ReadMem/WriteMem (see
+        // header file comment).
+        InitializePRD(&(patch->opcode));
+
+#if !defined(HOST_OSX) || !defined(HOST_ARM64)
+        if (!VirtualProtect(baseAddress,
+                            CORDbg_BREAK_INSTRUCTION_SIZE,
+                            oldProt, &oldProt))
+        {
+            return false;
+        }
+#endif // !defined(HOST_OSX) || !defined(HOST_ARM64)
+    }
+    else
+    {
+        DWORD oldProt;
+
+        if (!VirtualProtect((void *) patch->address, 2,
+                            PAGE_EXECUTE_READWRITE, &oldProt))
+        {
+            if (!VirtualProtect((void*)patch->address, 2,
+                PAGE_EXECUTE_WRITECOPY, &oldProt))
+            {
+                //
+                // We may be trying to remove a patch from memory
+                // which has been unmapped. We can ignore the
+                // error in this case.
+                //
+                InitializePRD(&(patch->opcode));
+                return false;
+            }
+        }
+
+        //
+        // !!! IL patch logic assumes reference encoding
+        //
+// TODO: : determine if this is needed for AMD64
+#if defined(TARGET_X86)
+        _ASSERTE(*(unsigned short*)(patch->address+1) == CEE_BREAK);
+
+        ExecutableWriterHolder<BYTE> breakpointWriterHolder((BYTE*)patch->address, 2);
+        *(unsigned short *) (breakpointWriterHolder.GetRW()+1)
+          = (unsigned short) patch->opcode;
+#endif //this makes no sense on anything but X86
+
+        // VERY IMPORTANT to zero out opcode, else we might mistake
+        // this patch for an active one on ReadMem/WriteMem (see
+        // header file comment.
+        InitializePRD(&(patch->opcode));
+
+        if (!VirtualProtect((void *) patch->address, 2, oldProt, &oldProt))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+```
+
+</spoiler>
 
 ### Шаги в исходном коде
 
-Шаги также реализованы в виде событий.
-Команды:
+Шаги также реализованы событиями. Команды для них:
 
 - `DB_IPCE_STEP` - шаг в коде (поведение зависит от аргументов)
 - `DB_IPCE_STEP_OUT` - step out
-- `DB_IPCE_STEP_CANCEL` - отмена выполнения шага (код продолжит выполнение (TODO: уточнить))
 
-Ответы:
+В результате их выполнения мы получаем такие события:
 
 - `DB_IPCE_STEP_RESULT` - успешная обработка команды выше
 - `DB_IPCE_STEP_COMPLETE` - команда выше завершена
 
-Разница между ответами в том, что 1 отправляется сразу, а 2 только когда шаг был завершен.
-Это необходимо, так как выполнение шага может занять большое количество времени, а за 1 раз можно обрабатывать только 1 событие.
-
-Таким образом, работа ведется следующим образом:
+Разница между ними в том, что 1 отправляется сразу (синхронный ответ), а 2 только когда шаг был завершен (асинхронный ответ). Это необходимо, так как выполнение шага может занять большое количество времени, а за 1 раз можно обрабатывать только 1 событие. Таким образом, работа ведется следующим образом:
 
 1. <- `DB_IPCE_STEP`/`DB_IPCE_STEP_OUT`
 2. -> `DB_IPCE_STEP_RESULT`
 3. *проходит время*
 4. -> `DB_IPCE_STEP_COMPLETE`
 
-Разберем как работает `DB_IPCE_STEP`.
-Струкрута для этого события выглядит следующим образом:
+Разберем как работает `DB_IPCE_STEP`. Структура для этого события выглядит следующим образом:
 
 <spoiler title="Структура события для шага">
 
@@ -6072,25 +6814,16 @@ struct MSLAYOUT
 
 </spoiler>
 
-Можно заметить поле `stepIn` - это флаг. Если он выставлен, то необходимо выполнить step in, иначе step out.
-Есть и другие, например, поле `rangeIL` - это тоже флаг и используется для указания того, что переданные данные для IL кода, а не нативного.
+Можно заметить поле `stepIn` - это флаг. Если он выставлен, то необходимо выполнить step in, иначе step out. Есть и другие, например, поле `rangeIL` - это тоже флаг и используется для указания того, что переданные данные для IL кода, а не нативного (прямо как в gdb можно указать какое количество шагов выполнить, только здесь не машинные инструкции). Логика шагания заключена в классе `DebuggerStepper` и его методе `Step`.
 
-Логика шагания заключена в классе `DebuggerStepper` и его методе `Step`.
+> Также есть класс `DebuggerJMCStepper`. Он используется для JMC, [Just My Code](https://learn.microsoft.com/en-us/visualstudio/debugger/just-my-code?view=vs-2022). То есть отладчик будет работать только с *нашими* функциями и не будет проваливаться во внутренние функции платформы или чужие модули. Если флаг `IsJMCStop` в событии выставлен, то будет использоваться эта структура.
 
-> Также есть класс `DebuggerJMCStepper`. Он используется для JMC, [Just My Code](https://learn.microsoft.com/en-us/visualstudio/debugger/just-my-code?view=vs-2022).
-> То есть отладчик будет работать только с нашими функциями и не будет проваливаться во внутренние функции платформы или чужие модули.
-> Если флаг `IsJMCStop` в событии выставлен, то будет использоваться эта структура.
+Для реализации мы ставим точку останова на следующей выполняемой инструкции. Также мы используем предсказывание переходов.
 
-Логика шага похожа на gdb - ставим точку останова на следующей выполняемой инструкции.
-Но есть главное различие - предсказывание переходов.
-
-Для того, чтобы получить следующую инструкцию используется специальный класс `NativeWalker`.
-Его главная задача - дать понять, какого типа инструкция идет дальше.
-Он различает 8 типов инструкций. Они определены в перечислении `WALK_TYPE`.
-
-<spoiler title="WALK_TYPE">
+Для того, чтобы получить следующую инструкцию используется специальный класс `NativeWalker`. Его главная задача - дать понять, какого типа инструкция идет дальше. Он различает 8 типов инструкций. Они определены в перечислении `WALK_TYPE`.
 
 ```c++
+/* src/coreclr/debug/ee/walker.h */
 enum WALK_TYPE
 {
   WALK_NEXT,
@@ -6105,37 +6838,154 @@ enum WALK_TYPE
 };
 ```
 
-</spoiler>
+При создании инстанса этого класса ему передается PC и состояние регистров. После этого, мы можем получить тип инструкции, на который PC указывает. С помощью этого мы и понимаем как ставить точку останова.
 
-При создании инстанса этого класса ему передается PC и состояние регистров.
-После этого, мы можем получить тип инструкции, на который PC указывает.
-С помощью этого мы и понимаем как ставить точку останова.
+<spoiler title="TrapStep">
+
+```c++
+bool DebuggerStepper::TrapStep(ControllerStackInfo *info, bool in)
+{
+    /* ... */
+    NativeWalker walker;
+    walker.Init((BYTE*)GetControlPC(&(info->m_activeFrame.registers)), &info->m_activeFrame.registers);
+
+    /* ... */
+    while (TRUE)
+    {
+        const BYTE *ip = walker.GetIP();
+
+        SIZE_T offset = CodeRegionInfo::GetCodeRegionInfo(ji, info->m_activeFrame.md).AddressToOffset(ip);
+
+        if (!IsInRange(offset, range, rangeCount)
+            && !ShouldContinueStep( info, offset ))
+        {
+            AddBindAndActivateNativeManagedPatch(info->m_activeFrame.md,
+                     ji,
+                     offset,
+                     info->GetReturnFrame().fp,
+                     NULL);
+            return true;
+        }
+
+        switch (walker.GetOpcodeWalkType())
+        {
+        case WALK_RETURN:
+            // In the loop above, if we're at the return address, we'll check & see
+            // if we're returning to elsewhere within the same method, and if so,
+            // we'll single step rather than TrapStepOut. If we see a return in the
+            // code stream, then we'll set a breakpoint there, so that we can
+            // examine the return address, and decide whether to SS or TSO then
+            AddBindAndActivateNativeManagedPatch(info->m_activeFrame.md,
+                     ji,
+                     offset,
+                     info->GetReturnFrame().fp,
+                     NULL);
+            return true;
+
+        case WALK_CALL:
+            // If we're doing some sort of intra-method jump (usually, to get EIP in a clever way, via the CALL
+            // instruction), then put the bp where we're going, NOT at the instruction following the call
+            if (IsAddrWithinFrame(ji, info->m_activeFrame.md, walker.GetIP(), walker.GetNextIP()))
+            {
+                // How else to detect this?
+                AddBindAndActivateNativeManagedPatch(info->m_activeFrame.md,
+                         ji,
+                         CodeRegionInfo::GetCodeRegionInfo(ji, info->m_activeFrame.md).AddressToOffset(walker.GetNextIP()),
+                         info->GetReturnFrame().fp,
+                         NULL);
+                return true;
+            }
+
+            if (IsTailCallJitHelper(walker.GetNextIP()) || IsTailCallThatReturns(walker.GetNextIP(), info))
+            {
+                if (!in)
+                {
+                    AddBindAndActivateNativeManagedPatch(info->m_activeFrame.md,
+                                                         ji,
+                                                         offset,
+                                                         info->GetReturnFrame().fp,
+                                                         NULL);
+                    return true;
+                }
+            }
+
+            if (in || fCallingIntoFunclet)
+            {
+                if (walker.GetNextIP() == NULL)
+                {
+                    AddBindAndActivateNativeManagedPatch(info->m_activeFrame.md,
+                             ji,
+                             offset,
+                             info->GetReturnFrame().fp,
+                             NULL);
+                    m_reason = STEP_CALL;
+
+                    return true;
+                }
+
+                if (TrapStepInHelper(info, walker.GetNextIP(), walker.GetSkipIP(), fCallingIntoFunclet, false))
+                {
+                    return true;
+                }
+
+            }
+
+            if (walker.GetSkipIP() == NULL)
+            {
+                AddBindAndActivateNativeManagedPatch(info->m_activeFrame.md,
+                         ji,
+                         offset,
+                         info->GetReturnFrame().fp,
+                         NULL);
+
+                m_reason = STEP_CALL;
+
+                return true;
+            }
+
+            walker.Skip();
+            break;
+
+        default:
+            if (walker.GetNextIP() == NULL)
+            {
+                AddBindAndActivateNativeManagedPatch(info->m_activeFrame.md,
+                    ji,
+                    offset,
+                    info->GetReturnFrame().fp,
+                    NULL);
+                return true;
+            }
+            walker.Next();
+            break;
+        }
+    }
+    /* ... */
+}
+```
+
+</spoiler>
 
 Обрабатываются 3 ситуации (в зависимости от текущей инструкции):
 
 - Обычная инструкция - ставим точку останова на следующей инструкции
-- RETURN - ставим точку останова по адресу возврата
-- CALL - ставим точку останова по указанному в CALL адресу
+- `RETURN` - ставим точку останова по адресу возврата
+- `CALL` - ставим точку останова по указанному в CALL адресу
 
-Но инструкция CALL не такая простая, как я описал. Для него предусмотрено несколько граничных случаев:
+Но инструкция `CALL` не такая простая, как я описал. Для него предусмотрено несколько граничных случаев:
 
 - Адрес находится внутри текущей функции
 - Используется Tail Call (поддерживается платформой)
 - Вызов funclet'ов (мини-функций: внутренних функций, try/catch блоки и т.д. - функция, которая использует стек родителя)
 
-> Эта логика выполняется для управляемого кода, то есть скомпилированного из IL рантаймом.
-> Кроме него есть и неуправляемый код.
-> Если мы его встречаем, то ничего сделать не можем.
-> В таких случаях, документация говорит выполнить step out и поставить точку останова уже в управляемом коде.
+> Эта логика выполняется для управляемого кода, то есть скомпилированного из IL рантаймом. Кроме него есть и неуправляемый код. Если мы его встречаем, то ничего сделать не можем. В таких случаях, документация говорит выполнить step out и поставить точку останова уже в управляемом коде.
 
-Теперь, перейдем к step out. Его логика тажке заключена в классе `DebuggerStepper`, но метод уже `StepOut`.
-Сама логика выставления точки останова заключена в `TrapStepOut`.
-
-Happy path простой - ставим точку останова на адресе возврата.
+Теперь, перейдем к step out. Его логика тажке заключена в классе `DebuggerStepper`, но метод уже `StepOut`. Сама логика выставления точки останова заключена в `TrapStepOut`. Happy path простой - ставим точку останова на адресе возврата.
 
 <spoiler title="TrapStepOut - Happy Path">
 
 ```c++
+/* src/coreclr/debug/ee/controller.cpp */
 // Place a single patch somewhere up the stack to do a step-out
 void DebuggerStepper::TrapStepOut(ControllerStackInfo *info, bool fForceTraditional)
 {
@@ -6220,26 +7070,16 @@ void DebuggerStepper::TrapStepOut(ControllerStackInfo *info, bool fForceTraditio
 
 </spoiler>
 
-Но интересно не это. Если посмотрели на код, то могли заметить, что имеется некоторое количество граничных случаев:
+Но интересно не это. Если посмотрели на код, то могли заметить, что также имеется некоторое количество граничных случаев:
 
-- Динамически скомпилированный код - .NET позволяет своими силами в рантайме создавать сборки, компилировать их и запускать.
-  Представьте ситуацию - динамически скомпилированный код вызвал нашу функцию и мы в ней остановились. Что будет, если мы пошлем команду step out?
-  В .NET решили, что если на пути встретится фрейм динамического кода, то мы его **пропустим**.
-- Единственный фрейм - такое может случиться, если это `Main`. Так как это единственный фрейм, то выход из него означает завершение работы программы.
-  То есть, в этом случае мы ничего не будем делать.
-- Вычисление динамического выражения - это случаи, когда отладчик отправляет в рантайм выражения, которые необходимо вычислить.
-  Такие выражения ближе к динамически скомпилированному коду, но ведет себя как единственный фрейм, то есть ничего не делаем.
-  В общем, поведение логичное - этот фрейм, грубо говоря, существует в вакууме, так как ни к кому не привязан.
-- Политики безопасности - с помощью атрибутов можно задавать различные политики безопасности (декларативная безопасность).
-  Если на методе есть такой атрибут, то перед его вызовом будет вызван перехватчик (interceptor) - код, который проверяет права.
-  Если мы находимся в таком контексте, то необходимо поставить точку останова на функции выше в цепочке вызовов.
-- Остальные случаи - этим я обозвал все случаи (в управляемом коде), которые не обработались выше.
-  Если добрались сюда, то ставим точку останова на следующем фрейме, который будем выполнять.
-  Такое поведение в комментарии назвали step next.
+- Динамически скомпилированный код - .NET позволяет своими силами в рантайме создавать сборки, компилировать их и запускать. Представьте ситуацию - динамически скомпилированный код вызвал нашу функцию и мы в ней остановились. Что будет, если мы пошлем команду step out? В .NET решили, что если на пути встретится фрейм динамического кода, то мы его **пропустим**.
+- Единственный фрейм - такое может случиться, если это `Main`. Так как это единственный фрейм, то выход из него означает завершение работы программы. То есть, в этом случае мы ничего не будем делать.
+- Вычисление динамического выражения - это случаи, когда отладчик отправляет в рантайм выражения, которые необходимо вычислить. Такие выражения ближе к динамически скомпилированному коду, но ведет себя как единственный фрейм, то есть ничего не делаем. В общем, поведение логичное - этот фрейм, грубо говоря, существует в вакууме, так как ни к кому не привязан.
+- Политики безопасности - с помощью атрибутов можно задавать различные политики безопасности (декларативная безопасность). Если на методе есть такой атрибут, то перед его вызовом будет вызван перехватчик (interceptor) - код, который проверяет права. Если мы находимся в таком контексте, то необходимо поставить точку останова на функции выше в цепочке вызовов.
+- Остальные случаи - этим я обозвал все случаи (в управляемом коде), которые не обработались выше. Если добрались сюда, то ставим точку останова на следующем фрейме, который будем выполнять. Такое поведение в комментарии назвали step next.
 - Неуправляемый код - ставим точку останова на адресе возврата.
 
-> Для работы с фреймами используется отдельный класс `Frame`. Он базовый - абстрактный.
-> Всего я нашел 18 подклассов `Frame`. Например, `FuncEvalFrame` - это фрейм, который создается отладчиком во время вычисления выражения для вызова функций.
+> Для работы с фреймами используется отдельный класс `Frame`. Он базовый - абстрактный. Всего я нашел 18 подклассов `Frame`. Например, `FuncEvalFrame` - это фрейм, который создается отладчиком во время вычисления выражения для вызова функций.
 
 ## Java
 
