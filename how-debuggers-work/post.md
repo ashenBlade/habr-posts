@@ -88,7 +88,7 @@ long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
 - `PTRACE_EVENT stop` — получено событие от `ptrace` (подробнее ниже).
 - `syscall-stop` — мы вызвали `ptrace(PTRACE_SYSCALL)`, и начался системный вызов.
 
-По `PTRACE_EVENT stop` подробнее. Вызов `PTRACE_SETOPTIONS` позволяет выставить "свойства" `ptrace`, его поведение. Например, если с этим вызовом передать `PTRACE_O_TRACEFORK`, то мы остановимся при следующем вызове `fork` и tracee войдет в состояние `PTRACE_EVENT stop`.
+По `PTRACE_EVENT stop`. Вызов `PTRACE_SETOPTIONS` позволяет выставить "свойства" `ptrace`, его поведение. Например, если с этим вызовом передать `PTRACE_O_TRACEFORK`, то мы остановимся при следующем вызове `fork` и tracee войдет в состояние `PTRACE_EVENT stop`.
 
 И еще - вызов блокирующего системного вызов это не ptrace-stop. Процесс может остановиться, да, но он не в ptrace-stop состоянии.
 
