@@ -37,7 +37,7 @@ long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
 - `PTRACE_CONT`/`PTRACE_SINGLESTEP` — получить контроль над выполнением.
 - Прочитать и изменять:
   - `PTRACE_GETREGS`/`PTRACE_SETREGS` — регистры.
-  - `PTRACE_PEEKDATA`/`PTRACE_POKEDATA` - Память и код
+  - `PTRACE_PEEKDATA`/`PTRACE_POKEDATA` — память и код.
   - `PTRACE_PEEKUSER`/`PTRACE_POKEUSER` - TODO: придумать как назвать
   - `PTRACE_SET_THREAD_AREA` - Локальные данные потока (TLS)
 - `PTRACE_SET_SYSCALL` - Подменять вызываемые системные вызовы
