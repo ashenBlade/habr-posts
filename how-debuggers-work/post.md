@@ -41,7 +41,7 @@ long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
   - `PTRACE_PEEKUSER`/`PTRACE_POKEUSER` — TODO: придумать как назвать.
   - `PTRACE_SET_THREAD_AREA` — локальные данные потока (TLS).
 - `PTRACE_SET_SYSCALL` — подменять вызываемые системные вызовы.
-- `PTRACE_SECCOMP_GET_FILTER` - Получать информацию о [seccomp](https://man.archlinux.org/man/seccomp.2.en)
+- `PTRACE_SECCOMP_GET_FILTER` — получать информацию о [seccomp](https://man.archlinux.org/man/seccomp.2.en).
 
 <spoiler title="Откуда пришли PEEK & POKE">
 
