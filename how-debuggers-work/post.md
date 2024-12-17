@@ -86,7 +86,7 @@ long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
 - `signal-delivery-stop` — tracee получил сигнал, и мы его перехватили.
 - `group-stop` — многопоточный процесс.
 - `PTRACE_EVENT stop` — получено событие от `ptrace` (подробнее ниже).
-- `syscall-stop` - мы вызвали `ptrace(PTRACE_SYSCALL)` и начался системный вызов
+- `syscall-stop` — мы вызвали `ptrace(PTRACE_SYSCALL)`, и начался системный вызов.
 
 По `PTRACE_EVENT stop` подробнее. Вызов `PTRACE_SETOPTIONS` позволяет выставить "свойства" `ptrace`, его поведение. Например, если с этим вызовом передать `PTRACE_O_TRACEFORK`, то мы остановимся при следующем вызове `fork` и tracee войдет в состояние `PTRACE_EVENT stop`.
 
