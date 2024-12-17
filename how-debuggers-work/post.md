@@ -21,7 +21,7 @@
 - `ptrace`
 - `INT 3`
 
-`ptrace` - это системный вызов, который используется для отслеживания процесса (**p**rocess **trace**):
+`ptrace` — это системный вызов, который используется для отслеживания процесса (**p**rocess **trace**):
 
 ```c
 long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
