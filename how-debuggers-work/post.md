@@ -83,7 +83,7 @@ long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
 
 Когда `waitpid` возвращается, то tracee остановлен, да. Но вот типов таких остановок несколько. Общее состояние, когда tracee остановлен для обработки им tracer'ом называется ptrace-stop и он разбивается на подгруппы:
 
-- `signal-delivery-stop` - tracee получил сигнал и мы его перехватили
+- `signal-delivery-stop` — tracee получил сигнал, и мы его перехватили.
 - `group-stop` - многопоточный процесс
 - `PTRACE_EVENT stop` - получено событие от `ptrace` (ниже)
 - `syscall-stop` - мы вызвали `ptrace(PTRACE_SYSCALL)` и начался системный вызов
