@@ -34,7 +34,7 @@ long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data);
 
 Благодаря этому системному вызову можно:
 
-- `PTRACE_CONT`/`PTRACE_SINGLESTEP` - Получить контроль над выполнением
+- `PTRACE_CONT`/`PTRACE_SINGLESTEP` — получить контроль над выполнением.
 - Прочитать и изменять:
   - `PTRACE_GETREGS`/`PTRACE_SETREGS` - Регистры
   - `PTRACE_PEEKDATA`/`PTRACE_POKEDATA` - Память и код
