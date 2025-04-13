@@ -7585,6 +7585,8 @@ handleFramePopEvent(JNIEnv *env, EventInfo *evinfo,
 }
 ```
 
+</spoiler>
+
 <spoiler title="fullspeed режим">
 
 В процессе исследования кода нашел упоминание о режиме [fullspeed debugging](https://docs.oracle.com/javase/8/docs/technotes/guides/jpda/enhancements1.4.html#fsd). Это специальный режим выполнения кода и важен он во время отладки. Код может либо интерпретироваться, либо JIT компилироваться. Но, как мы сможем отладить машинные инструкции, если работать умеем только с байт-кодом?
@@ -8388,7 +8390,7 @@ public:
 
 Этот интерфейс реализует класс `V8DebuggerAgentImpl`. Если посмотреть на его реализацию, то увидим, что и он на самом деле просто обертка над другим объектом. Но на этот раз последним - `V8Debugger`. Внутри него и содержится логика отладки. Например, вот реализация метода `stepOverStatement`:
 
-<spoiler title=V8Debugger::stepOverStatement>
+<spoiler title="V8Debugger::stepOverStatement">
 
 ```c++
 /* https://github.com/nodejs/node/blob/v23.1.0/deps/v8/src/inspector/v8-debugger.cc#L321 */
@@ -8948,7 +8950,7 @@ DAP - это протокол, созданный Microsoft. Как понятн
 
 [gdb mi](https://www.sourceware.org/gdb/current/onlinedocs/gdb.html/GDB_002fMI.html) (gdb Machine Interface) - текстовый интерфейс для взаимодействия с gdb. Его можно активировать запустив gdb с флагом `--interpreter` и предназначен для окружений, где отладчик является частью большой системы, такой как IDE. На данный момент, существует 4 версии этого протокола.
 
-Сам протокол сильно похож на стандартный протокол/алгоритм отладчика. Имеем команды, ответы и уведомления. Ответ присылаются при отправке команды, а уведомления приходят асинхронно. Из интересного - совместимость с командами интерактивного режима. Она есть, но оговаривается, что поведение может быть непредсказуемым. Чтобы использовать их без проблем есть отдельная команда (mi) - `-interperter-exec`.
+Сам протокол сильно похож на стандартный протокол/алгоритм отладчика. Имеем команды, ответы и уведомления. Ответ присылаются при отправке команды, а уведомления приходят асинхронно. Из интересного - совместимость с командами интерактивного режима. Она есть, но оговаривается, что поведение может быть непредсказуемым. Чтобы использовать их без проблем есть отдельная команда - `-interperter-exec`.
 
 На странице документации есть примеры взаимодействия с gdb mi. Например, таким образом выставляется точка останова:
 
@@ -9089,7 +9091,7 @@ internal class DebuggedProcess : MICore.Debugger
 
 </spoiler>
 
-Как можем видеть по этой цепочке вызовов - мы запускаем отладчик, инициализируем его и запускаем программу. Но где же сами MI команды? Да, я их пропустил, но намеренно, чтобы сконцетрироваться на логике, а сейчас посмотрим на то, как их отправляют. Первый пример - это команды инициализации, те что были в методе `Initialize`. Они создаются в методе `GetInitializeCommands`.
+Как можем видеть по этой цепочке вызовов - мы запускаем отладчик, инициализируем его и запускаем программу. Но где же сами MI команды? Да, я их пропустил, но намеренно, чтобы сконцентрироваться на логике, а сейчас посмотрим на то, как их отправляют. Первый пример - это команды инициализации, те что были в методе `Initialize`. Они создаются в методе `GetInitializeCommands`.
 
 <spoiler title="GetInitializeCommands">
 
@@ -9108,11 +9110,8 @@ internal class DebuggedProcess : MIcore.Debugger
             commands.Add(new LaunchCommand("-interpreter-exec console \"set pagination off\""));
         }
 
-        // When user specifies loading directives then the debugger cannot auto load symbols, the MIEngine must intervene at each solib-load event and make a determination
         commands.Add(new LaunchCommand("-gdb-set auto-solib-add " + (_launchOptions.CanAutoLoadSymbols() ? "on" : "off")));
 
-        // If the absolute prefix so path has not been specified, then don't set it to null
-        // because the debugger might already have a default.
         if (!string.IsNullOrEmpty(_launchOptions.AbsolutePrefixSOLibSearchPath))
         {
             commands.Add(new LaunchCommand("-gdb-set solib-absolute-prefix " + _launchOptions.AbsolutePrefixSOLibSearchPath));
@@ -9137,20 +9136,6 @@ internal class DebuggedProcess : MIcore.Debugger
             }
         }
 
-        if (this.MICommandFactory.SupportsStopOnDynamicLibLoad())
-        {
-            // Do not stop on shared library load/unload events while debugging core dump.
-            // Also check _needTerminalReset because we need to work around a GDB bug and clear the terminal error message. 
-            // This clear operation can't be done too early (because GDB only generate this message after start debugging) 
-            // or too late (otherwise we might clear debuggee's output). 
-            // The stop cause by first module load seems to be the perfect timing to clear the terminal, 
-            // that's why we still need to initially turn stop-on-solib-events on then turn it off after the first stop.
-            if ((_needTerminalReset || _launchOptions.WaitDynamicLibLoad) && !this.IsCoreDump)
-            {
-                commands.Add(new LaunchCommand("-gdb-set stop-on-solib-events 1"));
-            }
-        }
-
         if (MICommandFactory.SupportsChildProcessDebugging())
         {
             if (_launchOptions.DebugChildProcesses)
@@ -9159,184 +9144,19 @@ internal class DebuggedProcess : MIcore.Debugger
             }
         }
 
-        // Custom launch options replace the built in launch steps. This is used on iOS
-        // and Linux attach scenarios.
-        if (_launchOptions.CustomLaunchSetupCommands != null)
+        LocalLaunchOptions localLaunchOptions = _launchOptions as LocalLaunchOptions;
+        if (this.IsCoreDump)
         {
-            commands.AddRange(_launchOptions.CustomLaunchSetupCommands);
+            // Load executable and core dump
+            this.AddExecutableAndCorePathCommand(commands);
 
-            SetTargetArch(_launchOptions.TargetArchitecture);
+            // Important: this must occur after executable load but before anything else.
+            this.AddGetTargetArchitectureCommand(commands);
         }
-        else
-        {
-            LocalLaunchOptions localLaunchOptions = _launchOptions as LocalLaunchOptions;
-            if (this.IsCoreDump)
-            {
-                // Load executable and core dump
-                this.AddExecutableAndCorePathCommand(commands);
-
-                // Important: this must occur after executable load but before anything else.
-                this.AddGetTargetArchitectureCommand(commands);
-            }
-            else if (_launchOptions.ProcessId.HasValue)
-            {
-                // This is an attach
-
-                if (this.MICommandFactory.Mode == MIMode.Gdb)
-                {
-                    if (_launchOptions is UnixShellPortLaunchOptions)
-                    {
-                        // This code path is probably applicable when the ExePath is not specified and can be used to determine the full executable path.
-                        // For now it is limited to Linux and debugger running on remote machine.
-                        Debug.Assert(_launchOptions.ExePath == null);
-
-                        DetermineAndAddExecutablePathCommand(commands, _launchOptions as UnixShellPortLaunchOptions);
-                    }
-                    else if (!string.IsNullOrWhiteSpace(_launchOptions.ExePath))
-                    {
-                        this.AddExecutablePathCommand(commands);
-                    }
-                }
-
-                // Important: this must occur after file-exec-and-symbols but before anything else.
-                this.AddGetTargetArchitectureCommand(commands);
-
-                // check for remote
-                string destination = localLaunchOptions?.MIDebuggerServerAddress;
-                bool useExtendedRemote = localLaunchOptions?.UseExtendedRemote ?? false;
-                if (!string.IsNullOrWhiteSpace(destination))
-                {
-                    string remoteMode = useExtendedRemote ? "extended-remote" : "remote";
-                    commands.Add(new LaunchCommand($"-target-select {remoteMode} {destination}", string.Format(CultureInfo.CurrentCulture, ResourceStrings.ConnectingMessage, destination)));
-                }
-                // Allow attach after connection only in extended-remote mode
-                if (useExtendedRemote || (!useExtendedRemote && string.IsNullOrWhiteSpace(destination)))
-                {
-                    Action<string> failureHandler = (string miError) =>
-                    {
-                        if (miError.Trim().StartsWith("ptrace:", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string message = string.Format(CultureInfo.CurrentCulture, ResourceStrings.Error_PTraceFailure, _launchOptions.ProcessId, MICommandFactory.Name, miError);
-                            throw new LaunchErrorException(message);
-                        }
-                        else
-                        {
-                            string message = string.Format(CultureInfo.CurrentCulture, ResourceStrings.Error_ExePathInvalid, _launchOptions.ExePath, MICommandFactory.Name, miError);
-                            throw new LaunchErrorException(message);
-                        }
-                    };
-
-                    commands.Add(new LaunchCommand("-target-attach " + _launchOptions.ProcessId.Value.ToString(CultureInfo.InvariantCulture), ignoreFailures: false, failureHandler: failureHandler));
-                }
-
-                if (_launchOptions.PostRemoteConnectCommands != null) 
-                {
-                    commands.AddRange(_launchOptions.PostRemoteConnectCommands);
-                }
-
-
-                if (this.MICommandFactory.Mode == MIMode.Lldb)
-                {
-                    // LLDB finishes attach in break mode. Gdb does finishes in run mode. Issue a continue in lldb to match the gdb behavior
-                    commands.Add(new LaunchCommand("-exec-continue", ignoreFailures: false));
-                }
-
-                return commands;
-            }
-            else
-            {
-                // The default launch is to start a new process
-
-                if (!string.IsNullOrWhiteSpace(_launchOptions.WorkingDirectory))
-                {
-                    string escapedDir = this.EnsureProperPathSeparators(_launchOptions.WorkingDirectory, true);
-
-                    commands.Add(new LaunchCommand("-environment-cd " + escapedDir));
-                }
-
-                if (localLaunchOptions != null &&
-                    localLaunchOptions.UseExternalConsole &&
-                    (PlatformUtilities.IsWindows() ||
-                        (PlatformUtilities.IsOSX() && this.MICommandFactory.Mode == MIMode.Lldb)))
-                {
-                    commands.Add(new LaunchCommand("-gdb-set new-console on", ignoreFailures: true));
-                }
-
-                this.AddExecutablePathCommand(commands);
-
-                // Important: this must occur after file-exec-and-symbols but before anything else.
-                this.AddGetTargetArchitectureCommand(commands);
-
-                // LLDB requires -exec-arguments after -file-exec-and-symbols has been run, or else it errors
-                if (!string.IsNullOrWhiteSpace(_launchOptions.ExeArguments))
-                {
-                    commands.Add(new LaunchCommand("-exec-arguments " + _launchOptions.ExeArguments));
-                }
-
-                Func<Results, Task> breakMainSuccessResultsHandler = (Results bkptResult) =>
-                {
-                    if (bkptResult.Contains("bkpt"))
-                    {
-                        ResultValue b = bkptResult.Find("bkpt");
-                        TupleValue bkpt = null;
-                        if (b is TupleValue)
-                        {
-                            bkpt = b as TupleValue;
-                        }
-                        else if (b is ValueListValue) // Used when main breakpoint binds in more than one location
-                        {
-                            // Grab the first one as this is usually the <MULTIPLE> one that we can unbind them all with.
-                            // This is usually "1" when the children manifest as "1.1", "1.2", etc
-                            bkpt = (b as ValueListValue).Content[0] as TupleValue;
-                        }
-
-                        if (bkpt != null)
-                        {
-                            this._entryPointBreakpoint = bkpt.FindString("number");
-                            this._deleteEntryPointBreakpoint = true;
-                        }
-                    }
-                    return Task.FromResult(0);
-                };
-
-                // Builds '-break-insert' for 'main'.
-                StringBuilder breakInsertCommand = await this.MICommandFactory.BuildEntryBreakInsert();
-                breakInsertCommand.Append("main");
-
-                commands.Add(new LaunchCommand(breakInsertCommand.ToString(), ignoreFailures: true, successResultsHandler: breakMainSuccessResultsHandler));
-
-                if (null != localLaunchOptions)
-                {
-                    string destination = localLaunchOptions.MIDebuggerServerAddress;
-                    if (!string.IsNullOrWhiteSpace(destination))
-                    {
-                        string remoteMode = localLaunchOptions.UseExtendedRemote ? "extended-remote" : "remote";
-                        commands.Add(new LaunchCommand($"-target-select {remoteMode} {destination}", string.Format(CultureInfo.CurrentCulture, ResourceStrings.ConnectingMessage, destination)));
-                        if (localLaunchOptions.RequireHardwareBreakpoints && localLaunchOptions.HardwareBreakpointLimit > 0) {
-                            commands.Add(new LaunchCommand(string.Format(CultureInfo.InvariantCulture, "-interpreter-exec console \"set remote hardware-breakpoint-limit {0}\"", localLaunchOptions.HardwareBreakpointLimit.ToString(CultureInfo.InvariantCulture))));
-                        }
-                    }
-
-                }
-
-                if (_launchOptions.PostRemoteConnectCommands != null) 
-                {
-                    commands.AddRange(_launchOptions.PostRemoteConnectCommands);
-                }
-
-                // Environment variables are set for the debuggee only with the modes that support that
-                foreach (EnvironmentEntry envEntry in _launchOptions.Environment)
-                {
-                    commands.Add(new LaunchCommand(MICommandFactory.GetSetEnvironmentVariableCommand(envEntry.Name, envEntry.Value)));
-                }
-            }
-        }
-
-        return commands;
+        /* ... */
     }
 }
 ```
-
 </spoiler>
 
 Как можете заметить, во-первых, оперируем простыми, иногда с интерполированными параметрами, строками (это ведь текстовый протокол), и, во-вторых, больше количество кода используется для кроссплатформенности: речь не только об ОС (Windows, Cygwin, Linux ...), но и отладчике (gdb, lldb ...).
@@ -12606,7 +12426,7 @@ macro exc_wo_code [num] {
 } exc_wo_code   0,1,2,3,4,5,6,15,16,19
 ```
 
-<spoiler>
+</spoiler>
 
 Можно заметить, что для создания этой таблицы используется шаблонный код - в каждом элементе IDT различаются только адреса функции обработчика. Но все остальное у них одинаково. Давайте рассмотрим эту одинаковую часть, а именно вот эту инструкцию - `mov eax, (10001110b shl 24) + os_code`.
 
