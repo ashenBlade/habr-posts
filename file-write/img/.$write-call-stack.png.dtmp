@@ -1,0 +1,70 @@
+<mxfile host="Electron" modified="2025-05-03T12:06:43.007Z" agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/21.2.1 Chrome/112.0.5615.87 Electron/24.1.2 Safari/537.36" etag="q69t_FWSPiiSFmwwnCul" scale="1" border="0" version="21.2.1" type="device">
+  <diagram name="Страница — 1" id="VhZ1kCICUJxNULX5YcOH">
+    <mxGraphModel dx="726" dy="433" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="3DgyRNjmVs_a8_jl_-d5-1" target="3DgyRNjmVs_a8_jl_-d5-19" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-1" value="Application" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="330" y="330" width="140" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="3DgyRNjmVs_a8_jl_-d5-2" target="3DgyRNjmVs_a8_jl_-d5-3" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-2" value="Operating system" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="330" y="570" width="140" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="3DgyRNjmVs_a8_jl_-d5-3" target="3DgyRNjmVs_a8_jl_-d5-4" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-3" value="File system" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="330" y="670" width="140" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-4" value="Storage device" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="330" y="790" width="140" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-9" value="" style="shape=curlyBracket;whiteSpace=wrap;html=1;rounded=1;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="480" y="320" width="20" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-10" value="IO buffering" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="505" y="330" width="90" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-11" value="" style="shape=curlyBracket;whiteSpace=wrap;html=1;rounded=1;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="480" y="560" width="20" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-12" value="Page cache" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="505" y="570" width="90" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-13" value="" style="shape=curlyBracket;whiteSpace=wrap;html=1;rounded=1;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="480" y="660" width="20" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-14" value="Operations reordering" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="508" y="654" width="140" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-15" value="Atomicity" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="510" y="684" width="70" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-17" value="" style="shape=curlyBracket;whiteSpace=wrap;html=1;rounded=1;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="480" y="780" width="20" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-18" value="Data corruption" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="505" y="790" width="110" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-21" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;" parent="1" source="3DgyRNjmVs_a8_jl_-d5-19" target="3DgyRNjmVs_a8_jl_-d5-2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-19" value="Runtime" style="rounded=0;whiteSpace=wrap;html=1;" parent="1" vertex="1">
+          <mxGeometry x="330" y="460" width="140" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-24" value="" style="shape=curlyBracket;whiteSpace=wrap;html=1;rounded=1;labelPosition=left;verticalLabelPosition=middle;align=right;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="480" y="450" width="20" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="3DgyRNjmVs_a8_jl_-d5-25" value="Abstractions and programming model" style="text;html=1;align=center;verticalAlign=middle;resizable=0;points=[];autosize=1;strokeColor=none;fillColor=none;" parent="1" vertex="1">
+          <mxGeometry x="510" y="460" width="220" height="30" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

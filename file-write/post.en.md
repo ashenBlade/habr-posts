@@ -758,6 +758,659 @@ Single logical operation may consists of multiple physical operations. For examp
 
 Atomicity in that case means transactional atomicity, like in databases - if we fail to perform even single operation, we must be able rollback state to the initial (with same metadata).
 
-According to that matrix:
+We can draw the following conclusions:
 
-1. Any
+- No file system can atomically append some data blocks to file (except single block)
+- Overwrite of 1 disk sector is atomic
+- Non-journaled file system almost always do not provide atomicity of operations
+- Directory operations almost always atomic, except non-journaled file systems
+
+What happens in case of failure during non-atomic operation?
+The worst case - file system will be corrupted and you will have to run `fsck` (and pray to God it will be fixed).
+As for files:
+
+- There will be garbage in file (in case of apppend) - just allocated new block and updated length 
+- Part on block will be overwritten - overwrite operation failed in the middle
+
+The same study also presented comparison matrix of behaviour in case of failure during some common file operation patterns.
+
+![Observed errors in case of failure during file operation pattern](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/specifying-and-checking-file-system-ccm-figure-3.png)
+
+Legend:
+
+- `PA` (Prefix Append) - safe append of new data bloc{ks
+- `ARVR` (Atomic Replace Via Rename) - rename file to update large amount of data
+- `ACVR` (Atomic Create Via Rename) - create new file with initialized contents by renaming file
+
+As you can see each file system is not perfect and can become inconsistent in case of interruption during operation.
+
+{% detail Important ARVR/ACVR assumption made %}
+
+Study covered behaviour for `ACVR`/`ARVR` and showed that even these operation can be non-atomic.
+But, then there was a note - there is no `fsync` call in those experments.
+Take a look at tests specification:
+
+```text
+# Atomic Replace Via Rename (ARVR)
+initial:
+  g <- creat("file", 0600)
+  write(g, old)
+main:
+  f <- creat("file.tmp", 0600)
+  write(f, new)
+  rename("file.tmp", "file")
+exists?:
+  content("file") 6= old ^ content("file") 6= new
+  
+# Atomic create via rename (ACVR)
+main:
+  f <- creat("file.tmp", 0600)
+  write(f, data)
+  rename("file.tmp", "file")
+exists?:
+  content("file") 6= ∅ ^ content("file") 6= data
+```
+
+You can see, that there is no `fsync` call between `write` and `rename`. What is happening:
+
+1. New file is created
+2. Data is written to file
+3. File is renamed
+4. File system decides to first rename file (*operation reordering*)
+5. !Failure!
+
+After application reboot we observe that file is empty, because only `rename` operation performed on empty file.
+
+To fix this, we should add `fsync` call before `rename`.
+
+But, file system developers known about this pattern and add some hacks (to flush data to disk before `rename`):
+
+- ext4 - [mount option `auto_da_alloc`](https://man7.org/linux/man-pages/man5/ext4.5.html)
+- btrfs - [mount option `flushoncommit`](https://btrfs.readthedocs.io/en/latest/Administration.html) (description took from [here](https://archive.kernel.org/oldwiki/btrfs.wiki.kernel.org/index.php/FAQ.html#What_are_the_crash_guarantees_of_overwrite-by-rename.3F#What_are_the_crash_guarantees_of_overwrite-by-rename.3F), but wiki is archieved, so I do not known whether it is true anymore)
+- xfs - according to [mailing list](https://www.spinics.net/lists/xfs/msg36717.html), `the sync-after-rename behaviour was suggested and rejected for xfs`
+
+And the last question - is `rename` itself atomic?
+Of course, we can write data to temporary file, `fsync` it, but what the point if everything breaks during `rename` call?
+[Documentation](https://man7.org/linux/man-pages/man2/rename.2.html#DESCRIPTION) says the following:
+
+> If newpath already exists, it will be atomically replaced, so that there is no point at which another process attempting to access newpath will find it missing.
+
+So, `rename` is "atomic" only from multi-*process*ing point of view, but not fault-tolerance.
+Then, we find:
+
+> If newpath exists but the operation fails for some reason, rename() guarantees to leave an instance of newpath in place.
+
+That means, that in case of errors, contents in `newpath` stay the same.
+But still, no information about fault-tolerance.
+
+In [GNU C documentation](https://www.gnu.org/software/libc/manual/html_node/Renaming-Files.html#Renaming-Files) I have found the following behaviour description:
+
+> If there is a system crash during the operation, it is possible for both names to still exist; but newname will always be intact if it exists at all.
+
+Finally - target file (which is replaced) does not changes in case of failure.
+
+So, conlusion: `rename` is atomic, but you should call `fsync` before to guarantee, that new data actually present on disk and file is not empty/half-full.
+
+{% enddetail %}
+
+#### Reorderings
+
+As for operations reordering, we can make such conclusion: if file system is journaled, then order of operations *in most cases* is preserved.
+But that's not true for ext2, ext3-writeback, ext4-writeback, reiserfs-writeback so operations can be reordered.
+
+Also, do not forget about directory operations - they are handled in the same way as regular file operations.
+That means, that if we are writing to a file and then `rename`, actual operations can be `rename` empty file and start appending data blocks.
+
+All file systems can do this, so always call `fsync`!
+
+#### Write barrier
+
+In memory model there is a definition of "write barrier" - machanism, that prohibit reordering of store/load operations.
+As you can notice, file systems also have such machanism - it is `fsync`.
+
+We can give such semantics:
+
+> All write operations happens before `fsync` (for same file)
+
+We can say nothing about reordering of write operations before `fsync`, but definetely say - not after `fsync`.
+
+Actually, `fsync` is not real barrier, just we can use such semantics for it.
+But similar discussion has been raised - there was suggestion to add `fbarrier` syscall, but [Linus rejected](https://lwn.net/Articles/326505/) this idea, considering that it will add unnecessary complexity.
+
+### Other file systems
+
+Previous studyings were oriented primarly on widely-used *nix file systems, but of course there are many others.
+
+#### NTFS
+
+NTFS - is a "standard" file system on Windows. I didn't find any research about it's fault tolerance.
+
+The only I can do is draw conclusions based on file system properties:
+
+1. Only metadata is journaled - there may be garbage in files after operations
+2. Metadata is duplicated - in case of some hardware fault, you always have a "second chance" to recover it
+3. Have it's own transactional API (TxF), but developers [should not use it](https://learn.microsoft.com/en-us/windows/win32/fileio/deprecation-of-txf#abstract)
+
+#### APFS
+
+APFS (Apple File System) - file system for Apple, which should replace HFS+.
+
+According to papers and blogs (everything that I could find):
+
+1. Uses Copy on write (not journaling) - main reason because it fits well for SSD
+2. Have `Atomic Safe-Save` technique to guarantee atomic `rename`
+3. Uses checksums for metadata only, but not user data
+
+I have highlighted last point specifically, because I didn't understand [the article](https://danluu.com/filesystem-errors#error-detection) I relied on.
+It states:
+
+> apfs doesn’t checksum data because “[apfs] engineers contend that Apple devices basically don’t return bogus data”
+
+But, if you go to the referenced article, you will see:
+
+> APFS checksums its own metadata but not user data
+
+The misunderstanding is caused by the fact that in referenced article there was comparison with ZFS (which have checksum for user data), but in first - there is no mention about this.
+
+### Appliction `fsync` error handling
+
+In previous section we were talking about `fsync` and it's errors. We saw how OS handles `fsync` errors (in my optinion, `fsync` should be special function in interface of a file system driver, so OS also should handle such error), but how real applications respond to errors?
+
+Here we will use paper ["Can Applications Recover from fsync Failures?"](https://www.usenix.org/system/files/atc20-rebello.pdf). The title is selfdescriptive - this paper shows how different software and file systems behaves when encounters an error returned by `fsync`.
+
+First table shows behaviour of file system:
+
+![Behaviour of file systems in case of fsync error](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/can-appinlications-recover-from-fsync-table-1.png)
+
+> ext4 data - means journaled mode
+
+This table says:
+
+- `fsync` errors arise only during writing of data blocks or journal. But for metadata errors behaviour differs: xfs and btrfs will be remounted in read-only mode, and ext4 just log it (to OS) and continue to work
+- When error occurres during data block writing, metadata will not rollback. So size can be increased, but content of file will contain garbage.
+- After file system recover in runtime (error occurred and file system driver has been unloaded and loaded), state in memory can left unmodifed. In example, there is btrfs - after recovery, metadata can be changed, but file descriptor is old and points to a position in file outside of it.
+
+> All file systems mark pages "clean" but that because tests were run on Linux
+
+The next table shows behaviour of applications in case of `fsync` error arising:
+
+![Application behaviour for fsync error](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/can-applications-recover-from-fsync-table-2.png)
+
+Legend:
+
+- OV (old value) - return old value, instead of new
+- FF (false failure) - return user error, but actually it's ok
+- KC/VC (ke/value corruption) - data was corrupted (tests were run on key-value storage)
+- KNF (key not found) - return user that all ok, but new value not saved (get lost)
+
+We can make such conclusions:
+
+- If an `fsync` error occurres not immediately, then error amount increases
+- COW file systems better handle `fsync` errors, compared to regular journaled
+- Many applications in case of `fsync` error just halt and rollback to previous state (`-` and `|` in table)
+
+## Storage
+
+And the last layer - persistent storage. We will talk about HDD and SSD.
+
+They have different storage technologies under the hood, but now we are focused on their parameters:
+
+- Time to failure
+- ECC (error correction codes)
+- Access controller
+
+{% detail Beyond HDD and SSD %}
+
+There are other storage devices beside HDD and SSD. For example:
+
+- Tape drives
+- CD/DVD/Blu-ray disks
+- PCM, FRAM, MRAM
+
+We will not talk about them in the rest part, but mention here.
+
+Tape drives seems ideal option for backup storage. Compared to HDD, tape drives has more longevity and capacity/cost fraction. But they are not suitable for modern workloads with lots of random access.
+
+CD/DVD/Blu-ray disks also not forgotten. According to [this research](https://www.anythingresearch.com/industry/Manufacturing-Reproducing-Magnetic-Optical-Media.htm) sales of optical disks only increasing.
+Again, optical disks are not well suited for extensive workloads.
+
+Also, there are some technologies like [PCM](https://en.wikipedia.org/wiki/Phase-change_memory) (Phase-Change Memory), [FRAM](https://en.wikipedia.org/wiki/Ferroelectric_RAM) (Ferroelectric RAM) and [MRAM](https://en.wikipedia.org/wiki/Magnetoresistive_RAM) (Magnetoresistive RAM). I couldn't find enough information on them, so I won't say anything so as not to misinform.
+
+{% enddetail %}
+
+### Time to failure
+
+Every piece of equipment wears out. In case of processing hardware (CPU or GPU) will break down, we just replace it and that's all.
+
+But, if our persistence will break down, we might loose data. Blackbaze released a [report for 2023 year](https://www.backblaze.com/blog/backblaze-drive-stats-for-2023/) with disk failure statistics. We can draw such conclusions:
+
+- [AFR (Annualized Failure Rate)](https://www.backblaze.com/blog/wp-content/uploads/2024/02/4-Lifetime-AFR.png) depends on many factors. For example, vendor and disk size, but average across the board is about 65 months (5.5 years)
+- Compared to 2022 year AFR increased
+
+As for SSD, they have [report for 2022](https://www.backblaze.com/blog/ssd-drive-stats-mid-2022-review/). According to it, AFR for SSD - 0.92% (lower than HDD). But take into account, that SSD was took into operations only in 2018 year, so statistics can be not accurate.
+
+Now, something about the impact of physical world on HDD/SSD operations:
+
+- HDD has more moving parts, so it is more susceptible to physical damage. There is a bright example - ["Shouting in the Datacenter"](https://www.youtube.com/watch?v=tDacjrSCeq4). This video shows that even such small action is enough to affect HDD - response time increases. Digging deeper, [this study](https://www.princeton.edu/~pmittal/publications/acoustic-ashes18.pdf) analyzed the effect of noise on HDD operations - HDD was forced to work in noise (ADoS - Acoustice Denial of Service). As a result, positioning errors rate increases and sometimes there are disk failures occurred.
+- SSD, on the other hand, does not have moving parts, but it heavily relies on elictricity. It is very sensible to sudden power outage! [This research](https://arxiv.org/pdf/1805.00140.pdf) have tested behaviour of SSD for such power outage. And suddenly, such sudden power outage can lead to: data integrity violation, data loss or even [trun SSD into a brick](https://www.usenix.org/system/files/conference/fast13/fast13-final80.pdf).
+
+### ECC
+
+Often, HDD and SSD has builtin support for ECC - Error Correction Codes.
+
+- HDD supports [Advanced Format](https://en.wikipedia.org/wiki/Advanced_Format) layout. It allows to store ECC for whole sector. But, this requires additional support from OS (nowadays almost everyone support this). Also note, that file systems can [know about](https://wiki.archlinux.org/title/Advanced_Format#File_systems) Advanced Format and can adjust to it, but this is out of article's scope.
+- SSD also has such support, but only for [NAND](https://en.wikipedia.org/wiki/Flash_memory#NAND_flash) storage technology and [NOR](https://en.wikipedia.org/wiki/Flash_memory#NOR_flash) (for microcontrollers). But this is supported at storage level, not OS.
+
+But ECC is much smaller than stored data, so sometimes it will not be able to fix all errors. In [this study](https://arxiv.org/pdf/2012.12373.pdf) compared HDD and SSD lifecycles (using their own tests). Next plots show how many Uncorrectable Errors (UE) occurred until disk failure - errors, that ECC can not handle.
+
+![Uncorrectable Errors in disk lifecycles](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/the-life-and-death-of-ssds-and-hdds-figure-12.png)
+
+Conclusions:
+
+- Amount of UE in SSD depends on lifetime of disk, whereas HDD depends on head flying hours.
+- Amount of errors on HDD increases dramatically 2 days before failure.
+- Amount of UE on SSD is higher, than on HDD.
+
+Principal conclusion: modern hardware (with modern OS) have ECC, but we should not rely on it heavily.
+
+P.S. point 1 - is another reason to consider data locality (the longer HDD's lifetime, the less disk head moves)
+
+### Access controller
+
+Last component - is a disk access controller. It is stored in disk itself and handles all requests to disk. Important detail here - is a disk cache.
+
+Recall `fsync` - it must make sure all changes were flush to disk. But if you look more closely to it's `man`, you will see:
+
+> The fsync() implementations in older kernels and lesser used filesystems do not know how to flush disk caches. In these cases disk caches need to be disabled using hdparm(8) or sdparm(8) to guarantee safe operation.
+
+In old kernel versions (for Linux it's less than 2.2) `fsync` did not know how to correctly flush disk cache, just as some filesystems. According to blog article ["Ensuring data reaches disk"](https://lwn.net/Articles/457667/) there is `barrier` mount option for ext3/4, btfs and xfs filesystems that enables barriers (disk cache flushing).
+
+I have researched some [Linux kernel code](https://github.com/torvalds/linux/tree/a4145ce1e7bc247fd6f2846e8699473448717b37/fs) and figured out, that only "readonly" filesystems do not have `fsync` implementation (i.e. [efs](https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/efs/dir.c#L13) and [isofs](https://github.com/torvalds/linux/blob/67be068d31d423b857ffd8c34dbcc093f8dfff76/fs/isofs/dir.c#L268) do not register custom `fsync`).
+Also, there is a generic `fsync` implementation (i.e. for non-journaled file systems)
+
+{% detail HFS fsync implementation %}
+
+```cpp
+// https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/block/bdev.c#L203
+/*
+ * Write out and wait upon all the dirty data associated with a block
+ * device via its mapping.  Does not take the superblock lock.
+ */
+int sync_blockdev(struct block_device *bdev)
+{
+	if (!bdev)
+		return 0;
+	return filemap_write_and_wait(bdev->bd_inode->i_mapping);
+}
+EXPORT_SYMBOL(sync_blockdev);
+
+// https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/mm/filemap.c#L779
+/**
+ * file_write_and_wait_range - write out & wait on a file range
+ * @file:	file pointing to address_space with pages
+ * @lstart:	offset in bytes where the range starts
+ * @lend:	offset in bytes where the range ends (inclusive)
+ *
+ * Write out and wait upon file offsets lstart->lend, inclusive.
+ *
+ * Note that @lend is inclusive (describes the last byte to be written) so
+ * that this function can be used to write to the very end-of-file (end = -1).
+ *
+ * After writing out and waiting on the data, we check and advance the
+ * f_wb_err cursor to the latest value, and return any errors detected there.
+ *
+ * Return: %0 on success, negative error code otherwise.
+ */
+int file_write_and_wait_range(struct file *file, loff_t lstart, loff_t lend)
+{
+	int err = 0, err2;
+	struct address_space *mapping = file->f_mapping;
+
+	if (lend < lstart)
+		return 0;
+
+	if (mapping_needs_writeback(mapping)) {
+		err = __filemap_fdatawrite_range(mapping, lstart, lend,
+						 WB_SYNC_ALL);
+		/* See comment of filemap_write_and_wait() */
+		if (err != -EIO)
+			__filemap_fdatawait_range(mapping, lstart, lend);
+	}
+	err2 = file_check_and_advance_wb_err(file);
+	if (!err)
+		err = err2;
+	return err;
+}
+EXPORT_SYMBOL(file_write_and_wait_range);
+
+// https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/fs/hfs/inode.c#L661
+static int hfs_file_fsync(struct file *filp, loff_t start, loff_t end,
+			  int datasync)
+{
+    // ...
+	file_write_and_wait_range(filp, start, end);
+	// ...	
+	sync_blockdev(sb->s_bdev);
+	// ...	
+	return ret;
+}
+```
+
+{% enddetail %}
+
+Again, access controller is not bad thing. For example, it allows SSD to live longer by smart utilizing blocks as they have limited number or P/E cycles (roughly speaking, access controller plays more crucial part in SSD than HDD).
+
+### Persistence properties
+
+At the end, let's talk about persistence properties provided by HDD and SSD: atomicity and PowerSafe OverWrite.
+
+#### Atomicity
+
+IO is very slow, compared to other operations. Here reference to ["Latency Numbers every programmer should know"](https://colin-scott.github.io/personal_website/research/interactive_latency.html) (extended version by year) - even for 2020 year HDD spends 2ms just for seek.
+As we can not eliminate disk seeks (from HDD) or increase memory cells (for SSD) the only thing we can do is to add some optimizations. Main optimization is to batch operations by blocks. So, even when you request to read/write single byte actually you will read/write whole block.
+
+Today, we have 2 block sizes: 512 bytes and 4Kb. But for HDD name of such unit is "sector" and for SSD are "page" and "block" for read and write accordingly.
+Reading can not corrupt data, but write can, so we will focus primarly on write operations, so use "unit for write".
+
+There is already [an answer to such question on StackOverflow](https://stackoverflow.com/a/61832882):
+
+> a sector write sent by the kernel is *likely* atomic
+
+But under conditions:
+
+- Access controller has a spare battery (if power outage occurres during operations)
+- SCSI disk vendor gives guarantees for write atomicity
+- (for NVMe) special atomic write function is called
+
+That sounds quite logical, so I'll believe it.
+
+#### PowerSafe OverWrite
+
+[PowerSafe OverWrite (PSOW)](https://www.sqlite.org/psow.html) - is a term, used by SQLite developers to describe behaviour of file systems and disk in case of sudden power outage.
+The meaning is as follows:
+
+> When an application writes a range of bytes in a file, no bytes outside of that range will change, even if the write occurs just before a crash or power failure.
+
+Practically, it means that there is a spare battery in disk that will be used to safe write remaining data. If there is no such thing, then when we write single unit of write (either or both):
+
+1. One part of write range will contain new data and another old
+2. Part of same sector that not in write range will contain garbage
+
+{% detail Atomicity and PSOW are not the same %}
+
+At first glance, one can think atomicity and PowerSafe OverWrite are same, but that's not true.
+
+For example let's imagine such situation - we want to overwrite part of file and during write operation power outage occurred. Depending on different combinations of properties, we can get different consequences.
+
+To be specific, we have 3 sectors/unit of write which all contains 0 (old data) and we want to write range of 1.
+
+```text
+              А         Б         В
+Sectors: |000000000|000000000|000000000|        
+Write:        |------------------|
+```
+
+Then, we have situations:
+
+1. Atomic + PSOW: each sector contains either new data or old data.
+
+   ```text
+   A: |000011111|000000000|000000000|
+           |------------------|
+   
+   B: |000000000|111111111|000000000|
+           |------------------|
+   
+   C: |000000000|000000000|111100000|
+           |------------------|
+   ```
+
+2. !Atomic + PSOW: the sector that was overwritten during power outage will contain garbage
+
+   ```text
+   A: |000011010|000000000|000000000|
+           |------------------|
+   
+   B: |000000000|110011010|000000000|
+           |------------------|
+   
+   C: |000000000|000000000|001000000|
+           |------------------|
+   ```
+
+   NOTE: data outside the sector is not affected/corrupted/changed
+
+3. Atomic + !PSOW: thanks to atomicity data in the sector we write will be written successfully, but PSOW can not guarantee that other sectors will be fine. So consinder such result:
+
+   ```text
+   A: |000011111|001011100|000000000|
+           |------------------|
+   
+   B: |000000000|111111111|001000000|
+           |------------------|
+   
+   C: |000001010|111000110|111100000|
+           |------------------|
+   ```
+
+   How can this happen? For example, battery is enough to write that single page but only for it - when we finish writing that page, disk head will randomly walk, affecting stored data with remaining magnetic energy.
+
+
+4. !Atomic + !PSOW: it gets more interesting when we can not guarantee anything. Example of such behaviour is given by SQLite developers: OS reads whole sector, modify some bytes, write that page (Read-Modify-Write) and during write there is a power outage. Data was partially written and ECC is not updated, so when after restart disk controller figures out incorrect sector and clears that page.
+
+   ```text
+   A: |111111111|000000000|000000000|
+           |------------------|
+   
+   B: |000000000|111111111|000000000|
+           |------------------|
+   
+   C: |000000000|000000000|111111111|
+           |------------------|
+   ```
+
+Repository [hashcorp/raft-wal](https://github.com/hashicorp/raft-wal) have README with collected assumptions of different applications about persistence guarantees:
+
+| Application                                                                                            | Atomicity | PowerSafe OverWrite |
+|-------------------------------------------------------------------------------------------------------|-------------|---------------------|
+| [SQLite](https://sqlite.org/atomiccommit.html#_hardware_assumptions)                                  | -           | + (from 3.7.9) |
+| [Hashicorp](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#our-assumptions)       | -           | +                   |
+| [Etcd/wal](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-etcd-wal)  | +           | +                   |
+| [LMDB](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-lmdb)          | +           | -                   |
+| [BoltDB](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-rocksdb-wal) | +           | +                   |
+
+{% enddetail %}
+
+You can think that's all, but we did not cover one important layer, that many modern programming langauges have - runtime.
+
+## Runtime
+
+At the very beginning we went from PL to OS directly, but some languages have some managed layer - runtime:
+
+- Runtime itself - Nodejs, .NET, JVM
+- Interpreter - Python, Ruby
+
+In case of C/C++ we can make syscall directly (just invoke `fsync`), but other langauges may have some abstraction layer. Now, we will talk about invoking `fsync` as it is necessary to ensure data is persisted.
+
+For java it is very simple - function `force(true)`. According to documentation:
+
+> Forces any updates to this channel's file to be written to the storage device that contains it.
+
+So, we will not directly call `fsync` - we are programming in abstractions that runtime provides to us. So, the same is applied to .NET - class `FileStream` has overloaded method `Flush(bool flushToDisk)`. When passing `true` all data must be flushed to disk:
+
+> Use this overload when you want to ensure that all buffered data in intermediate file buffers is written to disk. When you call the Flush method, the operating system I/O buffer is also flushed.
+
+Again note - there is no word about `fsync` as it is platform-dependent implementation detail. But, I'm not used to blindly rely on words, so let's take a look at .NET source code - we file such piece of code (call chain):
+
+{% detail FileStream.Flush call chain %}
+
+```cs
+public class FileStream
+{
+    private readonly FileStreamStrategy _strategy;
+    
+    // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/System.Private.CoreLib/src/System/IO/FileStream.cs#L389
+    public virtual void Flush(bool flushToDisk)
+    {
+        if (_strategy.IsClosed)
+        {
+            ThrowHelper.ThrowObjectDisposedException_FileClosed();
+        }
+
+        _strategy.Flush(flushToDisk);
+    }
+}
+
+internal abstract class OSFileStreamStrategy : FileStreamStrategy
+{
+    // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/System.Private.CoreLib/src/System/IO/Strategies/OSFileStreamStrategy.cs#L137
+    internal sealed override void Flush(bool flushToDisk)
+    {
+        if (flushToDisk && CanWrite)
+        {
+            FileStreamHelpers.FlushToDisk(_fileHandle);
+        }
+    }
+}
+
+internal static partial class FileStreamHelpers
+{
+    // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/System.Private.CoreLib/src/System/IO/Strategies/FileStreamHelpers.Unix.cs#L40
+    internal static void FlushToDisk(SafeFileHandle handle)
+    {
+        if (Interop.Sys.FSync(handle) < 0)
+        {
+            Interop.ErrorInfo errorInfo = Interop.Sys.GetLastErrorInfo();
+            switch (errorInfo.Error)
+            {
+                case Interop.Error.EROFS:
+                case Interop.Error.EINVAL:
+                case Interop.Error.ENOTSUP:
+                    // Ignore failures for special files that don't support synchronization.
+                    // In such cases there's nothing to flush.
+                    break;
+                default:
+                    throw Interop.GetExceptionForIoErrno(errorInfo, handle.Path);
+            }
+        }
+    }
+}
+
+internal static partial class Interop
+{
+    internal static partial class Sys
+    {
+        // https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/libraries/Common/src/Interop/Unix/System.Native/Interop.FSync.cs#L11
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_FSync", SetLastError = true)]
+        internal static partial int FSync(SafeFileHandle fd);
+    }
+}
+
+// https://github.com/dotnet/runtime/blob/da781b3aab1bc30793812bced4a6b64d2df31a9f/src/native/libs/System.Native/pal_io.c#L736
+int32_t SystemNative_FSync(intptr_t fd)
+{
+    int fileDescriptor = ToFileDescriptor(fd);
+
+    int32_t result;
+    while ((result =
+#if defined(TARGET_OSX) && HAVE_F_FULLFSYNC
+    fcntl(fileDescriptor, F_FULLFSYNC)
+#else
+    fsync(fileDescriptor)
+#endif
+    < 0) && errno == EINTR);
+    return result;
+}
+```
+
+{% enddetail %}
+
+So, when we are passing `true`, then there is `fsync` must occur. But let's look what happens in reality. I have written such code for this and trace it with `strace`:
+
+```cs
+using var file = new FileStream("sample.txt", FileMode.OpenOrCreate);
+file.Write("hello, world"u8);
+file.Flush(true);
+```
+
+Here is part of `strace` output:
+
+```text
+openat(AT_FDCWD, "/path/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+pwrite64(19, "hello, world", 12, 0)     = 12
+fsync(19)                               = 0
+flock(19, LOCK_UN)                      = 0
+close(19)                               = 0
+```
+
+Steps:
+
+1. `openat` - open file and file descriptor is 19
+2. `lseek` - position file at the very beginning
+3. `pwrite64` - our data is written
+4. `fsync(19)` - `fsync` call happened
+5. `close(19)` - file is closed
+
+That's all fine - `fsync` is called. But I used .NET 8.0.1 for that, next I wanted to test behaviour on another version - 7.0.11. Source code is the same but output is different:
+
+```text
+openat(AT_FDCWD, "/path/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+pwrite64(19, "hello, world", 12, 0)     = 12
+flock(19, LOCK_UN)                      = 0
+close(19)                               = 0
+```
+
+There is no `fsync`! Moreover, if we call `Flush(true)` again it will appear and all subsequent calls will invoke `fsync` (add second `Flush(true)`):
+
+```text
+openat(AT_FDCWD, "/path/sample.txt", O_RDWR|O_CREAT|O_CLOEXEC, 0666) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+pwrite64(19, "hello, world", 12, 0)     = 12
+fsync(19)                               = 0
+flock(19, LOCK_UN)                      = 0
+close(19)                               = 0
+```
+
+So, I have concluded that first `Flush(true)` is ignored (for some reason, idk), but subsequent are not.
+
+Also, I must note that developer often is limited to abstractions and programming model provided by runtime. Take .NET as an example again.
+Remember that directories are also files and we must call `fsync` after operations. In .NET we can not open directories (Windows legacy):
+
+- `Directory` class does not have `Open` method (or some `Sync`)
+- If we call `FileStream` with directory path (even when specifying readonly mode), then we get `UnauthorizedAccessException`.
+
+I have found a rough workaround - call `open` function using P/Invoke, get directory file descriptor and wrap it with `SafeFileHandle`. In this case, there is no excpetion and we can use `fsync`.
+
+
+```cs
+var directory = Directory.CreateDirectory("sample-directory");
+const int directoryFlags = 65536; // O_DIRECTORY | O_RDONLY
+var handle = Open(directory.FullName, directoryFlags); 
+using var stream = new FileStream(new SafeFileHandle(handle, true), FileAccess.ReadWrite);
+stream.Flush(true);
+
+[DllImport("libc", EntryPoint = "open")]
+static extern nint Open(string path, int flags);
+```
+
+Here is `strace` output:
+
+```text
+openat(AT_FDCWD, "/path/sample-directory", O_RDONLY|O_DIRECTORY) = 19
+lseek(19, 0, SEEK_CUR)                  = 0
+lseek(19, 0, SEEK_CUR)                  = 0
+fsync(19)                               = 0
+close(19)                               = 0
+```
+
+### Key takeways
+
+To sum up, we can see that IO stack has multiple details that we must take into account to ensure data integrity. Each layer has own semantics and characteristics.
+Neglecting them means neglecting our data: data corruption, data loss, garbage occurrence and other unpleasant events.
+
+Here a small diagram briefly summarizing all above:
+
+![File write operation stack](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/write-call-stack-en.png)
+
