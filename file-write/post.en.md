@@ -152,14 +152,14 @@ etcd [comments this out](https://github.com/etcd-io/etcd/blob/6f55dfa26e1a359e47
 ```go
 // Fsync is a wrapper around file.Sync(). Special handling is needed on darwin platform.
 func Fsync(f *os.File) error {
-	return f.Sync()
+ return f.Sync()
 }
 
 // Fdatasync is similar to fsync(), but does not flush modified metadata
 // unless that metadata is needed in order to allow a subsequent data retrieval
 // to be correctly handled.
 func Fdatasync(f *os.File) error {
-	return syscall.Fdatasync(int(f.Fd()))
+ return syscall.Fdatasync(int(f.Fd()))
 }
 ```
 
@@ -183,11 +183,11 @@ int
 fdatasync(int fd)
 {
     // ...
-	status = pg_NtFlushBuffersFileEx(handle,
-									 FLUSH_FLAGS_FILE_DATA_SYNC_ONLY,
-									 NULL,
-									 0,
-									 &iosb);
+ status = pg_NtFlushBuffersFileEx(handle,
+          FLUSH_FLAGS_FILE_DATA_SYNC_ONLY,
+          NULL,
+          0,
+          &iosb);
     // ...
 }
 ```
@@ -207,14 +207,14 @@ Again, this is [handled in etcd](https://github.com/etcd-io/etcd/blob/6f55dfa26e
 // written in out-of-order sequence. Using F_FULLFSYNC ensures that the
 // physical drive's buffer will also get flushed to the media.
 func Fsync(f *os.File) error {
-	_, err := unix.FcntlInt(f.Fd(), unix.F_FULLFSYNC, 0)
-	return err
+ _, err := unix.FcntlInt(f.Fd(), unix.F_FULLFSYNC, 0)
+ return err
 }
 
 // Fdatasync on darwin platform invokes fcntl(F_FULLFSYNC) for actual persistence
 // on physical drive media.
 func Fdatasync(f *os.File) error {
-	return Fsync(f)
+ return Fsync(f)
 }
 ```
 
@@ -294,11 +294,11 @@ HANDLE
 pgwin32_open_handle(const char *fileName, int fileFlags, bool backup_semantics)
 {
     // ...
-	while ((h = CreateFile(fileName,
+ while ((h = CreateFile(fileName,
                            // ...
-						   ((fileFlags & O_DIRECT) ? FILE_FLAG_NO_BUFFERING : 0) |
-						   ((fileFlags & O_DSYNC) ? FILE_FLAG_WRITE_THROUGH : 0),
-						   NULL)) == INVALID_HANDLE_VALUE)
+         ((fileFlags & O_DIRECT) ? FILE_FLAG_NO_BUFFERING : 0) |
+         ((fileFlags & O_DSYNC) ? FILE_FLAG_WRITE_THROUGH : 0),
+         NULL)) == INVALID_HANDLE_VALUE)
     // ...
 }
 ```
@@ -339,19 +339,19 @@ Again, Postgres use *nix style - it call `fsync` for directories, but for Window
 int
 fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel)
 {
-	returncode = pg_fsync(fd);
+ returncode = pg_fsync(fd);
 
-	/*
-	 * Some OSes don't allow us to fsync directories at all, so we can ignore
-	 * those errors. Anything else needs to be logged.
-	 */
-	if (returncode != 0 && !(isdir && (errno == EBADF || errno == EINVAL)))
-	{
-		// ...
-		return -1;
-	}
+ /*
+  * Some OSes don't allow us to fsync directories at all, so we can ignore
+  * those errors. Anything else needs to be logged.
+  */
+ if (returncode != 0 && !(isdir && (errno == EBADF || errno == EINVAL)))
+ {
+  // ...
+  return -1;
+ }
 
-	return 0;
+ return 0;
 }
 ```
 
@@ -524,11 +524,11 @@ This approach is used by:
 /*
 * Each page of XLOG file has a header like this:
 */
-#define XLOG_PAGE_MAGIC 0xD114	/* can be used as WAL version indicator */
+#define XLOG_PAGE_MAGIC 0xD114 /* can be used as WAL version indicator */
 
 typedef struct XLogPageHeaderData
 {
-    uint16		xlp_magic;		/* magic value for correctness checks */
+    uint16  xlp_magic;  /* magic value for correctness checks */
     // ...
 } XLogPageHeaderData;
 ```
@@ -662,7 +662,7 @@ Checksum is widely used:
 typedef struct XLogRecord
 {
     // ...
-    pg_crc32c	xl_crc;			/* CRC for this record */
+    pg_crc32c xl_crc;   /* CRC for this record */
 } XLogRecord;
 ```
 
@@ -769,7 +769,7 @@ What happens in case of failure during non-atomic operation?
 The worst case - file system will be corrupted and you will have to run `fsck` (and pray to God it will be fixed).
 As for files:
 
-- There will be garbage in file (in case of apppend) - just allocated new block and updated length 
+- There will be garbage in file (in case of apppend) - just allocated new block and updated length
 - Part on block will be overwritten - overwrite operation failed in the middle
 
 The same study also presented comparison matrix of behaviour in case of failure during some common file operation patterns.
@@ -1038,18 +1038,18 @@ Also, there is a generic `fsync` implementation (i.e. for non-journaled file sys
  */
 int sync_blockdev(struct block_device *bdev)
 {
-	if (!bdev)
-		return 0;
-	return filemap_write_and_wait(bdev->bd_inode->i_mapping);
+ if (!bdev)
+  return 0;
+ return filemap_write_and_wait(bdev->bd_inode->i_mapping);
 }
 EXPORT_SYMBOL(sync_blockdev);
 
 // https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/mm/filemap.c#L779
 /**
  * file_write_and_wait_range - write out & wait on a file range
- * @file:	file pointing to address_space with pages
- * @lstart:	offset in bytes where the range starts
- * @lend:	offset in bytes where the range ends (inclusive)
+ * @file: file pointing to address_space with pages
+ * @lstart: offset in bytes where the range starts
+ * @lend: offset in bytes where the range ends (inclusive)
  *
  * Write out and wait upon file offsets lstart->lend, inclusive.
  *
@@ -1063,36 +1063,36 @@ EXPORT_SYMBOL(sync_blockdev);
  */
 int file_write_and_wait_range(struct file *file, loff_t lstart, loff_t lend)
 {
-	int err = 0, err2;
-	struct address_space *mapping = file->f_mapping;
+ int err = 0, err2;
+ struct address_space *mapping = file->f_mapping;
 
-	if (lend < lstart)
-		return 0;
+ if (lend < lstart)
+  return 0;
 
-	if (mapping_needs_writeback(mapping)) {
-		err = __filemap_fdatawrite_range(mapping, lstart, lend,
-						 WB_SYNC_ALL);
-		/* See comment of filemap_write_and_wait() */
-		if (err != -EIO)
-			__filemap_fdatawait_range(mapping, lstart, lend);
-	}
-	err2 = file_check_and_advance_wb_err(file);
-	if (!err)
-		err = err2;
-	return err;
+ if (mapping_needs_writeback(mapping)) {
+  err = __filemap_fdatawrite_range(mapping, lstart, lend,
+       WB_SYNC_ALL);
+  /* See comment of filemap_write_and_wait() */
+  if (err != -EIO)
+   __filemap_fdatawait_range(mapping, lstart, lend);
+ }
+ err2 = file_check_and_advance_wb_err(file);
+ if (!err)
+  err = err2;
+ return err;
 }
 EXPORT_SYMBOL(file_write_and_wait_range);
 
 // https://github.com/torvalds/linux/blob/a4145ce1e7bc247fd6f2846e8699473448717b37/fs/hfs/inode.c#L661
 static int hfs_file_fsync(struct file *filp, loff_t start, loff_t end,
-			  int datasync)
+     int datasync)
 {
     // ...
-	file_write_and_wait_range(filp, start, end);
-	// ...	
-	sync_blockdev(sb->s_bdev);
-	// ...	
-	return ret;
+ file_write_and_wait_range(filp, start, end);
+ // ... 
+ sync_blockdev(sb->s_bdev);
+ // ... 
+ return ret;
 }
 ```
 
@@ -1451,64 +1451,64 @@ Pratical example: creation of new log segment (file with operations being perfor
 // cut first creates a temp wal file and writes necessary headers into it.
 // Then cut atomically rename temp wal file to a wal file.
 func (w *WAL) cut() error {
-	// Название для нового файла сегмента
-	fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
+ // Название для нового файла сегмента
+ fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
 
     // 1. Create temporary file
-	newTail, err := w.fp.Open()
-	if err != nil {
-		return err
-	}
+ newTail, err := w.fp.Open()
+ if err != nil {
+  return err
+ }
 
     // 2. Write data to temporary file
-	// update writer and save the previous crc
-	w.locks = append(w.locks, newTail)
-	prevCrc := w.encoder.crc.Sum32()
-	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
-	if err != nil {
-		return err
-	}
-	if err = w.saveCrc(prevCrc); err != nil {
-		return err
-	}
-	if err = w.encoder.encode(&walpb.Record{Type: MetadataType, Data: w.metadata}); err != nil {
-		return err
-	}
-	if err = w.saveState(&w.state); err != nil {
-		return err
-	}
+ // update writer and save the previous crc
+ w.locks = append(w.locks, newTail)
+ prevCrc := w.encoder.crc.Sum32()
+ w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+ if err != nil {
+  return err
+ }
+ if err = w.saveCrc(prevCrc); err != nil {
+  return err
+ }
+ if err = w.encoder.encode(&walpb.Record{Type: MetadataType, Data: w.metadata}); err != nil {
+  return err
+ }
+ if err = w.saveState(&w.state); err != nil {
+  return err
+ }
 
-	// atomically move temp wal file to wal file
+ // atomically move temp wal file to wal file
     
     // 3-4. Flush file data to disk
-	if err = w.sync(); err != nil {
-		return err
-	}
+ if err = w.sync(); err != nil {
+  return err
+ }
 
     // 5. Rename temporary file to target
-	if err = os.Rename(newTail.Name(), fpath); err != nil {
-		return err
-	}
-	
-	// 6. Flush "rename" of parent directory to disk
-	if err = fileutil.Fsync(w.dirFile); err != nil {
-		return err
-	}
+ if err = os.Rename(newTail.Name(), fpath); err != nil {
+  return err
+ }
+ 
+ // 6. Flush "rename" of parent directory to disk
+ if err = fileutil.Fsync(w.dirFile); err != nil {
+  return err
+ }
 
-	// reopen newTail with its new path so calls to Name() match the wal filename format
-	newTail.Close()
-	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
-		return err
-	}
+ // reopen newTail with its new path so calls to Name() match the wal filename format
+ newTail.Close()
+ if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
+  return err
+ }
 
-	w.locks[len(w.locks)-1] = newTail
-	prevCrc = w.encoder.crc.Sum32()
-	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
-	if err != nil {
-		return err
-	}
+ w.locks[len(w.locks)-1] = newTail
+ prevCrc = w.encoder.crc.Sum32()
+ w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+ if err != nil {
+  return err
+ }
 
-	return nil
+ return nil
 }
 ```
 
@@ -2012,7 +2012,7 @@ static void
 CommitTransaction(void)
 {   
     // ...
-	RecordTransactionCommit();
+ RecordTransactionCommit();
     // ...
 }
 
@@ -2034,24 +2034,24 @@ RecordTransactionCommit(void)
 // https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/access/transam/xact.c#L5736
 XLogRecPtr
 XactLogCommitRecord(TimestampTz commit_time,
-					int nsubxacts, TransactionId *subxacts,
-					int nrels, RelFileLocator *rels,
-					int ndroppedstats, xl_xact_stats_item *droppedstats,
-					int nmsgs, SharedInvalidationMessage *msgs,
-					bool relcacheInval,
-					int xactflags, TransactionId twophase_xid,
-					const char *twophase_gid)
+     int nsubxacts, TransactionId *subxacts,
+     int nrels, RelFileLocator *rels,
+     int ndroppedstats, xl_xact_stats_item *droppedstats,
+     int nmsgs, SharedInvalidationMessage *msgs,
+     bool relcacheInval,
+     int xactflags, TransactionId twophase_xid,
+     const char *twophase_gid)
 {
     // ...
-	return XLogInsert(RM_XACT_ID, info);
+ return XLogInsert(RM_XACT_ID, info);
 }
 
 XLogRecPtr
 XLogInsertRecord(XLogRecData *rdata,
-				 XLogRecPtr fpw_lsn,
-				 uint8 flags,
-				 int num_fpi,
-				 bool topxid_included)
+     XLogRecPtr fpw_lsn,
+     uint8 flags,
+     int num_fpi,
+     bool topxid_included)
 {
     // ...
     XLogFlush(EndPos);
@@ -2062,8 +2062,8 @@ XLogInsertRecord(XLogRecData *rdata,
 void
 XLogFlush(XLogRecPtr record)
 {
-	// ...
-	XLogWrite(WriteRqst, insertTLI, false);
+ // ...
+ XLogWrite(WriteRqst, insertTLI, false);
     // ...
 }
 
@@ -2071,17 +2071,17 @@ XLogFlush(XLogRecPtr record)
 static void
 XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 {
-	while (/* Have data to write */)
-	{
+ while (/* Have data to write */)
+ {
         // 1. Create new WAL segment file or open existing
-	    if (/* Размер сегмента превышен */)
-		{
-			openLogFile = XLogFileInit(openLogSegNo, tli);
-		}
-		if (openLogFile < 0)
-		{
-			openLogFile = XLogFileOpen(openLogSegNo, tli);
-		}
+     if (/* Размер сегмента превышен */)
+  {
+   openLogFile = XLogFileInit(openLogSegNo, tli);
+  }
+  if (openLogFile < 0)
+  {
+   openLogFile = XLogFileOpen(openLogSegNo, tli);
+  }
 
         // 2. Write data to WAL
         do
@@ -2102,19 +2102,19 @@ void
 issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
 {
     // fsync behaviour can be adjusted by GUC (configuration)
-	switch (wal_sync_method)
-	{
-		case WAL_SYNC_METHOD_FSYNC:
-		    pg_fsync_no_writethrough(fd);
-			break;
-		case WAL_SYNC_METHOD_FSYNC_WRITETHROUGH:
-		    pg_fsync_writethrough(fd);
-			break;
-		case WAL_SYNC_METHOD_FDATASYNC:
-		    pg_fdatasync(fd);    
-			break;
-		// ...
-	}
+ switch (wal_sync_method)
+ {
+  case WAL_SYNC_METHOD_FSYNC:
+      pg_fsync_no_writethrough(fd);
+   break;
+  case WAL_SYNC_METHOD_FSYNC_WRITETHROUGH:
+      pg_fsync_writethrough(fd);
+   break;
+  case WAL_SYNC_METHOD_FDATASYNC:
+      pg_fdatasync(fd);    
+   break;
+  // ...
+ }
 }
 
 // 2. Flush "dirty" pages to disk, table file itself
@@ -2122,49 +2122,49 @@ issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
 // https://github.com/postgres/postgres/blob/97d85be365443eb4bf84373a7468624762382059/src/backend/storage/buffer/bufmgr.c#L3437
 static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
-			IOContext io_context)
+   IOContext io_context)
 {
     // 3. Flush change to WAL
-	if (buf_state & BM_PERMANENT)
-		XLogFlush(recptr);
+ if (buf_state & BM_PERMANENT)
+  XLogFlush(recptr);
     
     // Flush changes to table file
     smgrwrite(reln,
-			  BufTagGetForkNum(&buf->tag),
-			  buf->tag.blockNum,
-			  bufToWrite,
-			  false);
+     BufTagGetForkNum(&buf->tag),
+     buf->tag.blockNum,
+     bufToWrite,
+     false);
 }
 
 // https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/include/storage/smgr.h#L121
 static inline void
 smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-		  const void *buffer, bool skipFsync)
+    const void *buffer, bool skipFsync)
 {
-	smgrwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
+ smgrwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
 }
 
 // https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/smgr.c#L631
 void
 smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-		   const void **buffers, BlockNumber nblocks, bool skipFsync)
+     const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
-	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
-										 buffers, nblocks, skipFsync);
+ smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
+           buffers, nblocks, skipFsync);
 }
 
 // https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/md.c#L928
 void
 mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-		 const void **buffers, BlockNumber nblocks, bool skipFsync)
+   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
     // 5. Write data to table file
-	while (/* Have more data blocks */)
-	{
+ while (/* Have more data blocks */)
+ {
         FileWriteV(v->mdfd_vfd, iov, iovcnt, seekpos,
                    WAIT_EVENT_DATA_FILE_WRITE);
-	}
-	
+ }
+ 
     // 6. Flush data to disk
     register_dirty_segment(reln, forknum, v);
 }
@@ -2173,28 +2173,28 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 // https://github.com/postgres/postgres/blob/6b41ef03306f50602f68593d562cd73d5e39a9b9/src/backend/storage/file/fd.c#L2192
 ssize_t
 FileWriteV(File file, const struct iovec *iov, int iovcnt, off_t offset,
-		   uint32 wait_event_info)
+     uint32 wait_event_info)
 {
     // Perform write directly
-	returnCode = pg_pwritev(vfdP->fd, iov, iovcnt, offset);	
+ returnCode = pg_pwritev(vfdP->fd, iov, iovcnt, offset); 
 }
 
 // https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/md.c#L1353
 static void
 register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 {
-	if (/* Failed to ask checkpointer to perform fsync */)
-	{
+ if (/* Failed to ask checkpointer to perform fsync */)
+ {
         // Perform fsync directly
-		FileSync(seg->mdfd_vfd, WAIT_EVENT_DATA_FILE_SYNC);
-	}
+  FileSync(seg->mdfd_vfd, WAIT_EVENT_DATA_FILE_SYNC);
+ }
 }
 
 // https://github.com/postgres/postgres/blob/c20d90a41ca869f9c6dd4058ad1c7f5c9ee9d912/src/backend/storage/file/fd.c#L2297
 int
 FileSync(File file, uint32 wait_event_info)
 {
-	pg_fsync(VfdCache[file].fd);
+ pg_fsync(VfdCache[file].fd);
 }
 ```
 
