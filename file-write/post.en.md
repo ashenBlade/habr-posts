@@ -1155,27 +1155,27 @@ Then, we have situations:
 1. Atomic + PSOW: each sector contains either new data or old data.
 
    ```text
-   A: |000011111|000000000|000000000|
-           |------------------|
+   | A:  | 000011111 | 000000000 | 000000000 |
+   | --- |
    
-   B: |000000000|111111111|000000000|
-           |------------------|
+   | B:  | 000000000 | 111111111 | 000000000 |
+   | --- |
    
-   C: |000000000|000000000|111100000|
-           |------------------|
+   | C:  | 000000000 | 000000000 | 111100000 |
+   | --- |
    ```
 
 2. !Atomic + PSOW: the sector that was overwritten during power outage will contain garbage
 
    ```text
-   A: |000011010|000000000|000000000|
-           |------------------|
+   | A:  | 000011010 | 000000000 | 000000000 |
+   | --- |
    
-   B: |000000000|110011010|000000000|
-           |------------------|
+   | B:  | 000000000 | 110011010 | 000000000 |
+   | --- |
    
-   C: |000000000|000000000|001000000|
-           |------------------|
+   | C:  | 000000000 | 000000000 | 001000000 |
+   | --- |
    ```
 
    NOTE: data outside the sector is not affected/corrupted/changed
@@ -1183,14 +1183,14 @@ Then, we have situations:
 3. Atomic + !PSOW: thanks to atomicity data in the sector we write will be written successfully, but PSOW can not guarantee that other sectors will be fine. So consinder such result:
 
    ```text
-   A: |000011111|001011100|000000000|
-           |------------------|
+   | A:  | 000011111 | 001011100 | 000000000 |
+   | --- |
    
-   B: |000000000|111111111|001000000|
-           |------------------|
+   | B:  | 000000000 | 111111111 | 001000000 |
+   | --- |
    
-   C: |000001010|111000110|111100000|
-           |------------------|
+   | C:  | 000001010 | 111000110 | 111100000 |
+   | --- |
    ```
 
    How can this happen? For example, battery is enough to write that single page but only for it - when we finish writing that page, disk head will randomly walk, affecting stored data with remaining magnetic energy.
@@ -1199,25 +1199,25 @@ Then, we have situations:
 4. !Atomic + !PSOW: it gets more interesting when we can not guarantee anything. Example of such behaviour is given by SQLite developers: OS reads whole sector, modify some bytes, write that page (Read-Modify-Write) and during write there is a power outage. Data was partially written and ECC is not updated, so when after restart disk controller figures out incorrect sector and clears that page.
 
    ```text
-   A: |111111111|000000000|000000000|
-           |------------------|
+   | A:  | 111111111 | 000000000 | 000000000 |
+   | --- |
    
-   B: |000000000|111111111|000000000|
-           |------------------|
+   | B:  | 000000000 | 111111111 | 000000000 |
+   | --- |
    
-   C: |000000000|000000000|111111111|
-           |------------------|
+   | C:  | 000000000 | 000000000 | 111111111 |
+   | --- |
    ```
 
 Repository [hashcorp/raft-wal](https://github.com/hashicorp/raft-wal) have README with collected assumptions of different applications about persistence guarantees:
 
-| Application                                                                                            | Atomicity | PowerSafe OverWrite |
-|-------------------------------------------------------------------------------------------------------|-------------|---------------------|
-| [SQLite](https://sqlite.org/atomiccommit.html#_hardware_assumptions)                                  | -           | + (from 3.7.9) |
-| [Hashicorp](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#our-assumptions)       | -           | +                   |
-| [Etcd/wal](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-etcd-wal)  | +           | +                   |
-| [LMDB](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-lmdb)          | +           | -                   |
-| [BoltDB](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-rocksdb-wal) | +           | +                   |
+| Application                                                                                           | Atomicity | PowerSafe OverWrite |
+| ----------------------------------------------------------------------------------------------------- | --------- | ------------------- |
+| [SQLite](https://sqlite.org/atomiccommit.html#_hardware_assumptions)                                  | -         | + (from 3.7.9)      |
+| [Hashicorp](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#our-assumptions)       | -         | +                   |
+| [Etcd/wal](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-etcd-wal)  | +         | +                   |
+| [LMDB](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-lmdb)          | +         | -                   |
+| [BoltDB](https://github.com/hashicorp/raft-wal/tree/main?tab=readme-ov-file#user-content-rocksdb-wal) | +         | +                   |
 
 {% enddetail %}
 
@@ -1414,3 +1414,850 @@ Here a small diagram briefly summarizing all above:
 
 ![File write operation stack](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/write-call-stack-en.png)
 
+## File operations patterns
+
+After considering possible problems, that can arise during operations with files, let's consider opposite - how to fight with these problems.
+
+As a developers we create huge systems with lots of connected subsystems. The most illustrative example is a database (persistent, not in-memory).
+So most of example implementation will be given in DBMSs source code.
+
+### Create new file
+
+Let's kick off from the very beginning - creating a new file.
+
+If we want a new *empty* file then we should just call *`fsync` on parent directory* after we have created it:
+
+1. `creat("/dir/data")` - create new file
+2. `fsync("/dir")` - sync directory's contents
+
+Initially, file is empty, but what if file must have initial data, i.e. header with metadata. As we have seen, just `fsync` is not enough because if operation is interrupted then file either will not exist or will be half-full (which is not acceptable).
+
+We already have seen such pattern - `Atomic Create Via Rename`. Again, the title is selfdescriptive - to create initialized file we need to swap it (rename) with another initialized file.
+Algorithm is the following:
+
+1. `creat("/dir/data.tmp")` - create temporary file
+2. `write("/dir/data.tmp", new_data)` - write required data to it
+3. `fsync("/dir/data.tmp")` - flush contents of temporary file to disk
+4. `fsync("/dir")` - flush updates to parent directory
+5. `rename("/dir/data.tmp", "/dir/data")` - rename (replace) temporary file with target one
+6. `fsync("/dir")` - flush rename to parent directory
+
+Pratical example: creation of new log segment (file with operations being performed on data) in etcd:
+
+{% detail Creation of new log segment file in etcd %}
+
+```go
+// cut closes current file written and creates a new one ready to append.
+// cut first creates a temp wal file and writes necessary headers into it.
+// Then cut atomically rename temp wal file to a wal file.
+func (w *WAL) cut() error {
+	// Название для нового файла сегмента
+	fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
+
+    // 1. Create temporary file
+	newTail, err := w.fp.Open()
+	if err != nil {
+		return err
+	}
+
+    // 2. Write data to temporary file
+	// update writer and save the previous crc
+	w.locks = append(w.locks, newTail)
+	prevCrc := w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
+	if err = w.saveCrc(prevCrc); err != nil {
+		return err
+	}
+	if err = w.encoder.encode(&walpb.Record{Type: MetadataType, Data: w.metadata}); err != nil {
+		return err
+	}
+	if err = w.saveState(&w.state); err != nil {
+		return err
+	}
+
+	// atomically move temp wal file to wal file
+    
+    // 3-4. Flush file data to disk
+	if err = w.sync(); err != nil {
+		return err
+	}
+
+    // 5. Rename temporary file to target
+	if err = os.Rename(newTail.Name(), fpath); err != nil {
+		return err
+	}
+	
+	// 6. Flush "rename" of parent directory to disk
+	if err = fileutil.Fsync(w.dirFile); err != nil {
+		return err
+	}
+
+	// reopen newTail with its new path so calls to Name() match the wal filename format
+	newTail.Close()
+	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
+		return err
+	}
+
+	w.locks[len(w.locks)-1] = newTail
+	prevCrc = w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+```
+
+I have commented steps of our defined algorithm with numbers. As you can see, steps performed in same sequence.
+
+Also, target file is reopened in the end. This is done to correctly display target filename, not temporary (does not affect correctness).
+
+{% enddetail %}
+
+### File modification
+
+File is created and now we must make some modifications - write new data to it or update (overwrite) existing. Here we have 2 options:
+
+#### Change of a small file
+
+If our file is small enough, then we can apply sibling of previous pattern - `Atomic Replace Via Rename` (btrfs call this `overwrite-by-rename`). Algorithm is almost the same:
+
+1. `creat("/dir/data.tmp")` - create temporary file
+2. `write("/dir/data.tmp", new_data)` - write new data to it
+3. `fsync("/dir/data.tmp")` - flush data to disk
+4. `fsync("/dir")` - update parent directory contents (new file creation)
+5. `rename("/dir/data.tmp", "/dir/data")` - rename (replace) old file with a new one
+6. `fsync("/dir")` - update parent directory contents (file rename)
+
+Earlier I said that some file systems can detect this pattern and perform `fsync` themselves. But as a developers we target on multiple systems and do not rely on specific tehnologies - specific file system features in this case.
+
+Pratical example: LevelDB flush memtable to disk.
+
+{% detail LevelDB flush memtable to disk %}
+
+LevelDB stores data in memory using special MemTable. When it becomes too big it is flushed to disk - this is called "Compaction"
+
+```cpp
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/db_impl.cc#L549
+void DBImpl::CompactMemTable() {
+  // ...
+
+  // Replace immutable memtable with the generated Table
+  if (s.ok()) {
+    edit.SetPrevLogNumber(0);
+    edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
+    s = versions_->LogAndApply(&edit, &mutex_); // Versionset->LogAndApply
+  }
+  
+  // ...
+}
+
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/version_set.cc#L777
+Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
+  // 1. Create new state - apply patches to current state (in-memory for now)
+  Version* v = new Version(this);
+  {
+    Builder builder(this, current_);
+    builder.Apply(edit);
+    builder.SaveTo(v);
+  }
+  Finalize(v);
+
+  // Initialize new descriptor log file if necessary by creating
+  // a temporary file that contains a snapshot of the current version.
+  std::string new_manifest_file;
+  Status s;
+  if (descriptor_log_ == nullptr) { 
+    // 2. Create temporary file
+    new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+    s = env_->NewWritableFile(new_manifest_file, &descriptor_file_);
+    if (s.ok()) {
+      // 3. Write data (new snapshot) to temporary file
+      descriptor_log_ = new log::Writer(descriptor_file_);
+      s = WriteSnapshot(descriptor_log_);
+    }
+  }
+
+  {
+    if (s.ok()) {
+      // 4. Flush data to disk
+      s = descriptor_file_->Sync();
+    }
+
+    // If we just created a new descriptor file, install it by writing a
+    // new CURRENT file that points to it.
+    if (s.ok() && !new_manifest_file.empty()) {
+      // 5. Rename temporary file to target
+      s = SetCurrentFile(env_, dbname_, manifest_file_number_);
+    }
+
+    mu->Lock();
+  }
+  return s;
+}
+
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/util/env_posix.cc#L334
+class PosixWritableFile: public WritableFile {
+public:
+  Status Sync() override {
+    Status status = SyncDirIfManifest();
+    
+    status = FlushBuffer();
+    return SyncFd(fd_, filename_);
+  }
+private:
+  static Status SyncFd(int fd, const std::string& fd_path) {
+#if HAVE_FULLFSYNC
+    // On macOS and iOS, fsync() doesn't guarantee durability past power
+    // failures. fcntl(F_FULLFSYNC) is required for that purpose. Some
+    // filesystems don't support fcntl(F_FULLFSYNC), and require a fallback to
+    // fsync().
+    if (::fcntl(fd, F_FULLFSYNC) == 0) {
+      return Status::OK();
+    }
+#endif  // HAVE_FULLFSYNC
+
+#if HAVE_FDATASYNC
+    bool sync_success = ::fdatasync(fd) == 0;
+#else
+    bool sync_success = ::fsync(fd) == 0;
+#endif  // HAVE_FDATASYNC
+
+    if (sync_success) {
+      return Status::OK();
+    }
+    return PosixError(fd_path, errno);
+  }
+}
+
+// https://github.com/google/leveldb/blob/068d5ee1a3ac40dabd00d211d5013af44be55bea/db/filename.cc#L123
+Status SetCurrentFile(Env* env, const std::string& dbname,
+                      uint64_t descriptor_number) {
+  // ...
+  if (s.ok()) {
+    // Rename temporary file to target
+    s = env->RenameFile(tmp, CurrentFileName(dbname));
+  }
+  return s;
+}
+```
+
+Steps performed the same. Also, if you saw the code, you could mention usage of macOS specific - it requires usage of `fcntl` instead of `fsync`.
+
+{% enddetail %}
+
+#### UNDO log
+
+This example is given for a small file, but what if file is large or free disk space is low?
+
+So far we saw many atomic operations + `fsync` and now we will use them to create atomic file overwrite. But what does mean "atomically" here? Actually, we can go in both directions: undo operation (rollback operation) and reapply new operation (redo operation). Thus, we come to the 2 main conceptions:
+
+- UNDO log - contains information about how to rollback to previous state if operation fails
+- REDO log - contains information about what operation we wanted to perform in order to redo it if some failure occurred
+
+First, we describe UNDO log and REDO log come after.
+
+Undo log contains information to *rollback* operations. In case of file rewrite it can *store original data that we are overwriting*. So, after restart (there is a failure occurred) we check for some incomplete operation in that log and undo them.
+
+> Example for undo/redo log is borrowed from ["Files Are Hard"](https://danluu.com/file-consistency).
+
+Our example is following: we want to write new data (`new_data`) starting from 10 byte (`start`) with length of 15 bytes (`length`), so undo log will contain bytes from 10 to 25 of original data (`old_data`).
+Algorithm is the following:
+
+1. `creat("/dir/undo.log")` - create undo log
+2. `write("/dir/undo.log", "[check_sum, start, length, old_data]")` - store original data, that we want to overwrite:
+   - `start` - start position
+   - `length` - length of byte range
+   - `old_data` - actual data in that range
+   - `check_sum` - chech-sum, computed for the data
+3. `fsync("/dir/undo.log")` - persist undo log on disk
+4. `fsync("/dir")` - sync parent directory contents (undo log creation)
+5. `write("/dir/data", new_data)` - overwrite original file
+6. `fsync("/dir/data")` - flush file updates to disk
+7. `unlink("/dir/undo.log")` - remove undo log
+8. `fsync("/dir")` - sync parent directory contents (undo log deletion)
+
+What is taken into account in this example:
+
+- Fault can occur even right after UNDO log creation or data can be corrupted during reboot - so store checksum of that stored data
+- Always call `fsync` even for undo log - without this undo log can disappear after we have modified main data file
+- Call `fsync` even after deletion of undo log - otherwise we would think that operation was not completed at time of halt and perform rollback
+
+> Actually, you do not need to constantly create and remove undo log - you can just create it once and use special markers to detect that operation is completed successfully.
+> But you still need to call `fsync` when performing changes in that file.
+
+At this time you have probably already figured out how to rollback:
+
+1. Check undo-log existence (or there are some operations "in-progress")
+2. Check correctness of records (checksums)
+3. Find all undo operations (start byte, length, data)
+4. Write that original data
+5. Remove undo-log (mark operations "aborted")
+6. Flush changes to disk
+
+Even if there is another fault during rollback we always can retry because our algorithm is idempotent (additionally, you should consider atomicity and PSOW).
+
+SQLite developers use undo log and [developed 2 optimizations](https://devdoc.net/database/sqlite-3.0.7.2/atomiccommit.html#section_7_6) (as new file creation is a costly operation):
+
+- Truncate file after operation is complete: `PRAGMA journal_mode=TRUNCATE`
+- Set file header to all 0 - `PRAGMA journal_mode=PERSIST`
+
+Practical example: undo log in SQLite
+
+{% detail SQLite undo log %}
+
+This algorithm is described in documentation - [Atomic Commit In SQLite](https://devdoc.net/database/sqlite-3.0.7.2/atomiccommit.html)
+
+```cpp
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/btree.c#L4388
+int sqlite3BtreeCommit(Btree *p){
+  int rc;
+  // First phase - create log and update data in database file
+  rc = sqlite3BtreeCommitPhaseOne(p, 0);
+  if( rc==SQLITE_OK ){
+    // Second phase - remove/trancate/nullify log
+    rc = sqlite3BtreeCommitPhaseTwo(p, 0);
+  }
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/btree.c#L4267
+int sqlite3BtreeCommitPhaseOne(Btree *p, const char *zSuperJrnl){
+  int rc = SQLITE_OK;
+  if( p->inTrans==TRANS_WRITE ){
+    rc = sqlite3PagerCommitPhaseOne(pBt->pPager, zSuperJrnl, 0);
+  }
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L6437
+int sqlite3PagerCommitPhaseOne(
+  Pager *pPager,                  /* Pager object */
+  const char *zSuper,            /* If not NULL, the super-journal name */
+  int noSync                      /* True to omit the xSync on the db file */
+){
+  int rc = SQLITE_OK;             /* Return code */
+
+  if( 0==pagerFlushOnCommit(pPager, 1) ){
+    // ...
+  }else{
+    if( pagerUseWal(pPager) ){
+      // ...
+    }else{
+      // 1. Save original data to log
+      rc = pager_incr_changecounter(pPager, 0);
+      // 2. Sync data to disk (call fsync)
+      rc = syncJournal(pPager, 0);
+      if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+
+      // 3. Write updated data to main database file
+      pList = sqlite3PcacheDirtyList(pPager->pPCache);
+      if( /* ... */ ){
+        rc = pager_write_pagelist(pPager, pList);
+      }
+      if( rc!=SQLITE_OK ) goto commit_phase_one_exit;
+
+      // 4. Flush main database file to disk
+      if( /* ... */ ){
+        rc = sqlite3PagerSync(pPager, zSuper);
+      }
+    }
+  }
+
+commit_phase_one_exit:
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L4259
+static int syncJournal(Pager *pPager, int newHdr){
+  int rc;                         /* Return code */
+
+  if( /* ... */ ){
+    if( /* ... */ ){
+      if( /* ... */ ){
+        // Write total amount of pages equal to 0 (just in case)
+        if( rc==SQLITE_OK && 0==memcmp(aMagic, aJournalMagic, 8) ){
+          static const u8 zerobyte = 0;
+          rc = sqlite3OsWrite(pPager->jfd, &zerobyte, 1, iNextHdrOffset);
+        }
+
+        if( /* ... */ ){
+          // Flush written data
+          rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags);
+          if( rc!=SQLITE_OK ) return rc;
+        }
+        
+        // Write header with metadata
+        rc = sqlite3OsWrite(
+            pPager->jfd, zHeader, sizeof(zHeader), pPager->journalHdr
+        );
+        if( rc!=SQLITE_OK ) return rc;
+      }
+      if( /* ... */ ){
+        // Flush data to disk again
+        rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags|
+          (pPager->syncFlags==SQLITE_SYNC_FULL?SQLITE_SYNC_DATAONLY:0)
+        );
+        if( rc!=SQLITE_OK ) return rc;
+      }
+    }else{
+      pPager->journalHdr = pPager->journalOff;
+    }
+  }
+  
+  return SQLITE_OK;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L6372
+int sqlite3PagerSync(Pager *pPager, const char *zSuper){
+  int rc = SQLITE_OK;
+  if( /* ... */ ){
+    // fsync
+    rc = sqlite3OsSync(pPager->fd, pPager->syncFlags);
+  }
+  return rc;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/btree.c#L4356
+int sqlite3BtreeCommitPhaseTwo(Btree *p, int bCleanup){
+  if( p->inTrans==TRANS_WRITE ){
+    int rc;
+    rc = sqlite3PagerCommitPhaseTwo(p->pBt->pPager);
+    if( rc!=SQLITE_OK && bCleanup==0 ){
+      sqlite3BtreeLeave(p);
+      return rc;
+    }
+  }
+  
+  return SQLITE_OK;
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L6674
+int sqlite3PagerCommitPhaseTwo(Pager *pPager){
+  int rc = SQLITE_OK;                  /* Return code */
+  rc = pager_end_transaction(pPager, pPager->setSuper, 1);
+  return pager_error(pPager, rc);
+}
+
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/pager.c#L2033
+static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
+  int rc = SQLITE_OK;
+  int rc2 = SQLITE_OK;     
+
+  if( isOpen(pPager->jfd) ){
+    if( sqlite3JournalIsInMemory(pPager->jfd) ){
+      // ...
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_TRUNCATE ){
+      // PRAGMA journal_mode=TRUNCATE
+      // Truncate file to 0
+      if( pPager->journalOff==0 ){
+        rc = SQLITE_OK;
+      }else{
+        rc = sqlite3OsTruncate(pPager->jfd, 0);
+        if( rc==SQLITE_OK && pPager->fullSync ){
+          rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags);
+        }
+      }
+      pPager->journalOff = 0;
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_PERSIST){
+      // PRAGMA journal_mode=PERSIST
+      // Nullify header
+      rc = zeroJournalHdr(pPager, hasSuper||pPager->tempFile);
+      pPager->journalOff = 0;
+    }else{
+      // PRAGMA journal_mode=DELETE
+      // Remove undo log file
+      int bDelete = !pPager->tempFile;
+      sqlite3OsClose(pPager->jfd);
+      if( bDelete ){
+        rc = sqlite3OsDelete(pPager->pVfs, pPager->zJournal, pPager->extraSync);
+      }
+    }
+  }
+  // ...
+  return (rc==SQLITE_OK?rc2:rc);
+}
+
+// sqlite3OsDelete implementation for *nix
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/os_unix.c#L6533
+static int unixDelete(
+  sqlite3_vfs *NotUsed,     /* VFS containing this as the xDelete method */
+  const char *zPath,        /* Name of file to be deleted */
+  int dirSync               /* If true, fsync() directory after deleting file */
+){
+  int rc = SQLITE_OK;
+  
+  // Remove file itself
+  if( osUnlink(zPath)==(-1) ){
+    rc = unixLogError(SQLITE_IOERR_DELETE, "unlink", zPath);
+    return rc;
+  }
+  
+  // Sync directory contents
+  if( (dirSync & 1)!=0 ){
+    int fd;
+    rc = osOpenDirectory(zPath, &fd);
+    if( rc==SQLITE_OK ){
+      // "Improved fsync"
+      if( full_fsync(fd,0,0) ){
+        rc = unixLogError(SQLITE_IOERR_DIR_FSYNC, "fsync", zPath);
+      }
+    }else{
+      rc = SQLITE_OK;
+    }
+  }
+  return rc;
+}
+
+// "Improved fsync" - is just fsync that counts in specifics of some OS
+// https://github.com/sqlite/sqlite/blob/5007833f5f82d33c95f44c65fc46221de1c5950f/src/os_unix.c#L3638
+static int full_fsync(int fd, int fullSync, int dataOnly){
+  int rc;
+
+  /* If we compiled with the SQLITE_NO_SYNC flag, then syncing is a
+  ** no-op.  But go ahead and call fstat() to validate the file
+  ** descriptor as we need a method to provoke a failure during
+  ** coverage testing.
+  */
+#ifdef SQLITE_NO_SYNC
+  {
+    struct stat buf;
+    rc = osFstat(fd, &buf);
+  }
+#elif HAVE_FULLFSYNC
+  if( fullSync ){
+    rc = osFcntl(fd, F_FULLFSYNC, 0);
+  }else{
+    rc = 1;
+  }
+  /* If the FULLFSYNC failed, fall back to attempting an fsync().
+  ** It shouldn't be possible for fullfsync to fail on the local
+  ** file system (on OSX), so failure indicates that FULLFSYNC
+  ** isn't supported for this file system. So, attempt an fsync
+  ** and (for now) ignore the overhead of a superfluous fcntl call.
+  ** It'd be better to detect fullfsync support once and avoid
+  ** the fcntl call every time sync is called.
+  */
+  if( rc ) rc = fsync(fd);
+
+#elif defined(__APPLE__)
+  /* fdatasync() on HFS+ doesn't yet flush the file size if it changed correctly
+  ** so currently we default to the macro that redefines fdatasync to fsync
+  */
+  rc = fsync(fd);
+#else
+  rc = fdatasync(fd);
+#if OS_VXWORKS
+  if( rc==-1 && errno==ENOTSUP ){
+    rc = fsync(fd);
+  }
+#endif /* OS_VXWORKS */
+#endif /* ifdef SQLITE_NO_SYNC elif HAVE_FULLFSYNC */
+
+  if( OS_VXWORKS && rc!= -1 ){
+    rc = 0;
+  }
+  return rc;
+}
+```
+
+{% enddetail %}
+
+#### REDO log
+
+REDO log works similarly. The main difference is that we write to log *new* data instead of old.
+
+1. `creat("/dir/redo.log")` - create new REDO log
+2. `write("/dir/redo.log", "[check_sum, start, length, new_data]")` - write new data to log:
+     - `start` - starting position of data
+     - `length` - length of new data
+     - `new_data` - new data being written
+     - `check_sum` - checksum for new data
+3. `fsync("/dir/redo.log")` - flush new redo log file changes to disk
+4. `fsync("/dir")` - sync parent directory contents (create redo-log)
+5. `write("/dir/data", new_data)` - write new data to main file
+6. `fsync("/dir/data")` - flush changes of main file to disk
+7. `unlink("/dir/redo.log")` - remove redo-log (mark completed)
+8. `fsync("/dir")` - sync parent directory contents (remove redo-log)
+
+Main advantage of REDO log, that is widely used by multiple dbms, is that we can return response to user *right after we made record to redo-log* (step 4).
+We can be sure changes will be applied - later (flush to file in background) or during recovery.
+
+As in the UNDO log here we can apply some optimizations. Again, main optimization is to persist this file instead of constant creation/deletions. When we perform commit we just mark record as applied (or can just create new special record that previous record is applied ~ "commit record").
+
+REDO log has alternative name - WAL, Write Ahead Log.
+
+Practical example: WAL in Postgres.
+
+{% detail WAL in Postgres %}
+
+As I said, WAL is widely used in databases. It is used in [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/managing-the-redo-log.html), [MySQL](https://dev.mysql.com/doc/refman/8.0/en/innodb-redo-log.html), [Postgres](https://www.postgresql.org/docs/current/runtime-config-wal.html), [SQLite](https://www.sqlite.org/wal.html), [SQL Server](https://learn.microsoft.com/en-us/troubleshoot/sql/database-engine/database-file-operations/logging-data-storage-algorithms).
+
+This example is splited into 2 parts:
+
+1. `COMMIT` - save data to WAL
+2. Dirty page flushing to disk
+
+Here we can see advantage that I have highlighted earlier - it's enough to make record in WAL to return response to user and continue processing other requests. Dirty page will be flushed to table file later, during checkpoint.
+
+```cpp
+// 1. "COMMIT;"
+
+// https://github.com/postgres/postgres/blob/cc6e64afda530576d83e331365d36c758495a7cd/src/backend/access/transam/xact.c#L2158
+static void
+CommitTransaction(void)
+{   
+    // ...
+	RecordTransactionCommit();
+    // ...
+}
+
+// https://github.com/postgres/postgres/blob/97d85be365443eb4bf84373a7468624762382059/src/backend/access/transam/xact.c#L1284
+static TransactionId
+RecordTransactionCommit(void)
+{
+    // ...
+    XactLogCommitRecord(GetCurrentTransactionStopTimestamp(),
+                        nchildren, children, nrels, rels,
+                        ndroppedstats, droppedstats,
+                        nmsgs, invalMessages,
+                        RelcacheInitFileInval,
+                        MyXactFlags,
+                        InvalidTransactionId, NULL /* plain commit */ );
+    // ...
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/access/transam/xact.c#L5736
+XLogRecPtr
+XactLogCommitRecord(TimestampTz commit_time,
+					int nsubxacts, TransactionId *subxacts,
+					int nrels, RelFileLocator *rels,
+					int ndroppedstats, xl_xact_stats_item *droppedstats,
+					int nmsgs, SharedInvalidationMessage *msgs,
+					bool relcacheInval,
+					int xactflags, TransactionId twophase_xid,
+					const char *twophase_gid)
+{
+    // ...
+	return XLogInsert(RM_XACT_ID, info);
+}
+
+XLogRecPtr
+XLogInsertRecord(XLogRecData *rdata,
+				 XLogRecPtr fpw_lsn,
+				 uint8 flags,
+				 int num_fpi,
+				 bool topxid_included)
+{
+    // ...
+    XLogFlush(EndPos);
+    // ...
+}
+
+// https://github.com/postgres/postgres/blob/dbfc44716596073b99e093a04e29e774a518f520/src/backend/access/transam/xlog.c#L2728
+void
+XLogFlush(XLogRecPtr record)
+{
+	// ...
+	XLogWrite(WriteRqst, insertTLI, false);
+    // ...
+}
+
+// https://github.com/postgres/postgres/blob/dbfc44716596073b99e093a04e29e774a518f520/src/backend/access/transam/xlog.c#L2273
+static void
+XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
+{
+	while (/* Have data to write */)
+	{
+        // 1. Create new WAL segment file or open existing
+	    if (/* Размер сегмента превышен */)
+		{
+			openLogFile = XLogFileInit(openLogSegNo, tli);
+		}
+		if (openLogFile < 0)
+		{
+			openLogFile = XLogFileOpen(openLogSegNo, tli);
+		}
+
+        // 2. Write data to WAL
+        do
+        {
+            written = pg_pwrite(openLogFile, from, nleft, startoffset);
+        } while (/* Have data to write */);
+        
+        // 3. Flush WAL to disk
+        if (finishing_seg)
+        {
+            issue_xlog_fsync(openLogFile, openLogSegNo, tli);
+        }
+    }
+}
+
+// https://github.com/postgres/postgres/blob/dbfc44716596073b99e093a04e29e774a518f520/src/backend/access/transam/xlog.c#L8516
+void
+issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
+{
+    // fsync behaviour can be adjusted by GUC (configuration)
+	switch (wal_sync_method)
+	{
+		case WAL_SYNC_METHOD_FSYNC:
+		    pg_fsync_no_writethrough(fd);
+			break;
+		case WAL_SYNC_METHOD_FSYNC_WRITETHROUGH:
+		    pg_fsync_writethrough(fd);
+			break;
+		case WAL_SYNC_METHOD_FDATASYNC:
+		    pg_fdatasync(fd);    
+			break;
+		// ...
+	}
+}
+
+// 2. Flush "dirty" pages to disk, table file itself
+
+// https://github.com/postgres/postgres/blob/97d85be365443eb4bf84373a7468624762382059/src/backend/storage/buffer/bufmgr.c#L3437
+static void
+FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+			IOContext io_context)
+{
+    // 3. Flush change to WAL
+	if (buf_state & BM_PERMANENT)
+		XLogFlush(recptr);
+    
+    // Flush changes to table file
+    smgrwrite(reln,
+			  BufTagGetForkNum(&buf->tag),
+			  buf->tag.blockNum,
+			  bufToWrite,
+			  false);
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/include/storage/smgr.h#L121
+static inline void
+smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		  const void *buffer, bool skipFsync)
+{
+	smgrwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/smgr.c#L631
+void
+smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		   const void **buffers, BlockNumber nblocks, bool skipFsync)
+{
+	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
+										 buffers, nblocks, skipFsync);
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/md.c#L928
+void
+mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+		 const void **buffers, BlockNumber nblocks, bool skipFsync)
+{
+    // 5. Write data to table file
+	while (/* Have more data blocks */)
+	{
+        FileWriteV(v->mdfd_vfd, iov, iovcnt, seekpos,
+                   WAIT_EVENT_DATA_FILE_WRITE);
+	}
+	
+    // 6. Flush data to disk
+    register_dirty_segment(reln, forknum, v);
+}
+
+
+// https://github.com/postgres/postgres/blob/6b41ef03306f50602f68593d562cd73d5e39a9b9/src/backend/storage/file/fd.c#L2192
+ssize_t
+FileWriteV(File file, const struct iovec *iov, int iovcnt, off_t offset,
+		   uint32 wait_event_info)
+{
+    // Perform write directly
+	returnCode = pg_pwritev(vfdP->fd, iov, iovcnt, offset);	
+}
+
+// https://github.com/postgres/postgres/blob/eeefd4280f6e5167d70efabb89586b7d38922d95/src/backend/storage/smgr/md.c#L1353
+static void
+register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
+{
+	if (/* Failed to ask checkpointer to perform fsync */)
+	{
+        // Perform fsync directly
+		FileSync(seg->mdfd_vfd, WAIT_EVENT_DATA_FILE_SYNC);
+	}
+}
+
+// https://github.com/postgres/postgres/blob/c20d90a41ca869f9c6dd4058ad1c7f5c9ee9d912/src/backend/storage/file/fd.c#L2297
+int
+FileSync(File file, uint32 wait_event_info)
+{
+	pg_fsync(VfdCache[file].fd);
+}
+```
+
+{% enddetail %}
+
+### Segmented log + Snapshot
+
+Since we are talking about WAL, it's worth talking about pair of segmented log and snapshot. [Segmented log](https://martinfowler.com/articles/patterns-of-distributed-systems/segmented-log.html) - is a pattern of representing single "logical" log as multiple "physical" segments.
+
+The benefit we get with this approach is significant. Earlier we have only one big file. Huge systems with highload might have this file have size of thousands TB. You might think that this is OK because we huge amount of storage, but remember that file is stored in file system that might have limit for file size.
+Even if we use zfs or xfs (with file size limit of 8 exbibytes) there are engineering problems - maintaince.
+
+But, if we split this big file into several small/medium sized files we get not only ability to grow WAL indefinitely, but also comfortable engineering experience - old WAL segments can be stored in some other place (and possible compressed).
+
+The segmented log itself is a good tool for transactional processing (ability to rollback), but if our server works some months, then this log can become too large and starup time will become impractical (several hours). And here comes "Snapshot" - serialized application state to which WAL records applied up to certain record.
+
+There is illustration from [Raft paper](https://raft.github.io/raft.pdf) that better describes relationship between these 2 components:
+
+![Relationship between segmented log and snapshot from Raft](https://raw.githubusercontent.com/ashenBlade/habr-posts/file-write/file-write/img/in-search-of-understandable-consensus-algorithm-snapshot.png)
+
+As a result, we have 2 "files" representing application state:
+
+- Snapshot - file with serialized state after applying some WAL records, and
+- Segmented log/WAL - multiple files representing single logical sequence of commands that must be applied to state to bring it up to date
+
+Actual state = Snapshot + WAL records.
+
+Finally, main magic - now we can work with both files atomically:
+
+- To create or update snapshot - use `ACVR`/`ARVR`
+- When some command comes from user - add to WAL/Segmented log (and return response)
+- New WAL segments created - `ACVR`
+
+Also, when using Snapshot we actual do not need old WAL segments, because they are already applied in snapshot. If we were using not segmented log, but a *monolog* (came up with the name myself), then freeing up a disk space will be problematic: atomic operation will require `ARVR`, but for large file it will consume to much resources. As for segmented log - we can just remove some log segments (or send to another storage/archive).
+
+Some examples:
+
+- Postgres: WAL represented as [multiple segments](https://www.postgresql.org/docs/current/wal-internals.html)
+- Apache Kafka: each partition consists of [several segments](https://kafka.apache.org/documentation/#log)
+- etcd: data stored in [snapshot](https://pkg.go.dev/github.com/etcd-io/etcd/snap) and [segmented WAL](https://pkg.go.dev/go.etcd.io/etcd/wal)
+- log-cabin: data stored in [snapshot](https://github.com/logcabin/logcabin/blob/master/Storage/SnapshotFile.cc) and [segmented WAL](https://github.com/logcabin/logcabin/blob/master/Storage/SegmentedLog.cc)
+
+> Actually, we can think of table files in Postgres in terms of Snapshot.
+> But in Raft snapshot is immutable and Postgres performs changes on such "snapshot" directly.
+
+Such approach for the organizatio of data storage has advantages:
+
+- Fault-tolerant update of application state: fault-tolerant WAL write and snapshot updates
+- Increase data update speed: response right after WAL saved record + data locality and sequential access when writing to WAL
+- Replication is more effective: streaming replication of state (just send WAL records sequentially) and/or send immutable snapshot
+- Application startup speed increases: we need to deserialize application state and apply some records from WAL (instead of applying *all* records for all time, without snapshot)
+
+## Conclusion
+
+In this blog-post we went through the main layers that write request passes. But some topics are not covered:
+
+- Network file systems
+- More deep description of storage devices
+- Architecture and implementation of different file systems
+- Comparison of file systems
+- Ephemerial file systems (i.e. OverlayFS used in Docker)
+- Cross-platform
+- Bugs in implementation of each layer
+- Behaviours in emulators/virtual machines
+
+Hope this article was useful. Bye!
