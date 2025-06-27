@@ -817,3 +817,66 @@ get_start_index(EdgeArray *edges, bitmapword excluded)
 }
 ```
 
+## Определение сложности запроса
+
+PostgreSQL использует 2 алгоритма: DPsize и GEQO. Причем последний используется если в запросе таблиц больше, чем значение параметра `geqo_threshold`. Но почему именно количество таблиц? А потому что сложность DPsize определяется количеством таблиц - мы безусловно будем рассматривать все возможные комбинации. Но DPhyp другое дело, его сложность - это сложность графа запроса. В оригинальной статье сравниваются производительности алгоритмов на некоторых типах запросов, но они не дают прямой ответ на то, как определять сложность запроса (а может я проглядел). Но зато этот ответ есть в другой статье - ["Adaptive Optimization of Large Join Queries"](https://db.in.tum.de/~radke/papers/hugejoins.pdf).
+
+Эта статья предлагает мета-алгоритм, который комбинируя несколько разных алгоритмов JOIN'а позволяет создать планы запросов с количеством таблиц в несколько тысяч. Но сейчас не об этом, а о DPhyp. Статья предлагает использовать его в простых запросах. Но что такое простой запрос? Например, если в запросе 100 таблиц это не значит, что DPhyp с ним не справится - а если граф запроса представляет простую цепочку, например, все предикаты в форме `Ti.x OP T(i + 1).x`. В такой постановке это просто цепочка, план для которой найти просто. Но вот если это клика (каждый с каждым), то даже 15 таблиц это уже много. Поэтому для DPhyp сложность надо определять не в количестве таблиц, в сложности графа запроса - **количестве связных подграфов** в нем. Авторы предлагают значение в 10000 связных подграфов как предел эффективности запроса. Это соответствует примерно 14 таблицам в клике.
+
+В этой же самой статье не только предлагается эта идея, но также дается и функция для вычисления количества. Посмотрев на нее я понял - она идеально ложится на ту схему кэширования, что описал ранее. Вот собственно эта функция:
+
+```c++
+static uint64
+count_cc_recursive(DPHypContext *context, bitmapword subgraph, bitmapword excluded,
+                   uint64 count, uint64 max, bitmapword base_neighborhood)
+{
+    SubsetIteratorState subset_iter;
+    subset_iterator_init(&subset_iter, base_neighborhood);
+    while (subset_iterator_next(&subset_iter))
+    {
+        bitmapword set;
+        bitmapword excluded_ext;
+        bitmapword neighborhood;
+    
+        count++;
+        if (count > max)
+            break;
+
+        excluded_ext = excluded | base_neighborhood;
+        set = subgraph | subset_iter.subset;
+        neighborhood = get_neighbors_iter(context, set, excluded_ext, &subset_iter);
+        count = count_cc_recursive(context, set, excluded_ext, count, max, neighborhood);
+    }
+
+    return count;
+}
+
+static uint64
+count_cc(DPHypContext *context, uint64 max)
+{
+    int64 count = 0;
+    int rels_count;
+
+    rels_count = list_length(context->initial_rels);
+    for (size_t i = 0; i < rels_count; i++)
+    {
+        bitmapword excluded;
+        bitmapword neighborhood;
+
+        count++;
+        if (count > max)
+            break;
+
+        excluded = bmw_make_b_v(i);
+        neighborhood = get_neighbors_base(context, i, excluded);
+        count = count_cc_recursive(context, bmw_make_singleton(i), excluded,
+                                   count, max, neighborhood);
+    }
+
+    return count;
+}
+```
+
+Названия для функций я оставил те же самые, что и в статье, но адаптировал сигнатуру для поддержки эффективного итерирования по соседям.
+
+Бонус: количество связных подграфов - это размер результирующей DP таблицы. Я использую это значение для ее предварительной аллокации.
