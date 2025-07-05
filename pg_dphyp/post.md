@@ -1055,31 +1055,529 @@ count_cc(DPHypContext *context, uint64 max)
 
 Бонус: количество связных подграфов - это размер результирующей DP таблицы. Сейчас это значение используется для ее предварительной аллокации.
 
-## Итоги
+## Тестирование
 
-Если вы захотели использовать расширение сейчас, то рад, что заинтересовал, но подождите. Расширение еще довольно сырое. Из-за того, что существующая инфраструктура заточена под особенности PostgreSQL приходится искать обходные пути для реализации некоторого функционала.
-
-Например, создание гиперребер - они создаются из предикатов, а не из структуры запроса. Это ведет к 2 вещам: во-первых, теряются возможные оптимизации, связанные с порядком JOIN'ов, и, во-вторых, после создания графа могут появиться несвязные подграфы.
-
-Еще одним недостатком можно выделить способ создания плана запроса. Сейчас используется встроенный `make_join_rel`, но он занимает колоссальное количество времени. Для целей DPhyp стоит написать свою логику создания плана, которая будет учитывать особенности алгоритма. Но все же, запросы, на которых расширение работает куда лучше есть. И это запросы, предикаты которых состоят из сложных гиперребер. Самый простой пример, который я придумал:
+Вначале проверим на каком-нибудь простом запросе. Долго гадать не будем:
 
 ```sql
+EXPLAIN ANALYZE
 SELECT * 
 FROM t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14
 WHERE 
     t1.x + t2.x + t3.x + t4.x + t5.x + t6.x + t7.x > t8.x + t9.x + t10.x + t11.x + t12.x + t13.x + t14.x;
 ```
 
-В этом запросе есть одно сложное гиперребро: `{t1, t2, t3, t4, t5, t6, t7} - {t8, t9, t10, t11, t12, t13, t14}`. DPsize обрабатывает его 1 секунду, DPhyp - около *1 миллисекунды*!
+Это 14 таблиц, соединенных 1 гиперребром: `{t1, t2, t3, t4, t5, t6, t7} - {t8, t9, t10, t11, t12, t13, t14}`. Каждая таблица - одноколоночная, с 3 значениями (чтобы запрос долго не выполнялся).
 
-Из-за всего этого, DPhyp штормит: план может быть хуже, а времени потрачено даже больше (чем на DPsize). Планы сейчас примерно такие:
+Для DPsize результат следующий:
 
-1. Научиться всегда давать оптимальный план
-2. Ускорить создание плана
+```text
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=0.00..215311.78 rows=1594323 width=56) (actual time=1.672..1330.944 rows=2083371 loops=1)
+   Join Filter: (((((((t1.x + t2.x) + t3.x) + t4.x) + t5.x) + t6.x) + t7.x) > ((((((t8.x + t9.x) + t10.x) + t11.x) + t12.x) + t13.x) + t14.x))
+   Rows Removed by Join Filter: 2699598
+   ->  Nested Loop  (cost=0.00..36.36 rows=2187 width=28) (actual time=0.057..0.612 rows=2187 loops=1)
+         ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16) (actual time=0.042..0.128 rows=81 loops=1)
+               ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.029..0.061 rows=9 loops=1)
+                     ->  Seq Scan on t4  (cost=0.00..1.03 rows=3 width=4) (actual time=0.018..0.028 rows=3 loops=1)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.003..0.008 rows=3 loops=3)
+                           ->  Seq Scan on t5  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.012 rows=3 loops=1)
+               ->  Materialize  (cost=0.00..2.23 rows=9 width=8) (actual time=0.001..0.005 rows=9 loops=9)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.007..0.025 rows=9 loops=1)
+                           ->  Seq Scan on t6  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.010 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.002..0.004 rows=3 loops=3)
+                                 ->  Seq Scan on t7  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.006 rows=3 loops=1)
+         ->  Materialize  (cost=0.00..3.69 rows=27 width=12) (actual time=0.001..0.002 rows=27 loops=81)
+               ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12) (actual time=0.014..0.037 rows=27 loops=1)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.008..0.022 rows=9 loops=1)
+                           ->  Seq Scan on t1  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.008 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.002..0.004 rows=3 loops=3)
+                                 ->  Seq Scan on t2  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.007 rows=3 loops=1)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.001 rows=3 loops=9)
+                           ->  Seq Scan on t3  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.004 rows=3 loops=1)
+   ->  Materialize  (cost=0.00..47.29 rows=2187 width=28) (actual time=0.000..0.078 rows=2187 loops=2187)
+         ->  Nested Loop  (cost=0.00..36.36 rows=2187 width=28) (actual time=0.039..0.405 rows=2187 loops=1)
+               ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16) (actual time=0.021..0.043 rows=81 loops=1)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.010..0.014 rows=9 loops=1)
+                           ->  Seq Scan on t11  (cost=0.00..1.03 rows=3 width=4) (actual time=0.004..0.005 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.002..0.002 rows=3 loops=3)
+                                 ->  Seq Scan on t12  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.004 rows=3 loops=1)
+                     ->  Materialize  (cost=0.00..2.23 rows=9 width=8) (actual time=0.001..0.002 rows=9 loops=9)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.009..0.013 rows=9 loops=1)
+                                 ->  Seq Scan on t13  (cost=0.00..1.03 rows=3 width=4) (actual time=0.004..0.005 rows=3 loops=1)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.002 rows=3 loops=3)
+                                       ->  Seq Scan on t14  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.003 rows=3 loops=1)
+               ->  Materialize  (cost=0.00..3.69 rows=27 width=12) (actual time=0.000..0.001 rows=27 loops=81)
+                     ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12) (actual time=0.016..0.026 rows=27 loops=1)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.010..0.014 rows=9 loops=1)
+                                 ->  Seq Scan on t8  (cost=0.00..1.03 rows=3 width=4) (actual time=0.005..0.006 rows=3 loops=1)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.002 rows=3 loops=3)
+                                       ->  Seq Scan on t9  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.003 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.001 rows=3 loops=9)
+                                 ->  Seq Scan on t10  (cost=0.00..1.03 rows=3 width=4) (actual time=0.004..0.005 rows=3 loops=1)
+ Planning Time: 3069.835 ms
+ Execution Time: 1371.090 ms
+(44 rows)
+```
 
-Первое гораздо важнее второго, так как лучше потратить 1 лишнюю секунду, чтобы время выполнения запроса стало на 30 секунд меньше. Тем более, если учитывать, что разница в стоимости плана составляет каких-то 10 у.е. (в терминах PostgreSQL), то в реальности время выполнения может отличаться значительно (в пользу DPsize).
+На планирование ушло 3 секунды, хотя на выполнение - меньше 1.5 секунд. Что нам даст DPhyp:
 
-Надеюсь моя статья была полезна и вы что-то узнали про планировщики запросов и базы данных. Всем слона.
+```text
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=0.00..215311.78 rows=1594323 width=56) (actual time=1.612..1325.670 rows=2083371 loops=1)
+   Join Filter: (((((((t1.x + t2.x) + t3.x) + t4.x) + t5.x) + t6.x) + t7.x) > ((((((t8.x + t9.x) + t10.x) + t11.x) + t12.x) + t13.x) + t14.x))
+   Rows Removed by Join Filter: 2699598
+   ->  Nested Loop  (cost=0.00..36.36 rows=2187 width=28) (actual time=0.039..0.551 rows=2187 loops=1)
+         ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16) (actual time=0.029..0.131 rows=81 loops=1)
+               ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.021..0.051 rows=9 loops=1)
+                     ->  Seq Scan on t4  (cost=0.00..1.03 rows=3 width=4) (actual time=0.015..0.023 rows=3 loops=1)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.006 rows=3 loops=3)
+                           ->  Seq Scan on t5  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.012 rows=3 loops=1)
+               ->  Materialize  (cost=0.00..2.23 rows=9 width=8) (actual time=0.001..0.006 rows=9 loops=9)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.006..0.034 rows=9 loops=1)
+                           ->  Seq Scan on t6  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.012 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.005 rows=3 loops=3)
+                                 ->  Seq Scan on t7  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.009 rows=3 loops=1)
+         ->  Materialize  (cost=0.00..3.69 rows=27 width=12) (actual time=0.000..0.002 rows=27 loops=81)
+               ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12) (actual time=0.009..0.032 rows=27 loops=1)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.006..0.020 rows=9 loops=1)
+                           ->  Seq Scan on t2  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.008 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.003 rows=3 loops=3)
+                                 ->  Seq Scan on t3  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.006 rows=3 loops=1)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.000..0.001 rows=3 loops=9)
+                           ->  Seq Scan on t1  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.003 rows=3 loops=1)
+   ->  Materialize  (cost=0.00..47.29 rows=2187 width=28) (actual time=0.000..0.078 rows=2187 loops=2187)
+         ->  Nested Loop  (cost=0.00..36.36 rows=2187 width=28) (actual time=0.025..0.397 rows=2187 loops=1)
+               ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16) (actual time=0.013..0.037 rows=81 loops=1)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.007..0.012 rows=9 loops=1)
+                           ->  Seq Scan on t11  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.005 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.002 rows=3 loops=3)
+                                 ->  Seq Scan on t12  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.003 rows=3 loops=1)
+                     ->  Materialize  (cost=0.00..2.23 rows=9 width=8) (actual time=0.001..0.002 rows=9 loops=9)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.006..0.009 rows=9 loops=1)
+                                 ->  Seq Scan on t13  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.003 rows=3 loops=1)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.001 rows=3 loops=3)
+                                       ->  Seq Scan on t14  (cost=0.00..1.03 rows=3 width=4) (actual time=0.002..0.003 rows=3 loops=1)
+               ->  Materialize  (cost=0.00..3.69 rows=27 width=12) (actual time=0.000..0.001 rows=27 loops=81)
+                     ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12) (actual time=0.011..0.021 rows=27 loops=1)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8) (actual time=0.007..0.011 rows=9 loops=1)
+                                 ->  Seq Scan on t9  (cost=0.00..1.03 rows=3 width=4) (actual time=0.004..0.004 rows=3 loops=1)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.001..0.001 rows=3 loops=3)
+                                       ->  Seq Scan on t10  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.003 rows=3 loops=1)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4) (actual time=0.000..0.001 rows=3 loops=9)
+                                 ->  Seq Scan on t8  (cost=0.00..1.03 rows=3 width=4) (actual time=0.003..0.004 rows=3 loops=1)
+ Planning Time: 4.706 ms
+ Execution Time: 1365.543 ms
+(44 rows)
+```
+
+**4 миллисекунды**! При этом планы идентичные - прирост производительности почти в **600 раз**!
+
+Но это всего-лишь 1 небольшой запрос, нужно что-то  На чем тестировать гадать не будем - возьмем готовый JOB, Join Order Benchmarks. Он был представлен в работе ["How Good Are Query Optimizers, Really?"](https://vldb.org/pvldb/vol9/p204-leis.pdf) и использовался для сравнения планировщиков нескольких СУБД, включая сам PostgreSQL. Сам бенчмарк можно найти в [этом репозитории](https://github.com/gregrahn/join-order-benchmark).
+
+> В самой работе производилось сравнение не скорости работы планировщика, а оценок, которые он дает. Запросы, которые там используются не сложные - это INNER equi-JOIN'ы (т.е. условия JOIN только равенство), хотя для оценки реальной производительности следует использовать самые различные нагрузки, включая всякие сложные `LEFT JOIN`, но пока этого достаточно.
+
+Как производилось тестирование:
+
+- Замер времени производился с помощью простенького расширения, которое замеряло время выполнения `join_search_hook`.
+- После заливки данных итоговый размер БД чуть больше 8Гб.
+- Всего имеется *113* запросов, но на самом деле их 33 - все остальные это вариации с различными константами. Для тестов каждый запрос запускался 10 раз и рассчитывалось среднее время его выполнения, а затем, чтобы "шуметь", результаты одних и тех же классов запросов (с разными константами) группировались и рассчитывалось среднее значение.
+
+По итогу всех запусков получилась такая таблица:
+
+| Класс запроса | Время, DPsize | Время, DPhyp | Стоимость, DPsize    | Стоимость, DPhyp    |
+| ------------- | ------------- | ------------ | -------------------- | -------------------- |
+| 1             | 0.00          | 0.00         | 20063.63..20063.64   | 20047.21..20047.22   |
+| 2             | 0.00          | 0.00         | 3917.21..3917.22     | 3865.78..3865.79     |
+| 3             | 0.00          | 0.00         | 16893.51..16893.52   | 16893.07..16893.08   |
+| 4             | 0.00          | 0.00         | 16537.03..16537.04   | 16532.75..16532.76   |
+| 5             | 0.00          | 0.00         | 55136.70..55136.71   | 55110.84..55110.85   |
+| 6             | 0.00          | 0.00         | 9136.23..9136.24     | 8601.80..8601.81     |
+| 7             | 1.30          | 2.00         | 26596.24..26596.25   | 25281.84..25281.85   |
+| 8             | 0.25          | 0.85         | 237500.71..237500.73 | 215342.88..215342.89 |
+| 9             | 1.75          | 1.95         | 121709.02..121709.03 | 118041.88..118041.89 |
+| 10            | 0.23          | 0.30         | 218646.80..218646.81 | 216146.76..216146.77 |
+| 11            | 1.25          | 2.03         | 4264.53..4264.54     | 4263.81..4263.82     |
+| 12            | 1.47          | 2.27         | 18062.07..18062.08   | 17923.86..17923.87   |
+| 13            | 3.28          | 3.73         | 19880.57..19880.58   | 19561.58..19561.60   |
+| 14            | 1.20          | 1.30         | 6675.30..6675.31     | 6675.12..6675.13     |
+| 15            | 4.70          | 6.03         | 140612.22..140612.23 | 105280.24..105280.26 |
+| 16            | 2.03          | 2.30         | 4373.61..4373.62     | 3928.40..3928.41     |
+| 17            | 0.72          | 1.10         | 4526.53..4526.54     | 4073.57..4073.58     |
+| 18            | 0.50          | 1.03         | 36882.96..36882.97   | 33151.67..33151.68   |
+| 19            | 8.35          | 9.23         | 141225.66..141225.67 | 131527.60..131527.61 |
+| 20            | 4.60          | 6.23         | 12982.67..12982.68   | 12976.69..12976.70   |
+| 21            | 4.57          | 5.90         | 3833.12..3833.13     | 3833.12..3833.13     |
+| 22            | 17.55         | 21.00        | 7532.63..7532.64     | 7532.28..7532.29     |
+| 23            | 16.07         | 20.53        | 43981.68..43981.69   | 42108.50..42108.51   |
+| 24            | 47.90         | 56.35        | 6665.46..6665.47     | 6580.84..6580.85     |
+| 25            | 3.73          | 5.30         | 8502.14..8502.15     | 8495.15..8495.16     |
+| 26            | 29.83         | 41.83        | 9324.37..9324.38     | 9237.43..9237.44     |
+| 27            | 42.40         | 69.67        | 1053.48..1053.49     | 1290.69..1290.70     |
+| 28            | 137.20        | 208.17       | 7534.70..7534.71     | 7534.67..7534.68     |
+| 29            | 949.77        | 936.80       | 4013.73..4013.74     | 4013.73..4013.74     |
+| 30            | 38.67         | 61.60        | 9323.59..9323.60     | 9323.59..9323.60     |
+| 31            | 20.83         | 34.00        | 9584.13..9584.14     | 9575.61..9575.62     |
+| 32            | 0.00          | 0.00         | 3880.96..3880.97     | 3838.37..3838.38     |
+| 33            | 165.90        | 216.83       | 3029.91..3029.92     | 2995.14..2995.15     |
+
+Когда я слегка пробежался по таблице, то не поверил своим глазам. Таблица не очень информативная, поэтому лучше посмотреть на график и вы поймете:
+
+![Наглядное сравнение получившихся стоимостей](./img/job_cost_compare.svg)
+
+DPhyp в подавляющем большинстве создает план *лучше*, чем DPsize. Да, время его выполнения больше, но зато план-то лучше, а значит в долгосроке мы выигрываем!
+
+Но что-то здесь явно не так. Как минимум, мы только управляли *порядком* обследуемых отношений, но сами планы не создавали - это на самом PostgreSQL. Значит встроенный планировщик сломан!?
+
+Для чистоты эксперимента, давайте посмотрим, что получается на выходе. Под нож пойдет запрос `6f` (первый попался под руку). Вот, что нам дает DPsize:
+
+```text
+                                                                        QUERY PLAN                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=15215.38..15215.39 rows=1 width=96)
+   ->  Nested Loop  (cost=8.10..15175.34 rows=5339 width=48)
+         ->  Nested Loop  (cost=7.67..12744.50 rows=5339 width=37)
+               Join Filter: (ci.movie_id = t.id)
+               ->  Nested Loop  (cost=7.23..12483.46 rows=147 width=41)
+                     ->  Nested Loop  (cost=6.80..12351.21 rows=270 width=20)
+                           ->  Seq Scan on keyword k  (cost=0.00..3691.40 rows=8 width=20)
+                                 Filter: (keyword = ANY ('{superhero,sequel,second-part,marvel-comics,based-on-comic,tv-special,fight,violence}'::text[]))
+                           ->  Bitmap Heap Scan on movie_keyword mk  (cost=6.80..1079.43 rows=305 width=8)
+                                 Recheck Cond: (k.id = keyword_id)
+                                 ->  Bitmap Index Scan on keyword_id_movie_keyword  (cost=0.00..6.72 rows=305 width=0)
+                                       Index Cond: (keyword_id = k.id)
+                     ->  Index Scan using title_pkey on title t  (cost=0.43..0.49 rows=1 width=21)
+                           Index Cond: (id = mk.movie_id)
+                           Filter: (production_year > 2000)
+               ->  Index Scan using movie_id_cast_info on cast_info ci  (cost=0.44..1.33 rows=36 width=8)
+                     Index Cond: (movie_id = mk.movie_id)
+         ->  Index Scan using name_pkey on name n  (cost=0.43..0.46 rows=1 width=19)
+               Index Cond: (id = ci.person_id)
+(19 rows)
+```
+
+А вот, что дает DPhyp:
+
+```text
+                                                                        QUERY PLAN                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=13720.08..13720.09 rows=1 width=96)
+   ->  Nested Loop  (cost=8.10..13704.27 rows=2108 width=48)
+         ->  Nested Loop  (cost=7.67..12744.50 rows=2108 width=37)
+               Join Filter: (ci.movie_id = t.id)
+               ->  Nested Loop  (cost=7.23..12483.46 rows=147 width=41)
+                     ->  Nested Loop  (cost=6.80..12351.21 rows=270 width=20)
+                           ->  Seq Scan on keyword k  (cost=0.00..3691.40 rows=8 width=20)
+                                 Filter: (keyword = ANY ('{superhero,sequel,second-part,marvel-comics,based-on-comic,tv-special,fight,violence}'::text[]))
+                           ->  Bitmap Heap Scan on movie_keyword mk  (cost=6.80..1079.43 rows=305 width=8)
+                                 Recheck Cond: (k.id = keyword_id)
+                                 ->  Bitmap Index Scan on keyword_id_movie_keyword  (cost=0.00..6.72 rows=305 width=0)
+                                       Index Cond: (keyword_id = k.id)
+                     ->  Index Scan using title_pkey on title t  (cost=0.43..0.49 rows=1 width=21)
+                           Index Cond: (id = mk.movie_id)
+                           Filter: (production_year > 2000)
+               ->  Index Scan using movie_id_cast_info on cast_info ci  (cost=0.44..1.33 rows=36 width=8)
+                     Index Cond: (movie_id = mk.movie_id)
+         ->  Index Scan using name_pkey on name n  (cost=0.43..0.46 rows=1 width=19)
+               Index Cond: (id = ci.person_id)
+(19 rows)
+```
+
+План дешевле на почти на 20000 у.е.! То есть расширение действительно дает план лучше...
+
+Так стоп! Это что такое? Почему **планы идентичные, но стоимости разные**? Различия наступают в 3 узле - `Nested Loop` с `ci.movie_id = t.id` предикатом: DPsize оценивает его в 5339 строк, а DPhyp - в 2108. Как такое вообще могло произойти? Надо найти причину.
+
+Стартовой точкой будет трейсинг запроса, чтобы обнаружить какие подпланы используются для создания этого NL. Это придется делать отладкой вручную, так как нет специальных настроек для подобного (есть макрос `OPTIMIZER_DEBUG`, но он будет выводить уже готовые отношения, а нам нужно проследить порядок выбора, поэтому не подходит).
+
+Для DPsize будет такой порядок:
+
+```text
+{1, 2, 3} {5}
+{1, 3, 5} {2}
+{2, 3, 5} {1}
+{1, 5} {2, 3}
+```
+
+Для DPhyp такой:
+
+```text
+{1} {2, 3, 5}
+{1, 5} {2, 3}
+{1, 3, 5} {2}
+{1, 2, 3} {5}
+```
+
+> Числа - это ID отношений:
+>
+> 1 - `cast_info ci`
+> 2 - `keyword k`
+> 3 - `movie_keyword mk`
+> 5 - `title t`
+
+Несмотря на разницах в порядке следования, обрабатываются одни и те же пары, то есть мы ничего не теряем. Но почему же тогда разная стоимость? Давайте пойдем с другой стороны.
+
+Что это за числа `2108` и `5339` в планах запроса? Если посмотреть в коде, то это поле `rows` у структуры `Path`. А как это поле инициализируется? Если посмотрим в код, то увидим, что `rows` у структуры `Path` инициализируется полем `rows` у `RelOptInfo`. Причем это делается во всех типах узлов плана (небольшая часть примеров):
+
+```c++
+/* https://github.com/postgres/postgres/blob/144ad723a4484927266a316d1c9550d56745ff67/src/backend/optimizer/path/costsize.c#L3375 */
+void
+final_cost_nestloop(PlannerInfo *root, NestPath *path, JoinCostWorkspace *workspace, JoinPathExtraData *extra)
+{
+    /* ... */
+    if (path->jpath.path.param_info)
+        path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
+    else
+        path->jpath.path.rows = path->jpath.path.parent->rows;
+    /* ... */
+}
+
+/* https://github.com/postgres/postgres/blob/144ad723a4484927266a316d1c9550d56745ff67/src/backend/optimizer/path/costsize.c#L3873 */
+void
+final_cost_mergejoin(PlannerInfo *root, MergePath *path, JoinCostWorkspace *workspace, JoinPathExtraData *extra)
+{
+    /* ... */
+    if (path->jpath.path.param_info)
+        path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
+    else
+        path->jpath.path.rows = path->jpath.path.parent->rows;
+    /* ... */
+}
+
+/* https://github.com/postgres/postgres/blob/144ad723a4484927266a316d1c9550d56745ff67/src/backend/optimizer/path/costsize.c#L4305 */
+void
+final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *workspace, JoinPathExtraData *extra)
+{
+    /* ... */
+    if (path->jpath.path.param_info)
+        path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
+    else
+        path->jpath.path.rows = path->jpath.path.parent->rows;
+    /* ... */
+}
+```
+
+Хорошо, а откуда тогда `rows` берется в `RelOptInfo`? Если поискать по коду, то для JOIN мы найдем *единственное* место ее инициализации - `set_joinrel_size_estimates`. И где же он вызывается? В 2 местах: `build_join_rel` - создает *новый* `RelOptInfo` типа JOIN и `build_child_join_rel` - тоже самое, но для наследуемых таблиц (например, сюда попадают партиции). В нашем случае, никаких партиций нет, поэтому используется `build_join_rel`. Финальная черта - и где же в нем выставляется оценка количества строк? Ответ - при *первом создании* структуры вызывается `set_joinrel_size_estimates`, которая выставляет это поле *оценивая по текущей паре* соединяемых отношений.
+
+Короче говоря, оценка возвращаемого количества строк происходит единожды, а дальше мы используем эту оценку во всех случаях. Звучит вполне логично, так как на каждое множество отношений предикаты тоже фиксированы, поэтому количество возвращаемых строк не должно зависеть от физической реализации оператора. Но почему тогда оценка так сильно разнится? Для этого еще раз проведем трейсинг, но на этот раз уже подсчитаем все вызовы и все оценки, которые мы делаем.
+
+Мы построим дерево, узлами которого будут множества отношений, а дочерними узлами - те, из которых создается родитель. Так как в запросе используется только `JOIN INNER`, то формула вычисления количества кортежей проста: `nrows = outer_rows * inner_rows * jselect`:
+
+- `nrows` - итоговое количество кортежей
+- `outer_rows` - количество кортежей во внешней части
+- `inner_rows` - количество кортежей во внутренней части
+- `jselec` - селективность предикатов
+
+Для DPsize этот стек вызовов будет следующим (под множествами написана селективность предикатов, ребра содержат количество кортежей на выходе):
+
+```text
+                     {1, 2, 3, 5}
+                        3.95e-7
+                    /           \
+                9813           1375372
+                 /                   \
+            {1, 2, 3}                {5}
+             7.45e-6              
+            /      \ 
+     164574168      8
+        /            \
+    {1, 3}           {2}
+     1e-6
+    /     \
+36245584  4523930 
+  /          \
+{1}          {3}        
+```
+
+Указанная селективность сильно обрезана, чтобы не занимать много места, так как числа длинные, но даже без этого можно подсчитать, что `9813 * 1375372 * 3.95e-7 = 5332`. Если добавить те разряды, что отбросил, то наберется на ожидаемое число - `5339`.
+
+Теперь посмотрим, что случилось в DPhyp:
+
+```text
+                 {1, 2, 3, 5}
+                    3.95e-7
+                  /         \   
+             36245584        147
+               /               \
+            {1}             {2, 3, 5}
+                              7.45e-6
+                            /        \
+                           8       2461152
+                          /             \
+                        {2}           {3, 5}
+                                      3.95e-7
+                                     /      \
+                                 4523930  1375372
+                                   /          \
+                                 {3}          {5} 
+```
+
+Что и следовало ожидать: `36245584 * 147 * 3.95e-7 = 2104`, что с округлением дает `2108`.
+
+Таким образом, мы нашли исходную проблему - плохой выбор первоначальной оценки. Но действительно ли она плохая? В данном случае да, так как если выполнить запрос, то получим следующие результаты:
+
+```text
+                                                                             QUERY PLAN                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=13720.08..13720.09 rows=1 width=96) (actual time=8753.807..8753.810 rows=1 loops=1)
+   ->  Nested Loop  (cost=8.10..13704.27 rows=2108 width=48) (actual time=0.637..8530.663 rows=785477 loops=1)
+         ->  Nested Loop  (cost=7.67..12744.50 rows=2108 width=37) (actual time=0.623..2643.045 rows=785477 loops=1)
+               Join Filter: (ci.movie_id = t.id)
+               ->  Nested Loop  (cost=7.23..12483.46 rows=147 width=41) (actual time=0.610..405.496 rows=14165 loops=1)
+                     ->  Nested Loop  (cost=6.80..12351.21 rows=270 width=20) (actual time=0.597..140.721 rows=35548 loops=1)
+                           ->  Seq Scan on keyword k  (cost=0.00..3691.40 rows=8 width=20) (actual time=0.143..37.305 rows=8 loops=1)
+                                 Filter: (keyword = ANY ('{superhero,sequel,second-part,marvel-comics,based-on-comic,tv-special,fight,violence}'::text[]))
+                                 Rows Removed by Filter: 134162
+                           ->  Bitmap Heap Scan on movie_keyword mk  (cost=6.80..1079.43 rows=305 width=8) (actual time=0.993..12.278 rows=4444 loops=8)
+                                 Recheck Cond: (k.id = keyword_id)
+                                 Heap Blocks: exact=23488
+                                 ->  Bitmap Index Scan on keyword_id_movie_keyword  (cost=0.00..6.72 rows=305 width=0) (actual time=0.501..0.501 rows=4444 loops=8)
+                                       Index Cond: (keyword_id = k.id)
+                     ->  Index Scan using title_pkey on title t  (cost=0.43..0.49 rows=1 width=21) (actual time=0.007..0.007 rows=0 loops=35548)
+                           Index Cond: (id = mk.movie_id)
+                           Filter: (production_year > 2000)
+                           Rows Removed by Filter: 1
+               ->  Index Scan using movie_id_cast_info on cast_info ci  (cost=0.44..1.33 rows=36 width=8) (actual time=0.008..0.148 rows=55 loops=14165)
+                     Index Cond: (movie_id = mk.movie_id)
+         ->  Index Scan using name_pkey on name n  (cost=0.43..0.46 rows=1 width=19) (actual time=0.007..0.007 rows=1 loops=785477)
+               Index Cond: (id = ci.person_id)
+ Planning Time: 1.419 ms
+ Execution Time: 8753.873 ms
+(24 rows)
+```
+
+В реальности, узел дал 785477 кортежей, и ошибка составляет (кратность):
+
+- DPhyp: 370
+- DPsize: 150
+
+Ошиблись в оценке количества кортежей более чем в 2 раза! Причем в худшую сторону - недосчитались. Но это еще не все.
+
+Вспомните первый пример - запрос с единственным гиперребром. Он планируется очень быстро, но вот если сделать шаг в сторону, например, перенести `t7.x` в правую строну выражения, то мы получим такой план:
+
+```text
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=0.00..215344.72 rows=1594323 width=56)
+   Join Filter: ((((((t1.x + t2.x) + t3.x) + t4.x) + t5.x) + t6.x) > (((((((t7.x + t8.x) + t9.x) + t10.x) + t11.x) + t12.x) + t13.x) + t14.x))
+   ->  Nested Loop  (cost=0.00..93.00 rows=6561 width=32)
+         ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16)
+               ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                     ->  Seq Scan on t7  (cost=0.00..1.03 rows=3 width=4)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                           ->  Seq Scan on t8  (cost=0.00..1.03 rows=3 width=4)
+               ->  Materialize  (cost=0.00..2.23 rows=9 width=8)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                           ->  Seq Scan on t9  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t10  (cost=0.00..1.03 rows=3 width=4)
+         ->  Materialize  (cost=0.00..5.80 rows=81 width=16)
+               ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                           ->  Seq Scan on t11  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t12  (cost=0.00..1.03 rows=3 width=4)
+                     ->  Materialize  (cost=0.00..2.23 rows=9 width=8)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                                 ->  Seq Scan on t13  (cost=0.00..1.03 rows=3 width=4)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                       ->  Seq Scan on t14  (cost=0.00..1.03 rows=3 width=4)
+   ->  Materialize  (cost=0.00..19.94 rows=729 width=24)
+         ->  Nested Loop  (cost=0.00..16.29 rows=729 width=24)
+               ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                           ->  Seq Scan on t2  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t3  (cost=0.00..1.03 rows=3 width=4)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                           ->  Seq Scan on t1  (cost=0.00..1.03 rows=3 width=4)
+               ->  Materialize  (cost=0.00..3.69 rows=27 width=12)
+                     ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                                 ->  Seq Scan on t5  (cost=0.00..1.03 rows=3 width=4)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                       ->  Seq Scan on t6  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t4  (cost=0.00..1.03 rows=3 width=4)
+ Planning Time: 9.477 ms
+(42 rows)
+```
+
+Ну, немного медленнее - 9 мс, вместо 4 мс, но это же все равно быстро. Да, быстро, вот только дело уже не в скорости. Посмотрите, что дает DPsize:
+
+```text
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=0.00..215311.78 rows=1594323 width=56)
+   Join Filter: ((((((t1.x + t2.x) + t3.x) + t4.x) + t5.x) + t6.x) > (((((((t7.x + t8.x) + t9.x) + t10.x) + t11.x) + t12.x) + t13.x) + t14.x))
+   ->  Nested Loop  (cost=0.00..36.36 rows=2187 width=28)
+         ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16)
+               ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                     ->  Seq Scan on t4  (cost=0.00..1.03 rows=3 width=4)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                           ->  Seq Scan on t5  (cost=0.00..1.03 rows=3 width=4)
+               ->  Materialize  (cost=0.00..2.23 rows=9 width=8)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                           ->  Seq Scan on t6  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t7  (cost=0.00..1.03 rows=3 width=4)
+         ->  Materialize  (cost=0.00..3.69 rows=27 width=12)
+               ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                           ->  Seq Scan on t1  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t2  (cost=0.00..1.03 rows=3 width=4)
+                     ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                           ->  Seq Scan on t3  (cost=0.00..1.03 rows=3 width=4)
+   ->  Materialize  (cost=0.00..47.29 rows=2187 width=28)
+         ->  Nested Loop  (cost=0.00..36.36 rows=2187 width=28)
+               ->  Nested Loop  (cost=0.00..5.39 rows=81 width=16)
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                           ->  Seq Scan on t11  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t12  (cost=0.00..1.03 rows=3 width=4)
+                     ->  Materialize  (cost=0.00..2.23 rows=9 width=8)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                                 ->  Seq Scan on t13  (cost=0.00..1.03 rows=3 width=4)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                       ->  Seq Scan on t14  (cost=0.00..1.03 rows=3 width=4)
+               ->  Materialize  (cost=0.00..3.69 rows=27 width=12)
+                     ->  Nested Loop  (cost=0.00..3.56 rows=27 width=12)
+                           ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                                 ->  Seq Scan on t8  (cost=0.00..1.03 rows=3 width=4)
+                                 ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                       ->  Seq Scan on t9  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t10  (cost=0.00..1.03 rows=3 width=4)
+ Planning Time: 3337.097 ms
+(42 rows)
+```
+
+Время планирования действительно гораздо дольше, но внимательнее всмотритесь в план запроса. Первое, что надо заметить - стоимость меньше. За счет чего? А все из-за вот этой неприглядной строчки:
+
+```text
+                     ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
+                           ->  Seq Scan on t6  (cost=0.00..1.03 rows=3 width=4)
+                           ->  Materialize  (cost=0.00..1.04 rows=3 width=4)
+                                 ->  Seq Scan on t7  (cost=0.00..1.03 rows=3 width=4)
+```
+
+Да, DPsize смог *найти неявную связь* между отношениями, даже если они были по разную сторону операндов. DPhyp такого не сделает, так как это разные стороны ребра, а по его правилам, такого делать нельзя - нельзя соединять отдельные узлы разных гиперузлов, если они по разные стороны гиперребра, только все вместе. Из этого можно заключить, что DPhyp - это очень хорошая, но все же эвристика.
+
+## Итоги
+
+Как вы могли догадаться, расширение пока довольно сырое. Из-за того, что существующая инфраструктура заточена под особенности PostgreSQL для реализации одного функционала приходится искать обходные пути, а для другого работает скрипя зубами.
+
+Подытожим недостатки:
+
+1. Теряются некоторые возможные оптимизации - гиперребра создаются из предикатов, которые на данный момент нельзя полностью трансформировать в гиперребра из-за индексов RangeTable, указывающих НЕ на отношения (например, на JOIN'ы)
+2. Несвязные подграфы требуют отдельной обработки - пользователь сам должен говорить расширению как действовать (параметр `cj_strategy`)
+3. Оценка страдает из-за неоптимальных первых аргументов - порядок обрабатываемых пар отношений для JOIN'ов важен, но сейчас он не соотносится с тем, что делает встроенный планировщик
+4. Довольно долгое выполнение - сейчас используется встроенный `make_join_rel`, но он занимает колоссальное количество времени
+
+Но есть и хорошая новость - **все поправимо**. Эти ограничения продиктованы только лишь реализацией, то есть не фундаментальные ограничения. Никто не запрещает нам написать свой `make_join_rel`, оптимизированный под DPhyp. В крайнем случае, мы можем пропатчить ядро и добавить недостающую функциональность. Тем более, мы нашли, как минимум, 1 запрос, который в сотни раз производительнее, что может открыть целую область применимости, а значит работа проделана не зря.
+
+Всем слона.
 
 Ссылки:
 
