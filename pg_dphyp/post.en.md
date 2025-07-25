@@ -893,18 +893,20 @@ Even so, taking the first approach, we should evaluate the consequences, since a
 
 </spoiler>
 
-## Индексирование ребер
+## Hyperedge indexing
 
-Рассказывая о деталях реализации, я упомянул, что сложные ребра сортируются, это помогает избавиться от дубликатов, но есть еще одна польза. Если мы взглянем на некоторые части DPhyp, а конкретно на места, в которых нам необходимо обходить ребра — нахождение соседей и определение связи (ребра) между двумя гиперузлами, — то можно заметить похожий паттерн с идеей кеширования: есть движущиеся детали, а есть постоянные:
+Earlier I have mentioned that complex hyperedges are sorted, to get rid of duplicates. But there is another benefit. If we look at some parts of DPhyp, and specifically at the places where we need to traverse hyperedges — computing neighborhood and determining the connection (edges) between two hypernodes — we can see a similar pattern: there are moving parts, and there are permanent ones:
 
-- при поиске соседей множество исключенных узлов (`excluded`) неизменно (либо только увеличивается);
-- при определении связи между гиперузлами оба гиперузла фиксированы.
+- when searching for neighbors, the set of excluded nodes remains unchanged (or only increases).
+- when determining the connection between hypernodes, both hypernodes in hyperedge are fixed.
 
-Попробуем как-то использовать это знание, и для начала научимся учитывать исключенные узлы. Анализ DPhyp дает понять, что множество исключенных узлов имеет одинаковую структуру: лидирующие единицы, а затем разрозненные элементы, например, `010110011111` — в нем есть пять лидирующих единиц. Это неслучайно, алгоритм так работает: мы не должны смотреть на узлы, которые еще не обрабатывали, поэтому каждый раз при обходе ребер мы проверяем, что никакая часть с этими исключенными не пересекается. Множество исключенных узлов в процессе итерирования может только увеличиться, но не уменьшиться, а это значит, что мы заранее можем знать, какие узлы точно не будут удовлетворять условию, то есть будут пересекаться с этими лидирующими нулями.
+Let's try to use this knowledge somehow, and first we'll learn how to account for excluded nodes. Analysis of DPhyp makes it clear that the set of excluded nodes has the same structure: leading ones, and then sparse elements, for example, `010110011111` — it has 5 leading ones.
 
-Можем сделать вот что — взять все гиперребра и отсортировать их по правой части, а для сравнения использовать количество лидирующих нулей. Затем, во время итерирования, мы вычисляем длину последовательности лидирующих единиц во множестве исключенных и стартовый индекс для итерации ставим таким, чтобы первый элемент правой части ребра точно превышал последний элемент последовательности единиц.
+It's no coincidence, the algorithm works this way: we should not look at nodes that have not yet been processed, so each time we go through the edges, we check that no part intersects with these excluded ones (such constant part is determined in `solve`). The set of excluded nodes during iteration can only increase, but not decrease, which means that we can know in advance which nodes will definitely not satisfy the condition, that is, they will intersect with these leading zeros.
 
-Покажу на примере. У нас имеется несколько отсортированных по количеству лидирующих нулей гиперребер. Справа написал индексы для удобства (левая часть гиперребра не важна, только правая):
+What we can do is take all the hyperedges and sort them depending on the right hypernode, and use the number of leading zeros as comparator. Then, during iteration, we calculate the length of the sequence of leading ones in the set (hypernode we are checking) of excluded ones and set the loop start index so that the first element of the right hypernode of the first hyperedge exactly exceeds the last element of the sequence of ones.
+
+I'll show you an example. We have several hyperedges sorted by the number of leading zeros. I wrote indexes on the right for convenience (the left part of the hyperedge is not important, only the right one, so `xxxxx` is a placeholder):
 
 ```text
 [
@@ -919,31 +921,31 @@ Even so, taking the first approach, we should evaluate the consequences, since a
 ]
 ```
 
-Теперь легко понять, с какого индекса нам стоит начать итерацию в зависимости от того, какое перед нами множество исключенных узлов:
+Now it's easy to figure out which index we should start iterating from, depending on how many excluded nodes we have in front of us:
 
-| `excluded` | стартовый индекс |
-| ---------- | ---------------- |
-| `00100`    | 0                |
-| `00001`    | 2                |
-| `11101`    | 2                |
-| `10011`    | 2                |
-| `00111`    | 7                |
-| `01111`    | 8                |
+| `excluded` | start index |
+| ---------- | ----------- |
+| `00100`    | 0           |
+| `00001`    | 2           |
+| `11101`    | 2           |
+| `10011`    | 2           |
+| `00111`    | 7           |
+| `01111`    | 8           |
 
-Несколько моментов:
+A few points:
 
-1. Мы можем быть уверены только в размере лидирующих единиц, остальная часть для нас — черный ящик. Например, из-за этого в третьем примере итерацию начинаем со второго индекса, хотя видно, что остальная часть полностью исключена.
-2. Для обобщения кода в случае когда нет подходящих ребер мы можем возвращать длину массива (большое число).
+1. We can only be sure of the size of the leading ones - the rest is a black box for us. For example, because of this, in the third example, we start the iteration from `2`, although it is clear that the rest is completely excluded.
+2. To generalize the code when there are no suitable hyperedges, we can return the length of the array (a large number).
 
-Чтобы понять пользу этой оптимизации, вспомните, что все ребра в графе — двунаправленные, то есть для каждого гиперребра мы создаем две пары с обменянными левой и правой частями. Может оказаться, что на какой-то узел ссылается очень большое количество таблиц (например, это таблица фактов, а размерностей у нас 100+), а сама эта таблица имеет самый большой индекс, то есть `excluded` будет включать почти все таблицы. В этом случае нам придется безуспешно проходить по всем сложным ребрам, зная, что это не даст никакого результата.
+To understand the benefits of this optimization, remember that all edges in the graph are bidirectional, that is, for each hyperedge we create two pairs with swapped left and right sides. It may turn out that a very large number of tables refer to the same node (for example, this is a table of facts, and we have 100+ dimensions), and this table itself has the largest index, that is, `excluded` will include almost all tables. In this case, we will have to unsuccessfully go through all the complex edges, knowing that this will not give any result.
 
-Хорошо, а как мы будем получать стартовый индекс? Первое что приходит в голову, когда говорят "отсортированный" — бинарный поиск, но не спешите с выводами. Вспомним, что наше пространство "ключей" (это количество лидирующих нулей/единиц) — дискретное. Начинается оно с нуля и может только увеличиваться (в моем случае есть предел — 64). А что подходит под описание такой структуры? Массив. Под индексом `i` будет храниться первый индекс массива гиперребер, первый элемент правой части (гиперребра) которого не меньше этого `i`.
+Well, how are we going to get the start index? The first thing that comes to mind when someone says "sorted" is binary search - just perform binary search using given hypernode (it's set) as key. But don't rush it. Let's recall that our space of "keys" (the number of leading zeros/ones) is discrete. It starts from zero and can only increment (in my case, there is a limit of 64). And what fits the description of such a structure? Array! This array will store hyperedge at index `i`, if it's right hypernode constans at least `i` leading zeros.
 
-А что делать с пробелами? В примере после `00111` сразу идет `00100`, без `00010`. Эти пробелы мы заполняем предыдущим значением, то есть если для какой-то длины `i` я не знаю, с какого индекса мне лучше начать итерацию, то нужно взять предыдущий индекс, так как если мой первый элемент `i`, то я буду удовлетворять и всем последовательностям исключенных длиной меньше этого `i`. За базу мы возьмем индекс `0`, то есть если такой последовательности исключенных узлов нет, то ее значение будет `0`, так как в этом случае мы должны проитерироваться по всем гиперребрам.
+What about the gaps? In the example, `00111` is followed by `00100`, without any `00010`. We fill in these gaps with the previous value (index), that is, if for a certain length of `i` I do not know which index we should start the iteration from, then we need to take the previous index - index that was used for `i - 1`. We will take the index `0` as the base, that is, if there is no such sequence of excluded nodes, then its value will be `0`, since in this case we must iterate over all hyperedges.
 
-Затраты на использование такого индекса равны только расчету количества лидирующих единиц во множестве исключенных узлов. Но это можно оптимизировать простым битовым трюком — прибавляем `1` и получаем последовательность из `0` такой же длины, но оканчивающуюся на `1`, а затем рассчитываем позицию этой единицы. Получить это значение можно специальной инструкцией, например, `POPCNT`.
+The cost of using such an index is only equal to calculating the number of leading units in the set of excluded nodes. But this can be optimized with a simple bit trick — we add `1` and get a sequence of `0` of the same length, but ending in `1`, and then calculate the position of this "1". You can get this value using a special instruction, for example, `POPCNT` (it is used in PostgreSQL). So, time complexity for this index is `O(1)`.
 
-Для ребер из примера мы можем построить такой индекс (индекс массива ребер справа):
+For the edges from the example, we can build such an index (the index of the array of edges on the right):
 
 ```text
 [
@@ -956,11 +958,13 @@ Even so, taking the first approach, we should evaluate the consequences, since a
 ]
 ```
 
-Размер этого индекса зависит только от максимального количества лидирующих `0` во всем массиве ребер. Для примера видно, что я мог бы создать массив только из четырех элементов, а дальше всегда возвращать `8` (как размер массива).
+The size of this index depends only on the maximum number of leading `0` edges in the entire array. For example, you can see that I could create an array of only four elements, and then always return `8` (as the size of the array).
 
-Мы научились быстро отсекать ненужные ребра при поиске соседей. Но по ребрам мы ходим также для определения связанности двух гиперузлов. Можно ли использовать этот индекс и здесь? Да, можно. Два гиперузла соединены, когда есть гиперребро, левая часть которого — подмножество левого гиперузла, а правая часть — правого. Гиперузлы на входе никак не меняются, точно так же, как и множество исключенных. А теперь надо заметить, что правая часть гиперребра точно не будет подмножеством, если в этой части есть элементы, индекс которых меньше, чем наименьший в гиперузле справа. Пример: правая часть гиперребра `001010` никак не будет подмножеством гиперузла `001100`, поскольку в ребре есть элемент с индексом 2. То есть семантика здесь практически та же, что и в случае исключенного множества, — мы должны исключать все ребра, у которых есть элементы меньше наименьшего элемента правого гиперузла.
+> Of course, there is a problem with sparse sets, i.e. when right hypernode is `{1, 1000}`. Such arrays waste too much memory. We can fix this by using sparse arrays, but I don't think that this is a very big problem for now.
 
-Вычисление стартового индекса находится в функции `get_start_index`. Для удобства на вход она принимает не готовый индекс, а множество исключенных узлов. Эта функция также используется при определении связанности двух гиперузлов: надо просто перед передачей аргумента из множества, представляющего правое гиперребро, вычесть единицу, тогда последовательность нулей обратно станет последовательностью единиц, что по требуемой семантике — одно и то же.
+We have learned how to quickly cut off unnecessary edges when searching for neighbors. But we also use edges to determine the connectivity of two hypernodes. Is it possible to use this index here? Yes, we can. Two hypernodes are connected when there is a hyperedge, the left part of which is a subset of the left hypernode, and the right part is the subset of right one. The hypernodes for which we must find connectivity do not change during iterations, just like the excluded set. And now it should be noted that the right part of the hyperedge will definitely not be a subset if there are elements in this part whose index is less than the smallest in the hypernode on the right. Example: the right side of the hyperedge is `001010` and never be a subset of the hypernode `001100`, since there is an element with index 2 in the edge. That is, the semantics here are practically the same as in the case of an excluded set — we must exclude all edges that have elements smaller than the smallest element of the right hypernode.
+
+The calculation of the starting index is in the `get_start_index` function. For convenience, it accepts not a ready-made node index (minimal) as input, but a set of excluded nodes. This function is also used to determine the connectivity of two hypernodes: you just need to subtract "1" from the set representing the right hypernode before passing the argument, then the sequence of "0" will become a sequence of "1" back, which is the same thing according to the semantics.
 
 ```c++
 static int
@@ -979,13 +983,13 @@ get_start_index(EdgeArray *edges, bitmapword excluded)
 }
 ```
 
-## Определение сложности запроса
+## Query complexity
 
-Итак, PostgreSQL использует 2 алгоритма: DPsize и GEQO, причем последний используется, если в запросе таблиц больше, чем значение параметра `geqo_threshold`. Но почему именно количество таблиц? Дело в том, что сложность DPsize определяется количеством таблиц — мы безусловно будем рассматривать все возможные комбинации. Но с DPhyp все обстоит иначе, его сложность зависит от самого графа запроса. В оригинальной статье сравниваются производительности алгоритмов на некоторых типах запросов, но они не дают прямого ответа на то, как определять сложность запроса (а может, я проглядел). Этот ответ приводится в другой статье — ["Adaptive Optimization of Large Join Queries"](https://db.in.tum.de/~radke/papers/hugejoins.pdf).
+So, PostgreSQL uses 2 algorithms: DPsize and GEQO, and the latter is used if the table query has more than the value of the `geqo_threshold` parameter. But why exactly the *number of tables*? The fact is that the complexity of DPsize is determined by the number of tables — we will certainly consider all possible combinations. But with DPhyp, everything is different, its complexity depends on the shape of query graph. The original paper compares the performance of algorithms on some types of queries (chain, cliques, etc...), but they do not provide a direct answer on how to determine the complexity of a query (or maybe I overlooked it). This answer is given in another paper — ["Adaptive Optimization of Large Join Queries"](https://db.in.tum.de/~radke/papers/hugejoins.pdf).
 
-Автор этой статьи предлагает метаалгоритм, который, комбинируя несколько разных алгоритмов JOIN'а, позволяет создать планы запросов с количеством таблиц в несколько тысяч. В простых запросах авторы предлагают использовать DPhyp, но что такое простой запрос? Например, если в запросе 100 таблиц, то это не значит, что DPhyp с ним не справится. Если граф запроса представляет простую цепочку, например, все предикаты в форме `Ti.x OP T(i + 1).x`, то план для него найти несложно, но вот если это клика (каждый с каждым), то даже 15 таблиц — это уже много. Для DPhyp сложность надо определять не в количестве таблиц, а в сложности графа запроса — **количестве связных подграфов**. Значение в 10000 связных подграфов — как предел эффективности запроса, это соответствует примерно 14 таблицам в клике.
+The authors of this paper propose a meta-algorithm that, by combining several different JOIN algorithms, allows you to build query plans for several thousand tables. For simple queries, the authors suggest using DPhyp, but what is a simple query? For example, if there are 100 tables in a query, this does not mean that DPhyp cannot handle it. If the query graph is a simple chain, for example (all predicates are in the form `Ti.x OP T(i + 1).x`) then it's not difficult to find a plan for it, but if it's a clique (each joins with each other), then even 15 tables is too much. For DPhyp, complexity should be determined not in the number of tables, but in the complexity of the query graph — *the number of connected subgraphs*. A value of 10000 connected subgraphs is the limit of query efficiency, which corresponds to about 14 tables in clique.
 
-В этой же самой статье не только предлагается идея, но также и функция для вычисления количества связных подграфов. Посмотрев на нее, я понял: она идеально ложится на схему кеширования, описанную выше. Вот эта функция:
+The same article not only suggests an idea, but also a function for calculating the number of connected subgraphs - `countCC`. When I looked at her, I realized: it fits perfectly fits the caching scheme described above. Without further interruptions, the ready code:
 
 ```c++
 static uint64
@@ -1039,13 +1043,13 @@ count_cc(DPHypContext *context, uint64 max)
 }
 ```
 
-Названия функций я оставил теми же, что и в статье, но адаптировал сигнатуру для поддержки эффективного итерирования по соседям.
+I have kept the names of the functions the same as in the article, but adapted the signature to support efficient iteration across neighbors.
 
-Бонус: количество связных подграфов — это размер результирующей DP-таблицы. Сейчас это значение используется для ее предварительной аллокации.
+Bonus: The number of connected subgraphs is the size of the resulting DP table. Now this value is used for its preliminary hash-table allocation.
 
-## Тестирование
+## Testing
 
-Проверим все вначале на каком-нибудь простом запросе:
+Let's check everything first on some simple query.:
 
 ```sql
 EXPLAIN ANALYZE
@@ -1055,7 +1059,7 @@ WHERE
     t1.x + t2.x + t3.x + t4.x + t5.x + t6.x + t7.x > t8.x + t9.x + t10.x + t11.x + t12.x + t13.x + t14.x;
 ```
 
-Это 14 таблиц, соединенных одним гиперребром: `{t1, t2, t3, t4, t5, t6, t7} - {t8, t9, t10, t11, t12, t13, t14}`. Каждая таблица — одноколоночная, с тремя значениями (чтобы запрос долго не выполнялся). Для DPsize результат следующий:
+These are 14 tables connected by a single hyperline: `{t1, t2, t3, t4, t5, t6, t7} - {t8, t9, t10, t11, t12, t13, t14}`. Each table is a single—column table with three values (so that the query does not run for a long time). For DPsize, the result is as follows:
 
 ```text
                                                                   QUERY PLAN                                   
@@ -1107,7 +1111,7 @@ WHERE
 (44 rows)
 ```
 
-На планирование ушло 3 секунды, хотя на выполнение — меньше 1.5 секунд. Что нам даст DPhyp:
+It took 3 seconds for planner, although it took less than 1.5 seconds to complete. What will DPhyp give us?:
 
 ```text
                                                                   QUERY PLAN                                   
@@ -1159,63 +1163,66 @@ WHERE
 (44 rows)
 ```
 
-**4 миллисекунды**! При этом планы идентичные — прирост производительности почти в **600 раз**!
+**4 milliseconds**! At the same time, the plans are identical — an increase in productivity of almost **600 times**!
 
-Но это всего лишь небольшой запрос, давайте теперь возьмем что-то посолиднее. Возьмем к примеру готовый JOB (Join Order Benchmark), представленный в работе ["How Good Are Query Optimizers, Really?"](https://vldb.org/pvldb/vol9/p204-leis.pdf) и использованный для сравнения планировщиков нескольких СУБД, включая сам PostgreSQL. Бенчмарк можно найти в [этом репозитории](https://github.com/gregrahn/join-order-benchmark).
+But this is just a small query, let's take something more serious - JOB (Join Order Benchmark) presented in ["How Good Are Query Optimizers, Really?"](https://vldb.org/pvldb/vol9/p204-leis.pdf). It was used to compare planners of several databases, including PostgreSQL. The benchmark can be found in [this repository](https://github.com/gregrahn/join-order-benchmark).
 
-> В самой работе производилось сравнение не скорости работы планировщика, а оценок, которые он дает. Использовались несложные запросы — это INNER equi-JOIN'ы (т. е. условия JOIN — только равенство), однако для оценки реальной производительности следует использовать самые различные нагрузки, включая всякие сложные `LEFT JOIN`, но пока этого достаточно.
+> In the paper, authors compared planner estimations, not planning time, so simple queries were used — these are INNER equi-JOINS (i.e., the JOIN conditions are only equality). A wide variety of loads should be used to evaluate real performance, including all kinds of complex outer joins, but for now this is good enough.
 
-Как производилось тестирование:
+How the testing was performed:
 
-- замер времени производился с помощью простенького расширения, которое замеряло время выполнения `join_search_hook`;
-- после заливки данных итоговый размер БД — чуть больше 8Гб;
-- всего имелось 113 запросов, но на самом деле их 33, все остальные суть вариации с различными константами. Для тестов каждый запрос запускался десять раз и рассчитывалось среднее время его выполнения, а затем, чтобы "шуметь", результаты одних и тех же классов запросов (с разными константами) группировались и рассчитывалось среднее значение.
+- the time was measured using a simple extension that measured the execution time of `join_search_hook`.
+- after feeding the database, the final size is slightly more than 8GB (IMDB dataset).
 
-По итогу всех запусков получилась такая таблица:
+There were 113 queries in total, but actually there are 33 queries - all the others are variations with different constants. For the tests, each query was run 10 times and the average execution time was calculated, and then, in order not to "make noise", the results of the same query classes (with different constants) were grouped and the average value was calculated.
 
-| Класс запроса | Время, DPsize | Время, DPhyp | Стоимость, DPsize    | Стоимость, DPhyp     |
-| ------------- | ------------- | ------------ | -------------------- | -------------------- |
-| 1             | 0.00          | 0.00         | 20063.63..20063.64   | 20047.21..20047.22   |
-| 2             | 0.00          | 0.00         | 3917.21..3917.22     | 3865.78..3865.79     |
-| 3             | 0.00          | 0.00         | 16893.51..16893.52   | 16893.07..16893.08   |
-| 4             | 0.00          | 0.00         | 16537.03..16537.04   | 16532.75..16532.76   |
-| 5             | 0.00          | 0.00         | 55136.70..55136.71   | 55110.84..55110.85   |
-| 6             | 0.00          | 0.00         | 9136.23..9136.24     | 8601.80..8601.81     |
-| 7             | 1.30          | 2.00         | 26596.24..26596.25   | 25281.84..25281.85   |
-| 8             | 0.25          | 0.85         | 237500.71..237500.73 | 215342.88..215342.89 |
-| 9             | 1.75          | 1.95         | 121709.02..121709.03 | 118041.88..118041.89 |
-| 10            | 0.23          | 0.30         | 218646.80..218646.81 | 216146.76..216146.77 |
-| 11            | 1.25          | 2.03         | 4264.53..4264.54     | 4263.81..4263.82     |
-| 12            | 1.47          | 2.27         | 18062.07..18062.08   | 17923.86..17923.87   |
-| 13            | 3.28          | 3.73         | 19880.57..19880.58   | 19561.58..19561.60   |
-| 14            | 1.20          | 1.30         | 6675.30..6675.31     | 6675.12..6675.13     |
-| 15            | 4.70          | 6.03         | 140612.22..140612.23 | 105280.24..105280.26 |
-| 16            | 2.03          | 2.30         | 4373.61..4373.62     | 3928.40..3928.41     |
-| 17            | 0.72          | 1.10         | 4526.53..4526.54     | 4073.57..4073.58     |
-| 18            | 0.50          | 1.03         | 36882.96..36882.97   | 33151.67..33151.68   |
-| 19            | 8.35          | 9.23         | 141225.66..141225.67 | 131527.60..131527.61 |
-| 20            | 4.60          | 6.23         | 12982.67..12982.68   | 12976.69..12976.70   |
-| 21            | 4.57          | 5.90         | 3833.12..3833.13     | 3833.12..3833.13     |
-| 22            | 17.55         | 21.00        | 7532.63..7532.64     | 7532.28..7532.29     |
-| 23            | 16.07         | 20.53        | 43981.68..43981.69   | 42108.50..42108.51   |
-| 24            | 47.90         | 56.35        | 6665.46..6665.47     | 6580.84..6580.85     |
-| 25            | 3.73          | 5.30         | 8502.14..8502.15     | 8495.15..8495.16     |
-| 26            | 29.83         | 41.83        | 9324.37..9324.38     | 9237.43..9237.44     |
-| 27            | 42.40         | 69.67        | 1053.48..1053.49     | 1290.69..1290.70     |
-| 28            | 137.20        | 208.17       | 7534.70..7534.71     | 7534.67..7534.68     |
-| 29            | 949.77        | 936.80       | 4013.73..4013.74     | 4013.73..4013.74     |
-| 30            | 38.67         | 61.60        | 9323.59..9323.60     | 9323.59..9323.60     |
-| 31            | 20.83         | 34.00        | 9584.13..9584.14     | 9575.61..9575.62     |
-| 32            | 0.00          | 0.00         | 3880.96..3880.97     | 3838.37..3838.38     |
-| 33            | 165.90        | 216.83       | 3029.91..3029.92     | 2995.14..2995.15     |
+Finally we got the following table:
 
-Когда я слегка пробежался по таблице, то не поверил своим глазам. Давайте посмотрим в виде графика:
+| Query class | Time, DPsize | Time, DPhyp | Cost, DPsize         | Cost, DPhyp          |
+| ----------- | ------------ | ----------- | -------------------- | -------------------- |
+| 1           | 0.00         | 0.00        | 20063.63..20063.64   | 20047.21..20047.22   |
+| 2           | 0.00         | 0.00        | 3917.21..3917.22     | 3865.78..3865.79     |
+| 3           | 0.00         | 0.00        | 16893.51..16893.52   | 16893.07..16893.08   |
+| 4           | 0.00         | 0.00        | 16537.03..16537.04   | 16532.75..16532.76   |
+| 5           | 0.00         | 0.00        | 55136.70..55136.71   | 55110.84..55110.85   |
+| 6           | 0.00         | 0.00        | 9136.23..9136.24     | 8601.80..8601.81     |
+| 7           | 1.30         | 2.00        | 26596.24..26596.25   | 25281.84..25281.85   |
+| 8           | 0.25         | 0.85        | 237500.71..237500.73 | 215342.88..215342.89 |
+| 9           | 1.75         | 1.95        | 121709.02..121709.03 | 118041.88..118041.89 |
+| 10          | 0.23         | 0.30        | 218646.80..218646.81 | 216146.76..216146.77 |
+| 11          | 1.25         | 2.03        | 4264.53..4264.54     | 4263.81..4263.82     |
+| 12          | 1.47         | 2.27        | 18062.07..18062.08   | 17923.86..17923.87   |
+| 13          | 3.28         | 3.73        | 19880.57..19880.58   | 19561.58..19561.60   |
+| 14          | 1.20         | 1.30        | 6675.30..6675.31     | 6675.12..6675.13     |
+| 15          | 4.70         | 6.03        | 140612.22..140612.23 | 105280.24..105280.26 |
+| 16          | 2.03         | 2.30        | 4373.61..4373.62     | 3928.40..3928.41     |
+| 17          | 0.72         | 1.10        | 4526.53..4526.54     | 4073.57..4073.58     |
+| 18          | 0.50         | 1.03        | 36882.96..36882.97   | 33151.67..33151.68   |
+| 19          | 8.35         | 9.23        | 141225.66..141225.67 | 131527.60..131527.61 |
+| 20          | 4.60         | 6.23        | 12982.67..12982.68   | 12976.69..12976.70   |
+| 21          | 4.57         | 5.90        | 3833.12..3833.13     | 3833.12..3833.13     |
+| 22          | 17.55        | 21.00       | 7532.63..7532.64     | 7532.28..7532.29     |
+| 23          | 16.07        | 20.53       | 43981.68..43981.69   | 42108.50..42108.51   |
+| 24          | 47.90        | 56.35       | 6665.46..6665.47     | 6580.84..6580.85     |
+| 25          | 3.73         | 5.30        | 8502.14..8502.15     | 8495.15..8495.16     |
+| 26          | 29.83        | 41.83       | 9324.37..9324.38     | 9237.43..9237.44     |
+| 27          | 42.40        | 69.67       | 1053.48..1053.49     | 1290.69..1290.70     |
+| 28          | 137.20       | 208.17      | 7534.70..7534.71     | 7534.67..7534.68     |
+| 29          | 949.77       | 936.80      | 4013.73..4013.74     | 4013.73..4013.74     |
+| 30          | 38.67        | 61.60       | 9323.59..9323.60     | 9323.59..9323.60     |
+| 31          | 20.83        | 34.00       | 9584.13..9584.14     | 9575.61..9575.62     |
+| 32          | 0.00         | 0.00        | 3880.96..3880.97     | 3838.37..3838.38     |
+| 33          | 165.90       | 216.83      | 3029.91..3029.92     | 2995.14..2995.15     |
 
-![Наглядное сравнение получившихся стоимостей](https://raw.githubusercontent.com/ashenBlade/habr-posts/master/pg_dphyp/img/job_cost_compare.svg)
+When I ran through the table a bit, I couldn't believe. Let's look at it as a bar plot.
 
-DPhyp в подавляющем большинстве создает план *лучше*, чем DPsize. Да, время его выполнения больше, но зато план-то лучше, а значит в долгосроке мы выигрываем!
+# TODO: картинко перевод
 
-Однако что-то здесь явно не так. Как минимум, мы только управляли *порядком* обследуемых отношений, но сами планы-то не создавали, это на самом PostgreSQL. Так что же, встроенный планировщик сломан? Для чистоты эксперимента давайте посмотрим, что получается на выходе. "Под нож" пойдет запрос `6f` (попался под руку). Вот что нам дает DPsize:
+![Visual comparison of costs](https://raw.githubusercontent.com/ashenBlade/habr-posts/master/pg_dphyp/img/job_cost_compare.svg)
+
+DPhyp overwhelmingly creates a plan *better* than DPsize. Yes, the time to complete it is a little bit longer, but the plan is better, which means that we win in the long run!
+
+However, something is clearly wrong here. At least, we only managed the *join order* of the relations, but we didn't create the plans ourselves - it's up to PostgreSQL. So does vanilla planner misbehave? Let's look at the output manually and see what happened. We will examine `6f` query. That's what DPsize gives us:
 
 ```text
                                                                         QUERY PLAN                                           
@@ -1242,7 +1249,7 @@ DPhyp в подавляющем большинстве создает план *
 (19 rows)
 ```
 
-А вот что дает DPhyp:
+And that's for DPhyp:
 
 ```text
                                                                         QUERY PLAN                                         
@@ -1269,11 +1276,11 @@ DPhyp в подавляющем большинстве создает план *
 (19 rows)
 ```
 
-План дешевле на почти на 20000 у.е.! То есть расширение действительно дает план лучше... Но стоп! **планы идентичные, но стоимости разные**? Различия наступают в третьем узле — `Nested Loop` с `ci.movie_id = t.id` предикатом: DPsize оценивает его в 5339 строк, а DPhyp — в 2108. Как такое вообще могло произойти? Надо найти причину.
+The plan is cheaper by almost 2000 units! That is, the expansion really gives you a better plan... Stop! **the plans are identical, but the costs are different**? The differences occur in the third node, the `Nested Loop` with `ci.movie_id = t.id` predicate: DPsize evaluates it to `5339` rows, and DPhyp evaluates it to `2108`. How could this even happen? We need to find this out.
 
-Стартовой точкой будет трейсинг запроса, чтобы обнаружить, какие подпланы используются для создания этого NL. Придется делать это отладкой вручную, ведь для подобного нет специальных настроек (есть макрос `OPTIMIZER_DEBUG`, но он будет выводить уже готовые отношения, а нам нужно проследить порядок выбора, поэтому не подходит).
+The starting point will be query tracing to discover which subplans are used to create this NL. We will have to do this manually using debugger, because there are no special settings for this (there is a macro `OPTIMIZER_DEBUG`, but it will output ready-made relations, but we have to follow order of which relations used to create final, so it is not suitable).
 
-Для DPsize порядок будет таким:
+For DPsize, the order will be as follows:
 
 ```text
 {1, 2, 3} {5}
@@ -1282,7 +1289,7 @@ DPhyp в подавляющем большинстве создает план *
 {1, 5} {2, 3}
 ```
 
-Для DPhyp — таким:
+For DPhyp — like this:
 
 ```text
 {1} {2, 3, 5}
@@ -1291,14 +1298,14 @@ DPhyp в подавляющем большинстве создает план *
 {1, 2, 3} {5}
 ```
 
-> Числа - это ID отношений:
+> Numbers are IDs of relations:
 >
 > 1 - `cast_info ci`
 > 2 - `keyword k`
 > 3 - `movie_keyword mk`
 > 5 - `title t`
 
-Несмотря на разницу в порядке следования, обрабатываются одни и те же пары, то есть мы ничего не теряем. Но почему же тогда разная стоимость? Давайте зайдем с другой стороны — что это за числа `2108` и `5339` в планах запроса? Если посмотреть в коде, то это поле `rows` у структуры `Path`. А как это поле инициализируется? В коде же мы увидим, что `rows` у структуры `Path` инициализируется полем `rows` у `RelOptInfo`, причем это делается во всех типах узлов плана (небольшая часть примеров):
+Despite the difference in order, the same pairs are processed, meaning we don't lose anything. But why the different cost then? Let's look at the other side — what are these numbers `2108` and `5339` in the query plans, where do they come from? If you look in the code, this is the `rows` field in the `Path` structure. How is this member initialized? In the code, we will see that the `rows` of the `Path` structure is initialized by the `rows` field of `RelOptInfo`, and this is done in all types of plan nodes (examples are all JOIN nodes):
 
 ```c++
 /* https://github.com/postgres/postgres/blob/144ad723a4484927266a316d1c9550d56745ff67/src/backend/optimizer/path/costsize.c#L3375 */
@@ -1338,14 +1345,16 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *worksp
 }
 ```
 
-Хорошо, а откуда тогда `rows` берется в `RelOptInfo`? Если поискать по коду, то для JOIN мы найдем *единственное* место ее инициализации — `set_joinrel_size_estimates`. Вызывается он в двух местах: `build_join_rel` — создает *новый* `RelOptInfo` типа JOIN и `build_child_join_rel` — то же самое, но для наследуемых таблиц (например, сюда попадают партиции). В нашем случае никаких партиций нет, поэтому используется `build_join_rel`. Финальная черта — где же в нем выставляется оценка количества строк? Ответ — при *первом создании* структуры вызывается `set_joinrel_size_estimates`, которая выставляет это поле, *оценивая по текущей паре* соединяемых отношений. Другими словами, оценка возвращаемого количества строк происходит единожды, а дальше мы используем эту оценку во всех случаях. Звучит вполне логично, так как на каждое множество отношений предикаты тоже фиксированы, поэтому количество возвращаемых строк не должно зависеть от физической реализации оператора. Но почему же тогда оценка так сильно разнится? Для этого еще раз проведем трейсинг, но на этот раз подсчитаем все вызовы и все оценки, которые мы делаем. Построим дерево, узлами которого будут множества отношений, а дочерними узлами — те, из которых создается родитель. Так как в запросе используется только `JOIN INNER`, формула вычисления количества кортежей будет такова: `nrows = outer_rows * inner_rows * jselect`:
+Okay, then where does `rows` come from in `RelOptInfo`? If we search through the code, then for JOIN we will find the *only* place of its initialization — `set_joinrel_size_estimates`. It is called in two places: `build_join_rel` to create a *new* JOIN `RelOptInfo` and `build_child_join_rel` — the same thing, but for inherited tables (i.e. partitions fall here). In our case, there are no partitions, so `build_join_rel` is used. So where does it estimate the number of rows? The answer is that when *creating* the structure for the first time `set_joinrel_size_estimates` is called, which sets this field, *evaluating by the current pair* of the connected relations. In other words, the estimate of the returned number of rows occurs once, and then we use this estimate in all cases. It sounds quite logical, since predicates are also fixed for each set of relations, so the number of rows returned by this set of relations should not depend on the physical implementation of the operators.
 
-- `nrows` — итоговое количество кортежей;
-- `outer_rows` — количество кортежей во внешней части;
-- `inner_rows` — количество кортежей во внутренней части;
-- `jselec` — селективность предикатов.
+But then why does the estimate vary so much? To do this, we will do the tracking again, but this time we will track all the invocations and all the estimates that we make. Let's build a tree, the nodes of which will be sets of relations, and the child nodes will be those from which the parent is created. Since only the `JOIN INNER` is used in the query, the formula for calculating the number of tuples will be as follows: `nrows = outer_rows * inner_rows * jselect`:
 
-Для DPsize стек вызовов будет следующим (под множествами написана селективность предикатов, ребра содержат количество кортежей на выходе):
+- `nrows` — total number of tuples;
+- `outer_rows` — number of tuples in outer (left) part;
+- `inner_rows` — number of tuples in inner (right) part;
+- `jselec` — predicates selectivity.
+
+For DPsize, the call stack will be as follows (predicate selectivity is written under sets, edges contain the number of tuples at the output):
 
 ```text
                      {1, 2, 3, 5}
@@ -1366,9 +1375,9 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *worksp
 {1}          {3}  
 ```
 
-Указанная селективность сильно обрезана, чтобы не занимать много места, так как числа длинные, но даже без этого можно подсчитать, что `9813 * 1375372 * 3.95e-7 = 5332`. Если добавить отброшенные разряды, наберется на ожидаемое число — `5339`.
+The specified selectivity is trimmed in order not to take up much space, since the numbers are long, but even without this, it can be seen that `9813 * 1375372 * 3.95 e-7 = 5332`. If you add the dropped digits, it will be typed to the expected number — `5339`.
 
-Теперь посмотрим, что случилось в DPhyp:
+Now let's see what happened in DPhyp:
 
 ```text
                  {1, 2, 3, 5}
@@ -1389,9 +1398,9 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *worksp
                                  {3}          {5} 
 ```
 
-Что и следовало ожидать: `36245584 * 147 * 3.95e-7 = 2104`, с округлением это дает `2108`.
+`36245584 * 147 * 3.95 e-7 = 2104`, with ceiling gives us `2108`.
 
-Итак, мы нашли исходную проблему — плохой выбор первоначальной оценки. Действительно ли она плоха? В данном случае да, так как если выполнить запрос, то получим следующие результаты:
+So, we found the original problem — a incorrect initial estimations. Is it really bad? In our case, yes, because if we run the query, we will get the following results:
 
 ```text
                                                                              QUERY PLAN                                             
@@ -1423,12 +1432,12 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *worksp
 (24 rows)
 ```
 
-В реальности узел дал 785477 кортежей, и ошибка составляет (кратность):
+In reality, that node gave 785477 tuples, and the error is (multiplicity):
 
 - DPhyp: 370;
 - DPsize: 150.
 
-Ошиблись в оценке количества кортежей более чем в два раза, причем в худшую сторону — недосчитались. Но и это еще не все. Вспомните первый пример — запрос с единственным гиперребром. Он планируется очень быстро, но вот если сделать шаг в сторону, например, перенести `t7.x` в правую строну выражения, мы получим такой план:
+We made a mistake in estimating the number of tuples by more than two times, and for the worse — underestimation. But that's not all. Remember the first example, a query with a single hyperedge. It is planned very quickly, but if we change something a little bit, for example, move `t7.x` to the right side of the binary predicate, we will get such a plan:
 
 ```text
 -----------------------------------------------------------------------------------------------------------------------------------------------
@@ -1477,7 +1486,7 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *worksp
 (42 rows)
 ```
 
-Да, немного медленнее — 9 мс вместо 4 мс, но ведь это все равно быстро. Да, быстро, только вот дело уже не в скорости. Посмотрите, что дает DPsize:
+Yes, it's a little slower — 9ms instead of 4ms, but it's still fast. Yes, it's fast, but it's not about speed anymore. See what DPsize gives you:
 
 ```text
                                                                   QUERY PLAN                                   
@@ -1527,7 +1536,7 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *worksp
 (42 rows)
 ```
 
-Время планирования действительно гораздо дольше, но внимательнее всмотритесь в план запроса. Первое, что надо заметить, — стоимость меньше. Взгляните, за счет чего:
+The planning time is indeed much longer, but take a closer look at the query plan. The first thing to notice is that the cost is lower. Take a look at why:
 
 ```text
                      ->  Nested Loop  (cost=0.00..2.18 rows=9 width=8)
@@ -1536,9 +1545,11 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path, JoinCostWorkspace *worksp
                                  ->  Seq Scan on t7  (cost=0.00..1.03 rows=3 width=4)
 ```
 
-Да, DPsize смог *найти неявную связь* между отношениями, даже если они были по разную сторону операндов. DPhyp такого не сделает, так как это разные стороны ребра, а по его правилам такое делать запрещено — нельзя соединять отдельные узлы разных гиперузлов, если они по разные стороны гиперребра, только все вместе. Из этого можно заключить, что DPhyp — это очень хорошая, но все же *эвристика*. Но, к сожалению, и это не все проблемы.
+Yes, DPsize was able to *find an implicit connection* between the relations, even if they were on different sides of the operands. DPhyp will not do this, since these are different sides of an edge, and according to its logic it is forbidden to do this — you cannot connect separate nodes of different hypernodes if they are on different sides of a hyperedge. From this we can conclude that DPhyp is a very good, but *heuristic*. Unfortunately, these are not all the problems.
 
 Для создания гиперребер используется три различных источника, но они не покрывают всех вариантов. Проблема кроется в `joinclauses`. Во время работы PostgreSQL создает все возможные варианты выражения с разным набором необходимых отношений левой и правой части. Это позволяет рассмотреть разные варианты расположения выражения в дереве. Проблема в том, что используемые там индексы отношений могут относиться не к таблицам, а к индексам узлов JOIN (`RangeTblEntry` типа `RTE_JOIN`). И они там не просто так, они "подсказывают" планировщику, какие отношения можно использовать и как переопределить отношения. Для понимания посмотрим на такой запрос (взят из регресс-тестов самого PostgreSQL):
+
+3 different sources are used to create hyperedgegs, but they do not cover all the possible cases. The problem lies in the `joinclauses`. During operation, PostgreSQL creates all possible variants of an expression with a different set of necessary relations of the left and right sides. This allows you to consider different options for the location of the expression in the tree. The problem is that the relation IDs used there may refer not to tables, but to indexes of JOIN nodes (`RangeTblEntry` of type `RTE_JOIN`). And they are there for a reason - to "tell" the planner which relations can be used and how to reorder them. To understand, let's look at such a query (taken from the regression tests of PostgreSQL itself):
 
 ```sql
 select t1.* from
@@ -1553,13 +1564,13 @@ select t1.* from
   on (i8.q2 = i4.f1);
 ```
 
-Проблемным здесь является предикат `i8.q2 = i4.f1` — для него хранится *три* копии с разным набором отношений левой и правой части:
+The problematic predicate here is `i8.q2 = i4.f1` — it stores *3* copies with a different set of relations of the left and right sides:
 
 - `{3}       - {8}`
 - `{3, 6}    - {8}`
 - `{3, 6, 7} - {8}`
 
-3 и 8 — индексы, соответствующие таблицам `i8` и `i4` соответственно. Но что это за 6 и 7? Это индексы JOIN'ов:
+3 and 8 are indexes corresponding to tables `i8` and `i4`, respectively. But what are these 6 and 7? These are the indexes of JOINS:
 
 ```sql
 -- 6
@@ -1579,13 +1590,13 @@ text_tbl t1
   on (t1.f1 = b1.d1)
 ```
 
-Это отражает ограничения: `i8.q2 = i4.f1` применяется не к самому `i8`, а к результату `LEFT JOIN`а.
+This reflects the limitations: `i8.q2 = i4.f1` does not apply to `i8` itself, but to the result of the `LEFT JOIN`.
 
 ---
 
-Хорошо, но почему тогда время выполнения больше? Если мы не рассматриваем дополнительные варианты, то это время должно быть меньше. Дело вот в чем.
+OK, but then why is the execution time longer? If we are not considering additional cases (discussed above), then this time should be shorter. Here's the thing.
 
-Если посмотреть на код ванильного планировщика, то можем увидеть, что он достаточно умный. [Функция `join_search_one_level`](https://github.com/postgres/postgres/blob/0810fbb02dbe70b8a7a7bcc51580827b8bbddbdc/src/backend/optimizer/path/joinrels.c#L73) отвечает за обработку 1 уровня DPsize:
+If we take a look at the code of the vanilla planner, we can see that it is quite smart. [Function `join_search_one_level`](https://github.com/postgres/postgres/blob/0810fbb02dbe70b8a7a7bcc51580827b8bbddbdc/src/backend/optimizer/path/joinrels.c#L73) is responsible for processing single level of DPsize:
 
 <spoiler title="join_search_one_level">
 
@@ -1601,7 +1612,7 @@ join_search_one_level(PlannerInfo *root, int level)
 	root->join_cur_level = level;
 
 	/*
-	 * Соединяем все предыдущие уровни, с единственной таблицей.
+	 * Make ZIG-ZAG plan - join table with previous level.
 	 */
 	foreach(r, joinrels[level - 1])
 	{
@@ -1628,8 +1639,8 @@ join_search_one_level(PlannerInfo *root, int level)
 	}
 
 	/*
-	 * Создание "ветвистых" планов - логика DPsize, где рассматриваются
-     * пары из отношений с несколькими таблицами, по обеим сторонам
+     * Creation of "bushy" plans - main DPsize logic, where all possible
+     * pairs of relations with several tables on both sides are considered.
 	 */
 	for (k = 2;; k++)
 	{
@@ -1650,7 +1661,7 @@ join_search_one_level(PlannerInfo *root, int level)
 			{
 				RelOptInfo *new_rel = (RelOptInfo *) lfirst(r2);
 
-                /* Создаем план, только есть подходящий предикат */
+                /* Build plan only if it makes sense */
 				if (!bms_overlap(old_rel->relids, new_rel->relids))
 				{
 					if (have_relevant_joinclause(root, old_rel, new_rel) ||
@@ -1664,7 +1675,7 @@ join_search_one_level(PlannerInfo *root, int level)
 	}
 
 	/*
-     * Создаем CROSS JOIN, если на текущем уровне ничего не смогли создать
+     * Build CROSS JOIN if we failed to build anything at current level
 	 */
 	if (joinrels[level] == NIL)
 	{
@@ -1682,41 +1693,54 @@ join_search_one_level(PlannerInfo *root, int level)
 
 </spoiler>
 
-Ее логика такая:
+Logic is the following:
 
-1. Вначале создаем left-deep/right-deep планы — создаем текущий уровень присоединением 1 таблицы к предыдущему уровню (даже если нет предиката, то есть создаем `CROSS JOIN`).
-2. Затем запускаем основную логику DPsize с рассмотрением всех возможных пар, дающих по итогу нужное количество.
-3. В конце, если ничего не смогли найти, то создаем узлы `CROSS JOIN`'а.
+1. First, we create left-deep/right-deep plans — we create the current level by joining 1 table to the previous level (even if there is no predicate, that is, we create a `CROSS JOIN`).
+2. Then we run the main DPsize logic with consideration of all possible pairs, that create target set.
+3. In the end, if we couldn't find anything, then we create the `CROSS JOIN` nodes.
 
-Основная оптимизация заключается во 2 шаге — мы *не* создаем лишние `CROSS JOIN`, если они не нужны. Это, по факту, имитация поведения DPhyp, так как его идея в этом и заключается — соединять отношения, только если между ними есть связь.
+The main optimization is in step 2 — we *do not* create extra `CROSS JOINS` if they are not needed. This is, in fact, an imitation of the behavior of DPhyp, since its idea is to connect relationships only if there is a connection between them:
 
-Остальные микросекунды мы тратим на операционную деятельность:
+```c++
+/* Left/right parts do not intersect */
+if (!bms_overlap(old_rel->relids, new_rel->relids))
+{
+    /* Have edge between nodes */
+    if (have_relevant_joinclause(root, old_rel, new_rel) ||
+        have_join_order_restriction(root, old_rel, new_rel))
+    {
+        (void) make_join_rel(root, old_rel, new_rel);
+    }
+}
+```
 
-- Созданием гиперграфа.
-- Обход соседей.
-- Работа с еще одной хэш-таблицей.
+We spend the remaining microseconds on operational:
 
-Все эти лишние такты накапливаются и выливаются в еще более длительное выполнение.
+- Hypergraph building.
+- Neighbors traversing.
+- Hash-table maintenance.
 
-## Итоги
+All these extra cycles accumulate and result in an even longer execution.
 
-Расширение, конечно, пока еще довольно сырое. Существующая инфраструктура заточена под особенности PostgreSQL, поэтому для реализации одного функционала приходится искать обходные пути, а другой работает "со скрипом".
+## Conclusions
+
+The extension, of course, is still not ready due to performance reasons. The existing infrastructure is highly coherent with existing code base of PostgreSQL, so to implement some functionality, you have to look for hacks, or it will work ineffectively.
 
 Предвосхищаю вопрос: а зачем все это понадобилось? R&D. Как я сказал в начале, планировщик — важная деталь работы СУБД, поэтому исследования в этой области могут в какой-то момент обернуться существенным выигрышем (ключевое слово — "могут"). К сожалению, окупаемость конкретно этой инвестиции сейчас отрицательная — на практике этот алгоритм создает планы и не лучше, и не быстрее.
 
-Подытожим недостатки:
+The question arises: is it all necessary? R&D. As I said at the beginning, the planner is an important part of the DBMS, so researches in this area may at some point turn into a significant gain (the keyword is "may"). Unfortunately, the payback on this particular investment is negative for now — in practice, this algorithm creates plans that are neither better nor faster.
 
-1. Теряются некоторые возможные оптимизации: гиперребра создаются из предикатов, которые на данный момент нельзя полностью трансформировать в гиперребра из-за индексов RangeTable, указывающих НЕ на отношения (например, на JOIN'ы).
-2. Несвязные подграфы требуют отдельной обработки: пользователь сам должен указывать расширению как действовать (параметр `cj_strategy`).
-3. Оценка страдает из-за неоптимальных первых аргументов: порядок обрабатываемых пар отношений для JOIN'ов важен, но сейчас он не соотносится с тем, что делает встроенный планировщик.
-4. Довольно долгое выполнение: сейчас используется встроенный `make_join_rel`, но он занимает львиную долю времени.
+Let's summarize the disadvantages:
 
-При всем этом есть и хорошая новость: все поправимо. Ограничения продиктованы одной лишь реализацией, то есть это не какие-то фундаментальные ограничения. Никто не запрещает нам написать свой `make_join_rel`, оптимизированный под DPhyp. В крайнем случае мы можем пропатчить ядро и добавить то, чего нам недостает. Тем более мы нашли как минимум один запрос, который смогли ускорить в сотни раз, а это может открыть целую область применимости, и значит, работа проделана не зря.
+1. Some possible optimizations are lost: hyperedges are created from predicates that currently cannot be completely transformed into hyperedges due to `RangeTable` indexes that do NOT refer to relations (main problem is for OUTER JOINS)
+2. Disconnected subgraphs require special processing: the user must tell the extension how to act (the `cj_strategy` setting).
+3. Estimations suffer due to the suboptimal order of relation pairs: the order of the processed relation pairs is important for JOINS, but now it does not correspond to what the built-in planner does.
+4. It takes quite a long time to complete: the built-in `make_join_rel` is currently being used, but it takes the lion's share of the time.
 
-Всем слона.
+There is also good news: everything is fixable. The limitations are dictated by the implementation alone, that is, they are not fundamental limitations. No one forbids us to write our own `make_join_rel` optimized for DPhyp. As a last resort, we can patch the core and add what we're missing. Moreover, we found at least one query that we were able to speed up hundreds of times, and this can open up a whole field of applicability, which means that the work has not been done in vain.
 
-Ссылки:
+Links:
 
-- [Расширение pg_dphyp](https://github.com/TantorLabs/pg_dphyp)
+- [Extension pg_dphyp](https://github.com/TantorLabs/pg_dphyp)
 - [Dynamic Programming Strikes Back](https://15721.courses.cs.cmu.edu/spring2018/papers/16-optimizer2/p539-moerkotte.pdf) — DPhyp
-- [Adaptive Optimization of Very Large Join Queries](https://db.in.tum.de/~radke/papers/hugejoins.pdf) — планирование огромных запросов
+- [Adaptive Optimization of Very Large Join Queries](https://db.in.tum.de/~radke/papers/hugejoins.pdf) — planning of large queries (1000+ tables)
