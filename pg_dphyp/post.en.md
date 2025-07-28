@@ -1,14 +1,12 @@
 # pg_dphyp: teach PostgreSQL to JOIN tables differently
 
-![Cover](./img/cover.png)
-
 Greetings!
 
 I work in Tantor Labs as a database developer and naturally I am fond of databases. Once during reading the [red book](https://www.redbook.io) I have decided to study planner deeply. Main part of relational database planner is join ordering and I came across DPhyp algorithm that is used in most modern (and not so much) databases. I wonder - is there is anything in PostgreSQL? Surprisingly, nothing. Well, if something does not exist, you need to create it yourself.
 
 This article is not about DPhyp per se, but about what I had to deal with in the process of writing the corresponding extension for PostgreSQL. But first thing first, a little theory.
 
-## Алгоритмы работы планировщиков запросов
+## Join ordering algorithms
 
 The query planner in databases is perhaps the most complex and important component of the system, especially if we are talking about terabytes (especially petabytes) of data. It doesn't matter how fast the hardware is: if the planner made a mistake and started using sequential scan instead of the index scan, that's it, please come back for the result in a week. In this complex component, you can single out the core: JOIN ordering. Choosing the right table JOIN order has the greatest impact on the cost of the entire query. For example, a query like this...
 
@@ -20,7 +18,7 @@ JOIN t3 ON t2.x = t3.x
 JOIN t4 ON t3.x = t4.x;
 ```
 
-...has 14 possible combinations of table JOIN orderings. In general, this is the number of possible representations of a binary tree of `N` nodes, where nodes are tables, [Catalan number](https://en.wikipedia.org/wiki/Catalan_number). We already have 429 representations for 7 tables, and 1430 for 8! Needless to say, from a certain point on, this number becomes so huge that it becomes almost practically impossible to find the optimal plan by simply iterating through all the combinations? The way we are going to search suitable ordering determines architecture of the planner: top-down vs bottom-up.
+...has 14 possible combinations of table JOIN orderings. In general, this is the number of possible representations of a binary tree of `n` nodes, where nodes are tables, [Catalan number](https://en.wikipedia.org/wiki/Catalan_number) - $C_{n - 1}$. But do not forget, that order of tables also important, so for each shape of JOIN tree we must consider all table reorderings. Thus, number of possible JOIN orderings for query with `n` tables is $C_{n - 1}n!$. This number is growing very fast. For example, for 6 tables it will be 30240, and for 7 - 665280! Needless to say, from a certain point on, this number becomes so huge that it becomes almost practically impossible to find the optimal plan by simply iterating through all the combinations? The way we are going to search suitable ordering determines architecture of the planner: top-down vs bottom-up.
 
 In the top-down approach (also called goal-oriented) we start from the root and recursively descending down the query tree. The advantage here is that we have the full context in our hands and can use it. The most illustrative example are correlated subqueries: top-down planner can use current context to transform such nested subquery into simple JOIN - this can dramatically improve performance. An example is [the cascades planner](https://www.srdc.com.tr/share/publications/1995/cas.pdf) (roughly speaking, this is the framework), which is used in Microsoft SQL Server: it can easily move the nodes of the query graph under GROUP-BY, which another approach (bottom-up) cannot do without additional help (the architecture assumes a static set of relationships for connection).
 
@@ -236,7 +234,7 @@ Well, we've decided to use list of hyperedges, but is it possible to apply any o
 
 But this is still not the end. Earlier, I said that for the same expression in the query text, multiple instances of `RestrictInfo` (representation of the expression in the source code) can be created, but with a different set of indexes of the required relations. At the same time, I said that I couldn't process these additional relation IDs, so I could end up with a lot of duplicates of expressions. This can lead to lots of wasted work. I solved this using [sorting](https://github.com/ashenBlade/pg_dphyp/blob/0cdc5b410d3bce41398a6646c576cca77994b6e3/pg_dphyp.c#L1096): all hyperedges stored in sorted array. So adding new hyperedge is adding new element to sorted array - binary search can quickly find duplicates and prevent such bloating.
 
-### Создание плана
+### Query plan building
 
 If you have read original paper then you known that DPhyp is not only about JOIN ordering, but it also gives some tips for effective query plan creation. This is an important point, since some JOIN operators are not commutative (for example, `LEFT JOIN`), and such JOINs impose restrictions. But that's not all. Let me remind you that DPsize (builtin planner) has high cohesion with the code base — so much so that it is impossible to create a plan for the `i` tables without finding the optimal plan for the underlying ones.
 
@@ -348,7 +346,7 @@ If someone thought, "just take a shortcut and that's it," then alas. Do not forg
 00101001   111
 ```
 
-<spoiler title="Limitations of caching scheme">
+{% details Limitations of caching scheme %}
 
 The neighbor caching scheme only works when the set of excluded nodes *is fixed*. This requirement is satisfied by the last cycles in the `Enumerate*` functions, when the excluded set is fixed during all iterations (in the definition from the article, these functions recursively call themselves, but with a fixed set of excluded nodes $X\cup\mathcal{N}(S,X)$).
 
@@ -399,7 +397,7 @@ new_neighborhood |= forbidden & ~TablesBetween(0, lowest_node_idx);
 new_neighborhood |= neighborhood;
 ```
 
-</spoiler>
+{% enddetails %}
 
 To implement their singleton cache, they use the [class `NeighborhoodCache`](https://github.com/mysql/mysql-server/blob/ff05628a530696bc6851ba6540ac250c7a059aa7/sql/join_optimizer/subgraph_enumeration.h#L163) and they transitively pass it almost everywhere. Its logic is simple: before starting the neighbor search, we find the delta of the sets, but in fact we check that the last bit is set, and at the end we save the calculated neighbors — but only if the first bit (`taboo bit`) is not set - just because this will not contribute to any further neighborhood sets anymore (this is last bit can be set).
 
@@ -536,9 +534,7 @@ Let's draw a graph of 4 element set and see how we can create the current set fr
 
 Do you see this pattern? We take the elements in the cell under *the index less than ours by some power of two and use it as a base* to create the current set by adding the current outermost element. What is this power of two? You can see from the same diagram that the number of current leading zeros (or it can be represented as number of first element), that is, the set of neighbors that can be used to create the current one, is located $2^{zeros}$ steps back, where $zeros$ is the number of current leading zeros of the iteration number.
 
-Но ведь это таблица динамического программирования! Для вычисления текущего множества мы используем результат предыдущего вычисления. Стоп, и еще раз погодите! Не значит ли это, что для вычисления соседей для каждого из $2^i$ подмножества нам потребуется обработать ровно $2^i$ узлов? Да, значит! Таким образом все наше множество можно поделить на 2 части: базовую (base), где мы закешировали редко меняющуюся старшую часть, и табличную (table), которая вычисляется с помощью нашей таблицы динамического программирования. Вопроса о размере каждой части не возникает — table-часть берет то, что осталось: $64 - len(MSB)$ (либо наоборот). По итогу мы имеем следующий алгоритм:
-
-But this is a dynamic programming table! To calculate the current set, we use the result of the previous calculation. Wait! Doesn't this mean that to calculate the neighbors for each of the $2^i$ subset, we will need to process exactly $2^i$ nodes? Yes, it means! Thus, our entire set can be divided into 2 parts: the base part, where we have cached the rarely changing upper part, and the table part, which is calculated using our dynamic programming table. There is no question about the size of each part — the table part takes what is left: $64 - len(MSB)$ (or vice versa). As a result, we have the following algorithm:
+This is a *dynamic programming table*! To calculate the current set, we use the result of the previous calculation. Wait! Doesn't this mean that to calculate the neighbors for each of the $2^i$ subset, we will need to process exactly $2^i$ nodes? Yes, it means! Thus, our entire set can be divided into 2 parts: the base part, where we have cached the rarely changing upper part, and the table part, which is calculated using our dynamic programming table. There is no question about the size of each part — the table part takes what is left: $64 - len(MSB)$ (or vice versa). As a result, we have the following algorithm:
 
 1. If iteration number (number representation of subset bit mask) is divided by $2^{table size}$, then compute neighborhood - this is new base part begins.
 2. Otherwise:
@@ -574,7 +570,7 @@ Legend:
 
 Which table size to use can be calculated dynamically or simply choose the optimal value for your load heuristically (constant set in configuration). To make it easier to think further, I will choose a table size of 10 elements.
 
-<spoiler title="Increasing the table only reduces the number of iterations">
+{% details Increasing the table only reduces the number of iterations }
 
 I was wondering — what kind of gain does an increase in the table give? For example, how many iterations can we save if we use `tbl + 1` instead of a table with `tbl` elements. To begin with, here is the formula for the total number of iterations. Let's imagine that the number of our neighbors (i.e., the size of the set) is `max` (for current implementation it is `64`, but this is generalization), and the size of the table is `tbl`. Then, the number of iterations required to process all subsets of neighbors is:
 
@@ -604,7 +600,7 @@ $$
 
 Considering that $max > tbl$ (the formula assumes that we increase $tbl$ by 1, that is, this is the previous value, and it makes no sense to increase the size of the table beyond the size of the set), we see that this expression is non-negative, since each term of this sum is non-negative.
 
-</spoiler>
+{% enddetails %}
 
 ### 3-layered cache
 
@@ -665,8 +661,6 @@ The last question is: how to decide which action to perform? Use the subset pref
 - every $2^{table size}$ iterations, the base part should be updated (which in terms of binary numbers means that the first $i$ bits are 0);
 - every $2^4 = 16$ iterations, new entries should be made in the table;
 - every $8$ iterations, the quad leader should be updated in the hot part.
-
-Алгоритм значительно усложнился, но чего не сделаешь ради оптимизаций. Зато теперь для того же размера множества требуется не $2^{i}$ байт, а всего лишь $2^{i - 4}$. Например, вместо 8Кб теперь требуется только 0.5Кб, но при этом кешируется все 10 элементов.
 
 The algorithm has become much more complicated, but that is done for the sake of optimization. Now for the same set size, not $2^{i}$ bytes are required, but only $2^{i - 4}$. For example, instead of 8Kb, only 0.5Kb is now required whereas still all 10 elements are cached.
 
@@ -754,8 +748,6 @@ And now the algorithm itself:
 4. Take the element with this index from the DP table.
 5. Calculate the neighborhood based on the cached one, and for delta — the first element of the current subset.
 6. Save computed neighborhood to DP-table with index of current number of zeros.
-
-Корректно ли это? Корректно. Вот доказательство от обратного. Базой будет то, что соседи пустого множества — это пустое множество (либо другое, но определенное значение). Само доказательство исходит из свойства алгоритма перебора подмножеств — инкремента.
 
 Is this correct? Yes. Here is a evidence to the contrary. The proof itself comes from the property of the subset—increment algorithm.
 
@@ -860,7 +852,7 @@ get_neighbors_iter(DPHypContext *context, bitmapword subgroup,
 
 Is it possible to add more optimizations? Yes. An example of this is already in the code above — indexing.
 
-<spoiler title="Not exactly perfect cache">
+{% details Not exactly perfect cache %}
 
 Yes, this caching strategy is good, but not perfect. Remember the MySQL caching approach — they use it even in the first `EnumerateCsgRec` cycle, when excluded set varies. MySQL overcomes this using heuristic — it caches excluded nodes, and then add all previously prohibited ones which *could be* neighbors.
 
@@ -891,7 +883,7 @@ It's hard to say which is better.:
 
 Even so, taking the first approach, we should evaluate the consequences, since adding a few more nodes to the neighborhood will increase further costs for other iterations. This can almost completely negate the gains you're making right now: don't forget that each additional node increases the number of subset iterations *by 2 times*, and this additional node will also add new nodes to future neighbors! From the example above, we added two nodes to the neighbors, which means that there will be four times as many iterations, and for each one we will need to find more neighbors, call other functions, and so on. And how many such "indirect" neighbors will accumulate for an even greater number of recursive calls is hard to imagine.
 
-</spoiler>
+{% enddetails %}
 
 ## Hyperedge indexing
 
@@ -1216,9 +1208,7 @@ Finally we got the following table:
 
 When I ran through the table a bit, I couldn't believe. Let's look at it as a bar plot.
 
-# TODO: картинко перевод
-
-![Visual comparison of costs](https://raw.githubusercontent.com/ashenBlade/habr-posts/master/pg_dphyp/img/job_cost_compare.svg)
+![Visual comparison of costs](https://raw.githubusercontent.com/ashenBlade/habr-posts/master/pg_dphyp/img/job_cost_compare.en.svg)
 
 DPhyp overwhelmingly creates a plan *better* than DPsize. Yes, the time to complete it is a little bit longer, but the plan is better, which means that we win in the long run!
 
@@ -1547,8 +1537,6 @@ The planning time is indeed much longer, but take a closer look at the query pla
 
 Yes, DPsize was able to *find an implicit connection* between the relations, even if they were on different sides of the operands. DPhyp will not do this, since these are different sides of an edge, and according to its logic it is forbidden to do this — you cannot connect separate nodes of different hypernodes if they are on different sides of a hyperedge. From this we can conclude that DPhyp is a very good, but *heuristic*. Unfortunately, these are not all the problems.
 
-Для создания гиперребер используется три различных источника, но они не покрывают всех вариантов. Проблема кроется в `joinclauses`. Во время работы PostgreSQL создает все возможные варианты выражения с разным набором необходимых отношений левой и правой части. Это позволяет рассмотреть разные варианты расположения выражения в дереве. Проблема в том, что используемые там индексы отношений могут относиться не к таблицам, а к индексам узлов JOIN (`RangeTblEntry` типа `RTE_JOIN`). И они там не просто так, они "подсказывают" планировщику, какие отношения можно использовать и как переопределить отношения. Для понимания посмотрим на такой запрос (взят из регресс-тестов самого PostgreSQL):
-
 3 different sources are used to create hyperedgegs, but they do not cover all the possible cases. The problem lies in the `joinclauses`. During operation, PostgreSQL creates all possible variants of an expression with a different set of necessary relations of the left and right sides. This allows you to consider different options for the location of the expression in the tree. The problem is that the relation IDs used there may refer not to tables, but to indexes of JOIN nodes (`RangeTblEntry` of type `RTE_JOIN`). And they are there for a reason - to "tell" the planner which relations can be used and how to reorder them. To understand, let's look at such a query (taken from the regression tests of PostgreSQL itself):
 
 ```sql
@@ -1598,7 +1586,7 @@ OK, but then why is the execution time longer? If we are not considering additio
 
 If we take a look at the code of the vanilla planner, we can see that it is quite smart. [Function `join_search_one_level`](https://github.com/postgres/postgres/blob/0810fbb02dbe70b8a7a7bcc51580827b8bbddbdc/src/backend/optimizer/path/joinrels.c#L73) is responsible for processing single level of DPsize:
 
-<spoiler title="join_search_one_level">
+{% details join_search_one_level %}
 
 ```c++
 /* src/backend/optimizer/path/joinrels.c */
@@ -1691,7 +1679,7 @@ join_search_one_level(PlannerInfo *root, int level)
 }
 ```
 
-</spoiler>
+{% enddetails %}
 
 Logic is the following:
 
@@ -1725,8 +1713,6 @@ All these extra cycles accumulate and result in an even longer execution.
 ## Conclusions
 
 The extension, of course, is still not ready due to performance reasons. The existing infrastructure is highly coherent with existing code base of PostgreSQL, so to implement some functionality, you have to look for hacks, or it will work ineffectively.
-
-Предвосхищаю вопрос: а зачем все это понадобилось? R&D. Как я сказал в начале, планировщик — важная деталь работы СУБД, поэтому исследования в этой области могут в какой-то момент обернуться существенным выигрышем (ключевое слово — "могут"). К сожалению, окупаемость конкретно этой инвестиции сейчас отрицательная — на практике этот алгоритм создает планы и не лучше, и не быстрее.
 
 The question arises: is it all necessary? R&D. As I said at the beginning, the planner is an important part of the DBMS, so researches in this area may at some point turn into a significant gain (the keyword is "may"). Unfortunately, the payback on this particular investment is negative for now — in practice, this algorithm creates plans that are neither better nor faster.
 
