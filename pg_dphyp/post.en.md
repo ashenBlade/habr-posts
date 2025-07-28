@@ -6,6 +6,8 @@ I work in Tantor Labs as a database developer and naturally I am fond of databas
 
 This article is not about DPhyp per se, but about what I had to deal with in the process of writing the corresponding extension for PostgreSQL. But first thing first, a little theory.
 
+> If you want to go straight to the extension, here is the [link to the repository](https://github.com/TantorLabs/pg_dphyp).
+
 ## Join ordering algorithms
 
 The query planner in databases is perhaps the most complex and important component of the system, especially if we are talking about terabytes (especially petabytes) of data. It doesn't matter how fast the hardware is: if the planner made a mistake and started using sequential scan instead of the index scan, that's it, please come back for the result in a week. In this complex component, you can single out the core: JOIN ordering. Choosing the right table JOIN order has the greatest impact on the cost of the entire query. For example, a query like this...
