@@ -572,7 +572,7 @@ Legend:
 
 Which table size to use can be calculated dynamically or simply choose the optimal value for your load heuristically (constant set in configuration). To make it easier to think further, I will choose a table size of 10 elements.
 
-{% details Increasing the table only reduces the number of iterations }
+{% details Increasing the table only reduces the number of iterations %}
 
 I was wondering — what kind of gain does an increase in the table give? For example, how many iterations can we save if we use `tbl + 1` instead of a table with `tbl` elements. To begin with, here is the formula for the total number of iterations. Let's imagine that the number of our neighbors (i.e., the size of the set) is `max` (for current implementation it is `64`, but this is generalization), and the size of the table is `tbl`. Then, the number of iterations required to process all subsets of neighbors is:
 
