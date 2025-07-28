@@ -1,4 +1,4 @@
-# pg_dphyp: teach PostgreSQL to JOIN tables differently
+# pg_dphyp: teach PostgreSQL to JOIN tables in a different way
 
 Greetings!
 
