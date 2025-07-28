@@ -127,7 +127,7 @@ The idea to create this extension came to me by chance: I was studying different
 
 In the implementation, I tried to be closer to the paper and make the minimum number of changes. For example, the names of functions and some variables are the same as in the paper. But although there are practically no changes in the core of the algorithm, they exist at the operational decision-making level, and the first of them concerns the representation of sets.
 
-### Представление множеств
+### Set representation
 
 Sets are the workhorse of the algorithm, underlying all of its effectiveness. Different DBMS do this in different ways, for example:
 
