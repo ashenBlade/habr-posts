@@ -165,42 +165,117 @@ PostgreSQL работает по итераторной модели - за ка
 
 <spoiler title="ExecAgg">
 
-TODO: код
+Код упрощен.
+
+```c++
+/* https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/backend/executor/nodeAgg.c#L2247 */
+static TupleTableSlot *
+ExecAgg(PlanState *pstate)
+{
+	AggState   *node = castNode(AggState, pstate);
+	TupleTableSlot *result = NULL;
+
+	if (!node->agg_done)
+	{
+		/* Dispatch based on strategy */
+		switch (node->aggstrategy)
+		{
+			case AGG_HASHED:
+            /* ... */
+			case AGG_MIXED:
+            /* ... */
+			case AGG_PLAIN:
+            /* ... */
+			case AGG_SORTED:
+				return agg_retrieve_direct(node);
+		}
+	}
+
+	return NULL;
+}
+```
 
 </spoiler>
 
-За выполнение узла группировки отвечает функция `ExecAgg`, внутри которой простой `switch` определяющий нужную стратегию. То что для группировки мы можем использовать несколько стратегий секретом быть не должно. Сейчас мы рассматриваем плоскую группировку и за нее отвечает `AGG_PLAIN`, сам обработчик - `agg_retrieve_direct`.
+Обработчиком узла группировки является функция `ExecAgg`, внутри которой простой `switch`, определяющий нужную стратегию. То, что для группировки мы можем использовать несколько стратегий, секретом быть не должно. Сейчас мы рассматриваем плоскую группировку и за нее отвечает `AGG_PLAIN`, сам обработчик - `agg_retrieve_direct`.
 
 <spoiler title="agg_retrieve_direct">
 
-TODO: код простой
+```c++
+/* https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/backend/executor/nodeAgg.c#L2283 */
+static TupleTableSlot *
+agg_retrieve_direct(AggState *aggstate)
+{
+   Agg		   *node = aggstate->phase->aggnode;
+   AggStatePerAgg peragg;
+   AggStatePerGroup *pergroups;
+
+   /* Вначале читаем первый кортеж */
+   if (aggstate->grp_firstTuple == NULL)
+   {
+      outerslot = fetch_input_tuple(aggstate);
+      if (TupIsNull(outerslot))
+      {
+         return NULL;
+      }
+   }
+
+   /* Инициализация состояния */
+   initialize_aggregates(aggstate, pergroups, numReset);
+
+
+   /* Для каждого кортежа из входа вызываем функцию перехода */
+   for (;;)
+   {
+      advance_aggregates(aggstate);
+
+      if (TupIsNull(outerslot))
+      {
+         aggstate->agg_done = true;
+         break;
+      }
+   }
+
+   /* Вызов финализатора */
+   finalize_aggregates(aggstate, peragg, pergroups[currentSet]);
+   
+   return project_aggregates(aggstate);
+}
+```
 
 </spoiler>
 
 Здесь мы видим практически 1-к-1 отображение на протокол агрегатов (его псевдокод) выше. Единственная разница в том, что мы вначале читаем кортеж и только после этого инициализируем состояние. Это нужно, чтобы убедиться, что вход не пустой. Для чего нужно - увидим потом.
 
-TODO: код `agg_retrieve_direct` выделен `fetch_input_tuple`
-
-Для чтения кортежей из подузла в этом модуле используется функция `fetch_input_tuple`. На данный момент, все кортежи мы читаем из подузла, например, `SeqScan`.
-
-TODO: код `agg_retrieve_direct` выделен `initialize_aggregates`
+Для чтения кортежей из подузла в этом модуле используется функция `fetch_input_tuple`. Пока нам не интересно, что внутри, и читаем все кортежи из под-узла, например, `SeqScan`.
 
 Первым делом, нужно инициализировать состояние агрегата. Для этого используется функция `initialize_aggregates`. Но перед этим нам нужно познакомиться с основными используемыми структурами.
 
-TODO: схема AggStatePerGroup
+```c++
+/* https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/include/executor/nodeAgg.h#L250 */
+struct AggStatePerGroupData
+{
+	Datum		transValue;		/* current transition value */
+	bool		transValueIsNull;
+	bool		noTransValue;	/* true if transValue not set yet */
+};
+```
 
-Структура `AggStatePerGroup` хранит само состояние агрегата. Она создается для каждого набора конкретных значений атрибутов группировки. Например, состояние для AVG - это пара из 2 чисел - сумма и количество.
+Структура `AggStatePerGroup` хранит само состояние агрегата. Она создается для каждого набора конкретных значений атрибутов группировки.
 
-Но можете заметить, что здесь не 2 поля: значение и NULL, но есть и 3 - флаг `noTransValue`. Дело в ньюансе работы с `NULL`'ами, о котором я упомянул ранее, - если изначальное состояние агрегата `NULL`, то первое не `NULL` значение становится состоянием, но если мы используем только 1 флаг - как мы различим `NULL`, который еще не выставлен, от `NULL`, который вернула функция перехода. Для решения мы задействуем дополнительный флаг.
-
-TODO: схема AggStatePerTrans/AggStatePerAgg
+Но можете заметить, что здесь не 2 поля: значение и `NULL`, но есть и 3 - флаг `noTransValue`. Дело в нюансе работы с `NULL`'ами, о котором я упомянул ранее, - если изначальное состояние агрегата `NULL`, то первое не `NULL` значение становится состоянием, но если мы используем только 1 флаг - как мы различим `NULL`, когда состояние изначальное, от `NULL`, который вернула функция перехода. Для решения мы задействуем дополнительный флаг.
 
 Но это состояние, сама логика хранится в двух других структурах - `AggStatePerTrans` и `AggStatePerAgg`.
 
-Первая `AggStatePerTrans` хранит изначальное состояние и логику для вызова функции перехода. Но вот финализация выделена в отдельную структуру - `AggStatePerAgg`. И сделано это не просто так, а в угоду оптимизации.
+![Взаимосвязь PerTrans и PerAgg с логикой](./assets/trans-final-scheme.drawio.png)
+
+> Структуры довольно большие, поэтому их определение я не стал приводить. Если кому интересно, то ссылка на [PerTrans](https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/include/executor/nodeAgg.h#L30) и на [PerAgg](https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/include/executor/nodeAgg.h#L187).
+
+`AggStatePerTrans` хранит изначальное состояние и логику для вызова функции перехода, но вот финализация выделена в отдельную структуру - `AggStatePerAgg`. И сделано это не просто так, а в угоду оптимизации.
 
 ```sql
-select agginitval, aggtransfn, count(*) cnt from pg_aggregate group by 1, 2 having count(*) > 1 order by 3 desc;
+SELECT agginitval, aggtransfn, count(*) cnt FROM pg_aggregate GROUP BY 1, 2 HAVING count(*) > 1 ORDER BY 3 DESC;
+
   agginitval   |          aggtransfn          | cnt 
 ---------------+------------------------------+-----
  {0,0,0,0,0,0} | float8_regr_accum            |  11
@@ -221,49 +296,93 @@ select agginitval, aggtransfn, count(*) cnt from pg_aggregate group by 1, 2 havi
 
 Из этого запроса мы можем понять, что существует множество функций агрегации с одинаковыми начальным значением и функцией перехода. Это значит, что запустив запрос с таким агрегатами, то в конце, мы получим копии одного и того же состояния. Нам не зачем тратить и место, и время для них, поэтому подобные агрегаты мы находим и храним только по 1 состоянию, а в конце вызываем разные финализаторы над одним и тем же состоянием.
 
-TODO: скриншот отладчика numaggs/numtrans
-
-И в качестве примера можно привести 2 функции: `avg` и `stddev`. Если запустим такой запрос, то окажется, что агрегатных функции 2 (`numaggs`), но состояние хранится только 1 (`numtrans`).
-
 ```sql
 select avg(a::float), stddev(a::float) from tbl;
 ```
 
-TODO: код `initialize_aggregate`
+И в качестве примера можно привести 2 функции: `avg` и `stddev`. Если запустим такой запрос, то окажется, что агрегатных функции 2 (`numaggs`), но состояние хранится только 1 (`numtrans`).
+
+![`numaggs` и `numtrans` не равны друг другу](./assets/numaggstrans.png)
+
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/nodeAgg.c#L580 */
+static void
+initialize_aggregate(AggState *aggstate, AggStatePerTrans pertrans,
+							AggStatePerGroup pergroupstate)
+{
+	if (pertrans->initValueIsNull)
+		pergroupstate->transValue = pertrans->initValue;
+	else
+		pergroupstate->transValue = datumCopy(pertrans->initValue,
+											  pertrans->transtypeByVal,
+											  pertrans->transtypeLen);
+
+	pergroupstate->transValueIsNull = pertrans->initValueIsNull;
+	pergroupstate->noTransValue = pertrans->initValueIsNull;
+}
+```
 
 Теперь логика инициализации ясна: из `AggStatePerTrans` копируем состояние в `AggStatePerGroup` - само значение и 2 флага.
 
-TODO: код радом с `advance_aggregates`
-
 После инициализации нам нужно читать кортежи и применять функцию перехода, но так как первый кортеж мы уже прочитали, то сразу применяем функцию перехода. Это делается в `advance_aggregates`, но если опустимся внутрь, то вызова функций напрямую не увидим.
 
-Дело в том, что многие выражения в PostgreSQL выполняются не как отдельные функции, а преобразовываются в последовательность команд для выполнения. В postgres это называется компиляцией выражений. У этого подхода много преимуществ, например, благодаря ему мы можем очень просто добавить поддержку jit'а. Еще одно преимущество мы увидим далее.
-
-TODO: `ExecInterpExpr`, но только те шаги, которые нужны мне
+Дело в том, что многие выражения в PostgreSQL выполняются не как отдельные функции, а преобразовываются в последовательность команд для выполнения. В postgres это называется компиляцией выражений. У этого подхода много преимуществ, например, благодаря ему очень просто добавляется поддержка jit'а. Еще одно преимущество мы увидим далее.
 
 А сейчас нам нужно выполнить 2 команды: загрузка кортежа в память и вызов самой функции перехода. Если спустимся еще раз внутрь, то увидим и саму функцию перехода.
 
-TODO: скриншот отладчика до логики
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/execExprInterp.c#L460 */
+static Datum ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+{
+    EEO_SWITCH()
+    {
+       EEO_CASE(EEOP_OUTER_FETCHSOME)
+       {
+           slot_getsomeattrs(outerslot, op->d.fetch.last_var);
+           EEO_NEXT();
+       }
+       EEO_CASE(EEOP_AGG_PLAIN_TRANS_BYVAL)
+       {
+           AggState   *aggstate = castNode(AggState, state->parent);
+           AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
+           AggStatePerGroup pergroup = &aggstate->all_pergroups[op->d.agg_trans.transno];
+           ExecAggPlainTransByVal(aggstate, pertrans, pergroup,
+                                  op->d.agg_trans.aggcontext);
+           EEO_NEXT();
+       }
+    }
+}
+```
 
-Для `avg` функция перехода - `int4_avg_accum`, в которой мы сейчас и находимся. Так как мы только инициализировали состояние, то оно все по нулям (слева во вкладке) - `count` и `sum`.
+Для `avg` функция перехода - `int4_avg_accum`, в которой мы сейчас и находимся. Так как мы только инициализировали состояние, то оно все по нулям (слева во вкладке) - `count` и `sum`. На вход нам подали число `1` (поле `newval`), поэтому состояние изменилось соответствующе - `count` и `sum` равны 1.
 
-TODO: скриншот отладчика после логики
+![Основная логика `int4_avg_accum`](./assets/int4_avg_accum.gif)
 
-На вход нам подали число `1` (поле `newval`), поэтому состояние изменилось соответствующе - `count` и `sum` равны 1.
+Это была одна итерация - чтение кортежа и вызов функции перехода. Мы так повторяем до тех пор, пока не обработаем все кортежи. Конец входа обозначается тем, что узел возвращает `NULL`, поэтому читаем пока не получим `NULL`.
 
-TODO: код с `agg_retrieve_direct`
+В конце финализируем агрегаты. Здесь будет уже проще, так как скомпилированных выражений нет и мы вызываем сам финализатор.
 
-Это одна итерация - чтение кортежа и вызов функции перехода. Мы так повторяем до тех пор, пока не обработаем все кортежи. В нашей итераторной модели выполнения каждый узел возвращает наверх по одному кортежу за раз, а конец входа обозначает `NULL`, поэтому читаем пока не достигнем `NULL`.
-
-TODO: код `finalize_aggregates`
-
-После этого применяем финализатор. Здесь будет уже проще, так как скомпилированных выражений нет и мы вызываем сам финализатор.
-
-TODO: скриншот отладчика
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/nodeAgg.c#L1045 */
+static void finalize_aggregate(AggState *aggstate, AggStatePerAgg peragg,
+                               AggStatePerGroup pergroupstate,
+                               Datum *resultVal, bool *resultIsNull)
+{
+    Datum result;
+    InitFunctionCallInfoData(*fcinfo, &peragg->finalfn,
+                             numFinalArgs,
+                             pertrans->aggCollation,
+                             (Node *) aggstate, NULL);
+    *resultVal = FunctionCallInvoke(fcinfo);
+    *resultIsNull = fcinfo->isnull;
+}
+```
 
 Для того же `avg` финализатор `int8_avg`. Все что нам осталось сделать - поделить сумму на количество, но чтобы сохранить точность мы оба числа (`int`) приводим к типу `numeric` и выполняем уже деление самих `numeric`'ов.
 
-Работа с этим типом довольно сложная и описывать ее детали я здесь не буду, но если кому интересно, то можно посмотреть реализацию в [`numeric_div_opt_error`](https://github.com/postgres/postgres/blob/e8b9d6497469dadb3c2f3765dfeed7432af77704/src/backend/utils/adt/numeric.c#L3263).
+![Состояние под конец](./assets/int8_avg.png)
+
+> Работа с этим типом довольно сложная и описывать ее детали я здесь не буду, но если кому интересно, то можно посмотреть реализацию в [numeric_div_opt_error](https://github.com/postgres/postgres/blob/e8b9d6497469dadb3c2f3765dfeed7432af77704/src/backend/utils/adt/numeric.c#L3263).
 
 ## Группировка по атрибутам
 
