@@ -211,14 +211,7 @@ agg_retrieve_direct(AggState *aggstate)
    AggStatePerGroup *pergroups;
 
    /* Вначале читаем первый кортеж */
-   if (aggstate->grp_firstTuple == NULL)
-   {
-      outerslot = fetch_input_tuple(aggstate);
-      if (TupIsNull(outerslot))
-      {
-         return NULL;
-      }
-   }
+   outerslot = fetch_input_tuple(aggstate);
 
    /* Инициализация состояния */
    initialize_aggregates(aggstate, pergroups, numReset);
@@ -229,6 +222,7 @@ agg_retrieve_direct(AggState *aggstate)
    {
       advance_aggregates(aggstate);
 
+      outerslot = fetch_input_tuple(aggstate);
       if (TupIsNull(outerslot))
       {
          aggstate->agg_done = true;
@@ -389,33 +383,35 @@ static void finalize_aggregate(AggState *aggstate, AggStatePerAgg peragg,
 ```sql
 SELECT a, avg(b) FROM tbl GROUP BY a;
 
-                       QUERY PLAN                        
----------------------------------------------------------
+          QUERY PLAN                        
+------------------------
  HashAggregate
    Group Key: a
    ->  Seq Scan on tbl
 
 SELECT a, b, c FROM tbl GROUP BY a, b, c;
 
-                           QUERY PLAN                           
-----------------------------------------------------------------
- Group  (cost=1.08..1.12 rows=3 width=12)
+          QUERY PLAN                           
+-------------------------------
+ Group
    Group Key: a, b, c
-   ->  Sort  (cost=1.08..1.09 rows=4 width=12)
+   ->  Sort
          Sort Key: a, b, c
-         ->  Seq Scan on tbl  (cost=0.00..1.04 rows=4 width=12)
+         ->  Seq Scan on tbl
 ```
 
-Теперь мы знаем как выполняются агрегаты и самая простая стратегия группировки - плоская. Но чаще всего мы группируем по конкретным атрибутам.
+Мы рассмотрели как устроены агрегаты изнутри, а также инфраструктуру группировки на примере плоской стратегии. Но чаще всего мы группируем по конкретным атрибутам.
 
-Для этого в SQL используется конструкция `GROUP BY`, в которой передается список из элементов группировки. Рассуждать как это сделать эффективно мы не будем, поэтому сразу скажу - есть 2 стратегии: сортировка и хэширование. Вначале рассмотрим сортировку.
+Для этого в SQL используется конструкция `GROUP BY`, в которой передается список из элементов группировки. Для этого в postgres используется в 2 стратегии: сортировка и хэширование. Вначале рассмотрим сортировку.
+
+> Эту стратегию правильнее назвать потоковой группировкой (по аналогии с SQL Server или планировщиком GreenPlum, где есть узел Stream Aggregate), т.к. сам узел сортировку не выполняет, а на вход получает отсортированные данные. Но я выбрал использовать "сортировку", т.к. в коде используется слово "sort" и нет даже слова "stream".
 
 ### Сортировка
 
 ```sql
-EXPLAIN SELECT a, b FROM tbl GROUP BY a, b;
+EXPLAIN SELECT a, b FROM tbl *GROUP* BY a, b;
 
-                  QUERY PLAN                           
+                  QUERY PLAN             
 ----------------------------------------------
  Group
    Group Key: a, b
@@ -424,19 +420,72 @@ EXPLAIN SELECT a, b FROM tbl GROUP BY a, b;
          ->  Seq Scan on tbl
 ```
 
-Идея сортировки в следующем - если кортежи отсортированы, то элементы каждой группы находятся друг за другом, а первый неравный элемент эти группы разделяет.
+Идея сортировки в следующем - если кортежи на входе отсортированы, то кортежи одной группы находятся друг за другом, а первый неравный предыдущему эти группы разделяет.
 
-В такой постановке всю обработку мы можем выполнить за 1 проход. Нам только нужно отслеживать текущую группу (скажем, будет поле "представитель") и состояние текущей группы.
+В такой постановке всю обработку мы можем выполнить за 1 проход (т.е. потоком, без сохранения огромного состояния). Нам только нужно отслеживать текущую группу (его представителя) и состояние текущей группы.
 
 Алгоритм довольно простой: прочитали очередной кортеж - если равен представителю, то вызываем функцию перехода (внутри той же группы), иначе финализируем и обновляем представителя (новая группа). Граничные случаи: самое начало - первый кортеж сразу становится представителем, и самый конец - финализируем все текущее состояние.
 
-TODO: гифка обработки всех групп TODO: лучше подпись "на этой гифке" не добавлять, а в подписи к ней самой поставить
+![Группировка сортировкой](./assets/groupaggalg.gif)
 
-TODO: сравнение с тем, что дал нам реальный запрос
+Это мы обработали вручную. Если же выполним запрос, то получим тот же самый результат:
 
-> Слайд: `ExecAgg`
+```sql
+explain select a, b, c from tbl group by a, b, c;
+           QUERY PLAN
+-------------------------------
+ Group
+   Group Key: a, b, c
+   ->  Sort
+         Sort Key: a, b, c
+         ->  Seq Scan on tbl
+(5 rows)
 
-Сортировку представляет уже `AGG_SORTED` и, как можете заметить, плоская группировка имеет тот же самый обработчик. Если так подумать, то плоскую группировку можно рассматривать как вырожденный случай сортировки, когда все кортежи как бы равны и сравнения выполнить не нужно.
+select a, b, c from tbl group by a, b, c;
+
+ a | b | c 
+---+---+---
+ 1 | 1 | 1
+ 1 | 1 | 2
+ 1 | 2 | 1
+ 2 | 2 | 1
+(4 rows)
+```
+
+Теперь перейдем к коду.
+
+<spoiler title="ExecAgg">
+
+```c++
+/* https://github.com/postgres/postgres/blob/972c14fb9134fdfd76ea6ebcf98a55a945bbc988/src/backend/executor/nodeAgg.c#L2247 */
+static TupleTableSlot *
+ExecAgg(PlanState *pstate)
+{
+	AggState   *node = castNode(AggState, pstate);
+	TupleTableSlot *result = NULL;
+
+	if (!node->agg_done)
+	{
+		/* Dispatch based on strategy */
+		switch (node->aggstrategy)
+		{
+			case AGG_HASHED:
+            /* ... */
+			case AGG_MIXED:
+            /* ... */
+			case AGG_PLAIN:
+			case AGG_SORTED:
+				return agg_retrieve_direct(node);
+		}
+	}
+
+	return NULL;
+}
+```
+
+</spoiler>
+
+Сортировку представляет уже перечисление `AGG_SORTED` и, как можете заметить, плоская группировка имеет тот же самый обработчик. Если так подумать, то плоскую группировку можно рассматривать как вырожденный случай сортировки, когда все кортежи как бы равны и сравнения выполнить не нужно.
 
 <spoiler title="Еще одна важная разница и зачем читать кортеж перед инициализацией">
 
@@ -450,43 +499,160 @@ TODO: сравнение с тем, что дал нам реальный зап
 
 TODO: код `agg_retrieve_direct`, где есть `!= AGG_PLAIN`
 
-</spoiler>
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/nodeAgg.c#L2498 */
+static TupleTableSlot *agg_retrieve_direct(AggState *aggstate)
+{
+   Agg		   *node = aggstate->phase->aggnode;
+   AggStatePerAgg peragg;
+   AggStatePerGroup *pergroups;
 
-> Слайд: `agg_retrieve_direct`
+   /*
+    * Читаем первый кортеж, если это первый вызов.
+    * При последующих представитель будет сохранен и ничего читать не нужно будет.
+    */
+   if (aggstate->grp_firstTuple == NULL)
+   {
+      outerslot = fetch_input_tuple(aggstate);
+      if (TupIsNull(outerslot))
+      {
+         /*
+          * При сортировке с пустым входом ничего не возвращаем,
+          * но плоская должна вернуть ровно 1 кортеж
+          */
+         if (node->aggstrategy != AGG_PLAIN)
+            return NULL;
+      }
+   }
+
+   /* Обработка группировки как раньше */
+}
+```
+
+</spoiler>
 
 Что происходит внутри `agg_retrieve_direct` мы только что видели, поэтому сконцентрируемся на основном различии - обнаружении границ групп. А заключается она вот в этой строчке - когда читаем очередной кортеж, то проверяем его на равенство представителю:
 
-TODO: код `agg_retrieve_direct` с проверкой на `NULL`
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/nodeAgg.c#L2573 */
+static TupleTableSlot *
+agg_retrieve_direct(AggState *aggstate)
+{
+   /* ... */
+   for (;;)
+   {
+      advance_aggregates(aggstate);
 
-Чтобы проверить кортежи на равенство, нужно проверить каждый атрибут. Как можете заметить (`ExecQual`) функции вызываются с помощью скомпилированных выражений - для каждого атрибута вызываем свою функцию проверки. Но откуда эти функции берутся? Из системного каталога.
+      if (TupIsNull(outerslot))
+      {
+         aggstate->agg_done = true;
+         break;
+      }
 
-Но у типов могут быть разные свойства, например, какие-то можно сравнивать, можно хэшировать и т.д. Все это описывается классами и семействами операторов, но в нее мы углубляться не будем. Если эта тема интересна, то можете почитать [статью Егора Рогова об индексах](https://habr.com/ru/companies/postgrespro/articles/326106/). Сделаем только вывод - типы могут быть сравниваемыми и/или хэшируемыми, соответственно, они могут поддерживать операторы для Btree и HASH индексов. У каждого индекса есть свои стратегии поиска, но главное, что у обоих этих индексов есть стратегия поиска равенство. Поэтому сейчас мы пытаемся получить оператор равенства для этого типа вначале для Btree, а затем для HASH индекса.
+      /*
+       * If we are grouping, check whether we've crossed a group boundary.
+       */
+      if (node->aggstrategy != AGG_PLAIN)
+      {
+         tmpcontext->ecxt_innertuple = firstSlot;
+         if (!ExecQual(aggstate->phase->eqfunctions[node->numCols - 1], tmpcontext))
+         {
+            aggstate->grp_firstTuple = ExecCopySlotHeapTuple(outerslot);
+            break;
+         }
+      }
+   }
+   /* ... */
+}
+```
 
-TODO: код `lookup_type_cache`
+Чтобы проверить кортежи на равенство, нужно проверить каждый атрибут. Как можете заметить (`ExecQual`) функции вызываются с помощью скомпилированных выражений - для каждого атрибута вызываем свою функцию проверки. Но откуда эти функции берутся? Как и всегда - из системного каталога.
 
-То, что в этой функции находится, можно переписать в виде SQL запроса. Например, вот таким образом:
+У типов могут быть разные свойства и все это также описывается классами и семействами операторов, но мы опять не будем углубляться. Сделаем только вывод - типы могут быть сравниваемыми и/или хэшируемыми. Соответственно, они могут поддерживать операторы для B-tree и HASH индексов. У каждого индекса есть свои стратегии поиска, но главное, что у обоих этих индексов есть стратегия поиска равенство. Поэтому сейчас мы пытаемся получить оператор равенства для этого типа вначале для Btree, а затем для HASH индекса.
 
-TODO: запрос для Btree и HASH индексов в одном, но с комментариями strategy и т.д.
+Свойства типов и их операторы (в общем случае свойства типа) можно назвать горячими данными. Поэтому вместо того, чтобы постоянно ходить в системный каталог, эта информация кэшируется в кэше типов. Доступ к нему осуществляется через функцию `lookup_type_cache` и вот ее кусок (максимально очищенный), отвечающий за поиск оператора сравнения.
 
-Но это еще не все. Вы могли заметить, что функции сравнения (как минимум для встроенных типов) помечены `STRICT`, то есть должны возвращать `NULL` если хотя бы один из операндов `NULL` (что автоматически интерпретируется как `FALSE`), но если мы запустим запрос с `NULL` атрибутами, то они все попадут в одну группу, хотя по идее должны быть все в разных.
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/utils/cache/typcache.c#L386 */
+TypeCacheEntry *lookup_type_cache(Oid type_id, int flags)
+{
+	TypeCacheEntry *typentry;
 
-TODO: запрос с `=` и `IS NOT DISTINCT FROM`
+   if (flags & (TYPECACHE_EQ_OPR | TYPECACHE_EQ_OPR_FINFO))
+   {
+      Oid eq_opr = InvalidOid;
+   
+      /* BTREE */
+      if (typentry->btree_opf != InvalidOid)
+          eq_opr = get_opfamily_member(typentry->btree_opf,
+                                       typentry->btree_opintype,
+                                       typentry->btree_opintype,
+                                       BTEqualStrategyNumber);
+      /* HASH */
+      if (typentry->hash_opf != InvalidOid && eq_opr == InvalidOid)
+          eq_opr = get_opfamily_member(typentry->hash_opf,
+                                       typentry->hash_opintype,
+                                       typentry->hash_opintype,
+                                       HTEqualStrategyNumber);
+   }
+}
 
-На самом деле для сравнения используется конструкция `IS NOT DISTINCT FROM`, которая имеет правила сравнения с `NULL` и возвращает `TRUE` если оба операнда `NULL` и `FALSE` если только 1 из них. И обычный компаратор вызывается если оба операнда нормальные. Для нее также определена отдельная команда.
+```
 
-TODO: `EEOP_NOT_DISTINCT` как выполняется
+Но нельзя просто взять и вызывать эти функции для проверки равенства. Вы могли заметить, что функции сравнения (как минимум для встроенных типов) помечены `STRICT`, то есть должны возвращать `NULL` если хотя бы один из операндов `NULL` (что автоматически интерпретируется как `FALSE`), но если мы запустим запрос с `NULL` атрибутами, то они все попадут в одну группу, хотя по идее должны быть все в разных.
 
-Кортеж сравнили, поняли равен или не равен, вызвали функцию перехода или финализатор начиная новую группу. Но так как мы неравный кортеж уже прочитали и финализировали группу, то его надо как-то сохранить, чтобы использовать при следующем вызове. Этот представитель группы хранится в `grp_firstTuple`, но так как у нас уже есть этот представитель при следующем выполнении, то и читать его не надо - сразу вызываем инициализацию состояния:
+На самом деле для сравнения используется конструкция `IS NOT DISTINCT FROM`, которая имеет правила сравнения с `NULL` и возвращает `TRUE` если оба операнда `NULL` и `FALSE` если только 1 из них.
 
-TODO: `agg_retrieve_direct`, где сохраняем grp_firstTuple, а при входе проверяем, что не `NULL`
+И обычный компаратор вызывается если оба операнда нормальные. Для нее также определена отдельная команда.
+
+```c++
+static Datum ExecInterpExpr(ExprState *state, ExprContext *econtext)
+{
+   /* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/execExprInterp.c#L1481 */
+   EEO_CASE(EEOP_NOT_DISTINCT)
+   {
+      if (left_isnull && right_isnull)
+      {
+          *op->resvalue = true;
+      }
+      else if (left_isnull || right_isnull)
+      {
+          *op->resvalue = false;
+      }
+      else
+      {
+          *op->resvalue = eqfunction();
+      }
+   }
+}
+
+```
 
 <spoiler title="Эффективное сравнение">
 
-Если вход отсортирован, то наиболее вероятно, что изменяться будут старшие атрибуты (в конце списка), поэтому при компиляции выражения сравнения мы кладем выражения проверки с конца: вначале проверяем последние атрибуты, а потом идем к началу:
+Если вход отсортирован, то наиболее вероятно, что изменяться будут старшие атрибуты (в конце списка), поэтому при компиляции выражения сравнения мы кладем выражения проверки с конца: вначале проверяем последние атрибуты, а потом идем к началу.
 
-TODO: `ExecBuildGroupingEqual` for цикл
-
-TODO: итераторная модель, показать, что чтение представителя в `if` находится
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/execExpr.c#L4467 */
+ExprState *
+ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
+					   const TupleTableSlotOps *lops, const TupleTableSlotOps *rops,
+					   int numCols,
+					   const AttrNumber *keyColIdx,
+					   const Oid *eqfunctions,
+					   const Oid *collations,
+					   PlanState *parent)
+{
+	/*
+	 * Start comparing at the last field (least significant sort key). That's
+	 * the most likely to be different if we are dealing with sorted input.
+	 */
+	for (int natt = numCols; --natt >= 0;)
+	{
+      /* Создание шагов проверки равенства атрибута */
+   }
+}
+```
 
 </spoiler>
 
