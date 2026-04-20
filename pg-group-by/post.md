@@ -856,47 +856,149 @@ static uint32 TupleHashTableHash_internal(struct tuplehash_hash *tb, const Minim
 
 Сначала рассчитываем хэш для кортежа. Его мы рассчитываем из всех атрибутов и для этого нужно получить хэш-функцию для типа.
 
-Для нас главное научиться хэшировать базовый тип (в противопоставление сложным/составным типам: RECORD, ARRAY, RANGE и т.д.). Для этого мы снова идем в системный каталог: функция хэширования - это первая функция поддержки хэш индекса.
+Для нас главное научиться хэшировать базовый тип (в противопоставление сложным/составным типам: RECORD, ARRAY, RANGE и т.д.). Для этого мы снова идем в системный каталог: функция хэширования - это первая опорная функция хэш индекса.
 
-<spoiler title="Функции поддержки">
+<spoiler title="Опорные функции">
 
-TODO: что такое функции поддержки
+У разных методов доступа могут быть разные свойства, а как следствие разные требования. Чтобы обобщить подобное и сделать доступным легкое добавление новых методов доступа, была добавлена поддержка опорных функций. С помощью опорных функций мы можем включить поддержку фичи метода доступа для конкретного типа.
+
+Только что мы рассмотрели хэш-индекс и соответствующий метод доступа. У него есть 3 опорные функции:
+
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/include/access/hash.h#L355 */
+
+/*
+ * When a new operator class is declared, we require that the user supply
+ * us with an amproc function for hashing a key of the new type, returning
+ * a 32-bit hash value.  We call this the "standard" hash function.  We
+ * also allow an optional "extended" hash function which accepts a salt and
+ * returns a 64-bit hash value.  This is highly recommended but, for reasons
+ * of backward compatibility, optional.
+ *
+ * When the salt is 0, the low 32 bits of the value returned by the extended
+ * hash function should match the value that would have been returned by the
+ * standard hash function.
+ */
+#define HASHSTANDARD_PROC		1
+#define HASHEXTENDED_PROC		2
+#define HASHOPTIONS_PROC		3
+#define HASHNProcs				3
+```
+
+Мы использовали первую функцию, "стандартную". Кроме нее есть "расширенная", принимающая больше параметров.
+
+Другой пример - это популярный B+tree. У него есть целых 6 функций:
+
+```c++
+/* https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/include/access/nbtree.h#L717 */
+
+/*
+ *	When a new operator class is declared, we require that the user
+ *	supply us with an amproc procedure (BTORDER_PROC) for determining
+ *	whether, for two keys a and b, a < b, a = b, or a > b.  This routine
+ *	must return < 0, 0, > 0, respectively, in these three cases.
+ *
+ *	To facilitate accelerated sorting, an operator class may choose to
+ *	offer a second procedure (BTSORTSUPPORT_PROC).  For full details, see
+ *	src/include/utils/sortsupport.h.
+ *
+ *	To support window frames defined by "RANGE offset PRECEDING/FOLLOWING",
+ *	an operator class may choose to offer a third amproc procedure
+ *	(BTINRANGE_PROC), independently of whether it offers sortsupport.
+ *	For full details, see doc/src/sgml/btree.sgml.
+ *
+ *	To facilitate B-Tree deduplication, an operator class may choose to
+ *	offer a forth amproc procedure (BTEQUALIMAGE_PROC).  For full details,
+ *	see doc/src/sgml/btree.sgml.
+ *
+ *	An operator class may choose to offer a fifth amproc procedure
+ *	(BTOPTIONS_PROC).  These procedures define a set of user-visible
+ *	parameters that can be used to control operator class behavior.  None of
+ *	the built-in B-Tree operator classes currently register an "options" proc.
+ *
+ *	To facilitate more efficient B-Tree skip scans, an operator class may
+ *	choose to offer a sixth amproc procedure (BTSKIPSUPPORT_PROC).  For full
+ *	details, see src/include/utils/skipsupport.h.
+ */
+
+#define BTORDER_PROC		1
+#define BTSORTSUPPORT_PROC	2
+#define BTINRANGE_PROC		3
+#define BTEQUALIMAGE_PROC	4
+#define BTOPTIONS_PROC		5
+#define BTSKIPSUPPORT_PROC	6
+#define BTNProcs			6
+```
+
+Кроме этого, есть опорные функции для [GiST](https://github.com/postgres/postgres/blob/REL_18_3/src/include/access/gist.h#L32), [SP-GIST](https://github.com/postgres/postgres/blob/REL_18_3/src/include/access/spgist.h#L23), [GIN](https://github.com/postgres/postgres/blob/REL_18_3/src/include/access/gin.h#L24).
 
 </spoiler>
 
-Но это еще не все. Перед тем как этот хэш вернуть мы еще раз хэшируем это число. Делаем мы это для того, чтобы защититься от плохих хэш-функций (дающих не случайный хэш) - посмотреть внутрь функции хэширования и запретить плохие мы не можем, поэтому пессимистично хэшируем хэш. Для этого используется MurmurHash и для нашей задачи подходит хорошо - сильную нагрузку не дает, всего 5 строк базовых операций.
+Но это еще не все. Перед тем как этот хэш вернуть мы *еще раз его хэшируем*. Делается это для того, чтобы защититься от плохих хэш-функций - посмотреть внутрь функции хэширования и запретить плохие мы не можем, поэтому пессимистично хэшируем хэш. Для этого используется murmurhash.
 
-Теперь, когда хэш на руках, мы идем искать элемент с требуемым ключом в самой хэш-таблице. Единственное, что можно сказать здесь - поиск и создание нового элемента объединены для производительности.
+Теперь мы идем искать элемент с требуемым ключом в самой хэш-таблице. Здесь уже непосредственно логика самой хэш-таблицы, поэтому опустим.
 
-<spoiler title="Устройство хэш-таблицы">
-
-TODO: кодогенерация макросами, открытая адресация и т.д.
-
-</spoiler>
-
-TODO: `lookup_hash_entries` выделен `initialize_hash_entry`
-
-Из хэш-таблицы мы получаем элемент и при необходимости его надо инициализировать. Когда мы создавали элемент внутри хэш-таблицы то да, там была инициализация, но то была инициализация внутренней структуры, а сейчас нам нужно выполнить прикладную, т.к. самого состояния.
-
-TODO: `initialize_hash_entry`
+Из хэш-таблицы мы получаем элемент и при необходимости надо инициализировать состояние агрегата (если создали новый элемент).
 
 Это мы делаем в `initialize_hash_entry` и пока ничего необычного тут нет - инициализация каждого состояния как и было раньше.
 
-TODO: `lookup_hash_entries` выделен `pergroup = ...`
+```c++
+/* https://github.com/postgres/postgres/blob/REL_18_3/src/backend/executor/nodeAgg.c#L2136 */
+static void initialize_hash_entry(AggState *aggstate, TupleHashTable hashtable,
+                                  TupleHashEntry entry)
+{
+   /* ... какой-то код тут */
 
-Состояние на руках и его нужно передать в `advance_aggregates` откуда он передаст его функции перехода. Но если обратить внимание на сигнатуру, то заметим, что она принимает только само состояние узла (`AggState`), а не отдельное состояние (каждого агрегата) и кортеж. Это потому что мы передаем аргументы для функции перехода через окружение. В частности, состояние агрегатов мы передаем через поле `pergroup`, в который сейчас сохраняем указатель на текущий массив из `AggStatePerGroup`, а после `advance_aggregates` поймет откуда брать состояние и передаст его нужному обработчику.
+   for (transno = 0; transno < aggstate->numtrans; transno++)
+   {
+       AggStatePerTrans pertrans = &aggstate->pertrans[transno];
+       AggStatePerGroup pergroupstate = &pergroup[transno];
 
-Сейчас мы это поле настраиваем каждый раз для каждого кортежа (т.к. группа может поменяться), а когда обрабатывали сортировку, то хранился фиксированный неизменяемый массив (разве что сбрасывали само состояние, когда начинали новую группу).
+       initialize_aggregate(aggstate, pertrans, pergroupstate);
+   }
+}
+```
 
-TODO: `agg_fill_hash_table`
+Состояние на руках и его нужно передать в `advance_aggregates` откуда он передаст его функции перехода. Но если обратить внимание на ее сигнатуру, то заметим, что она принимает только само состояние узла, а не отдельное состояние (каждого агрегата) и кортеж.
 
-После настройки мы вызваем функцию перехода в `advance_aggregates` и на этом итерация окончена. Продолжаем так, пока не обработаем весь вход. А когда вход обработан приступаем к финализации состояний.
+Это потому что мы передаем аргументы для функции перехода через окружение. В частности, состояние агрегатов мы передаем через поле `pergroup`, в который сейчас сохраняем указатель на текущий массив из `AggStatePerGroup`, а после `advance_aggregates` поймет откуда брать состояние и передаст его нужному обработчику.
 
-TODO: `agg_retrieve_hash_table_in_memory`
+```c++
+static void
+lookup_hash_entries(AggState *aggstate)
+{
+   /* ... */
+   aggstate->pergroup = TupleHashEntryGetAdditional(hashtable, entry);
+}
+```
 
-Делается это просто - итерация по хэш-таблице и вызов финализатора для каждого элемента. Итерацию разбирать не будем (довольно тривиально), а как устроена финализация мы уже знаем.
+После настройки мы вызваем функцию перехода в `advance_aggregates` и на этом итерация окончена. Продолжаем так, пока не обработаем весь вход и, когда вход обработан, приступаем к финализации состояний.
 
-Поэтому теперь перейдем к самой мякотке - нехватке памяти.
+Делается это просто - итерируемся по хэш-таблице и вызываем финализатор для каждого элемента. Это реализуется в [`agg_retrieve_hash_table_in_memory`](https://github.com/postgres/postgres/blob/62d6c7d3df6287f1bd83199c1a746e50d31571a0/src/backend/executor/nodeAgg.c#L2859), но итерирование по хэш-таблице тривиально/неважно, а как происходит финализация мы уже видели, поэтому эту часть не будем рассматривать.
+
+<spoiler title="agg_retrieve_hash_table_in_memory">
+
+```c++
+static TupleTableSlot *agg_retrieve_hash_table_in_memory(AggState *aggstate)
+{
+   for (;;)
+   {
+      TupleHashTable hashtable = perhash->hashtable;
+      TupleHashEntry entry;
+      entry = ScanTupleHashTable(hashtable, &perhash->hashiter);
+      if (entry == NULL)
+	      return NULL;
+      finalize_aggregates(aggstate, peragg, pergroup);
+      result = project_aggregates(aggstate);
+      if (result)
+          return result;
+   }
+}
+```
+
+</spoiler>
+
+Это была самая простая часть - логика в памяти. Теперь перейдем к случаю, когда не хватает памяти.
 
 ### Хэширование, сброс на диск
 
