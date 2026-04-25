@@ -2452,6 +2452,8 @@ typedef enum AggSplit
 
 ### ordered set/distinct
 
+TODO: тут остановился
+
 Вторая вещь - это особый класс агрегатных функций, ordered-set aggregate.
 
 > Есть еще hypothetical-set aggregate, но они тоже самое, поэтому в одну кладу в одну топку
@@ -2469,25 +2471,211 @@ SELECT a, mode() WITHIN GROUP (ORDER BY b) FROM tbl GROUP BY a;
          ->  Seq Scan on tbl
 ```
 
-Вначале посмотрим на то, как разные стратегии могут добавить поддержку таких агрегатов (которым надо сохранять все кортежи, что они видели).
+Как вы заметили в стратегии хэширования мы одновременно обрабатываем все увиденные группы, не как сортировка по одной. Из-за этого мы должны отслеживать переполнение памяти. Но если мы наивно для каждой группы будем хранить ее массив кортежей, то возникнут 2 проблемы:
 
-Как вы заметили в стратегии хэширования мы одновременно обрабатываем несколько групп, а не как сортировка по одной. Из-за этого мы должны отслеживать переполнение памяти. Но если мы наивно для каждой группы будем хранить ее массив кортежей, то возникнет 2 проблемы.
+1. Переполнение надо будет проверять *после каждого кортежа*, а не только при создании новой группы, так как этот кортеж легко может быть записан в этот массив, а значит выделена память.
 
-Первое - переполнение надо будет проверять *после каждого кортежа*, а не только при создании новой группы, так как этот кортеж легко может быть записан в этот массив.
+2. Хранение указателя на сам массив. Размер всего структуры состояния агрегата (`AggStatePerGroup`) 10 байт, но еще один указатель добавит 8 байт, то есть в хэш-таблице мы сможем хранить *почти в 2 раза меньше элементов*, хотя подавляющая часть агрегатов этого не требует.
 
-Второе - где хранить этот массив. Размер всего состояния (`AggStatePerGroup`) 10 байт, но еще один указатель добавит 8 байт, то есть в этой хэш-таблице мы сможем хранить почти в 2 раза меньше элементов. Хотя подавляющая часть агрегатов этого не требует.
+Проблем мы получаем целую кучу, поэтому принято решение для ORDRED SET агрегатов *не* использовать хэширование, т.е. доступна только сортировка.
 
-Проблем мы получаем целую кучу, поэтому принято решение для ORDRED SET агрегатов *не* использовать хэширование, доступна только сортировка.
+И с ней все гораздо проще, так как одновременно мы обрабатываем по 1 группе в каждом GS. Тогда обработку можно представить так:
 
-И с ней все гораздо проще, так как одновременно мы обрабатываем только по 1 группе в каждом GROUPING SET. Это значит, что для каждого агрегата мы будем хранить свой массив кортежей. При вызове функции перехода мы просто сохраним это значение в массив (сама функция перехода тут не вызывается). А перед финализацией уже выполним сортировку и вызовем функцию перехода для отсорированного входа.
+1. По началу новой группы инициализируем массивы для каждого OS агрегата
+2. Для каждого кортежа также вызываем `advance_aggregates`, но теперь, вместо вызова функции перехода сохраняtv кортеж в ассоциированный массив
+3. При финализации сортируем этот массив и передаем уже отсортированную последовательность функции перехода, а в конце вызываем и сам финализатор
 
-TODO: код с полем `tuplesort`
-TODO: `ExecEvalAggOrderedTransDatum`
-TODO: `advance_aggregates`
+<spoiler title="Обработка ORDERED SET агрегатов">
 
-И вот как раз тут оптимизация, когда мы храним 1 состояние, из которого вычисляются сразу несколько агрегатов, сияет.
+Самое хорошее, что изменения мы должны сделать только для функций, работающих с агрегатами - саму логику группировки не трогаем.
 
-В Postgres есть несколько встроенных ordered set агрегатов. Но интересно вот что - у всех них одинаковые начальное состояние и функция перехода:
+Также еще замечание: в коде есть 2 версии логики - для одного значения (один `Datum`) и для кортежа. Это чисто техническое разделение - кортеж нужен, чтобы хранить и обрабатывать несколько атрибутов/значений (что подается на вход функции перехода). Например, `tuplesort_begin_datum` - инициализация для одного значения, а `tuplesort_begin_heap` - для кортежа (нескольких значений).
+
+```c++
+/* Инициализация */
+static void
+initialize_aggregate(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup pergroupstate)
+{
+   /* Инициализируем состояние для сортировки */
+	if (pertrans->aggsortrequired)
+	{
+		if (pertrans->sortstates[aggstate->current_set])
+			tuplesort_end(pertrans->sortstates[aggstate->current_set]);
+
+		if (pertrans->numInputs == 1)
+		{
+			Form_pg_attribute attr = TupleDescAttr(pertrans->sortdesc, 0);
+
+			pertrans->sortstates[aggstate->current_set] =
+				tuplesort_begin_datum(attr->atttypid,
+									  pertrans->sortOperators[0],
+									  pertrans->sortCollations[0],
+									  pertrans->sortNullsFirst[0],
+									  work_mem, NULL, TUPLESORT_NONE);
+		}
+		else
+			pertrans->sortstates[aggstate->current_set] =
+				tuplesort_begin_heap(pertrans->sortdesc,
+									 pertrans->numSortCols,
+									 pertrans->sortColIdx,
+									 pertrans->sortOperators,
+									 pertrans->sortCollations,
+									 pertrans->sortNullsFirst,
+									 work_mem, NULL, TUPLESORT_NONE);
+	}
+   
+   /* Копирование полей из AggStatePerTrans в AggStatePerGroup */
+}
+
+/* Скомпилированное выражение advance_aggregates */
+static Datum
+ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
+{
+   EEO_SWITCH()
+   {
+      /* ... */
+		EEO_CASE(EEOP_AGG_ORDERED_TRANS_DATUM)
+		{
+			ExecEvalAggOrderedTransDatum(state, op, econtext);
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_AGG_ORDERED_TRANS_TUPLE)
+		{
+			ExecEvalAggOrderedTransTuple(state, op, econtext);
+			EEO_NEXT();
+		}
+      
+      /* ... */
+   }
+}
+
+void
+ExecEvalAggOrderedTransDatum(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
+{
+	AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
+	int			setno = op->d.agg_trans.setno;
+
+	tuplesort_putdatum(pertrans->sortstates[setno], *op->resvalue, *op->resnull);
+}
+
+/* Финализация */
+static void
+finalize_aggregates(AggState *aggstate, AggStatePerAgg peraggs, AggStatePerGroup pergroup)
+{
+   /* Сортируем вход и вызываем функцию перехода для ORDERED SET агрегатов */
+   for (int transno = 0; transno < aggstate->numtrans; transno++)
+	{
+      AggStatePerTrans pertrans = &aggstate->pertrans[transno];
+		AggStatePerGroup pergroupstate = &pergroup[transno];
+
+		if (pertrans->aggsortrequired)
+		{
+			if (pertrans->numInputs == 1)
+				process_ordered_aggregate_single(aggstate, pertrans, pergroupstate);
+			else
+				process_ordered_aggregate_multi(aggstate, pertrans, pergroupstate);
+		}
+	}
+   
+   /* Вызываем сам финализатор */
+	for (aggno = 0; aggno < aggstate->numaggs; aggno++)
+	{
+		AggStatePerAgg peragg = &peraggs[aggno];
+		int			transno = peragg->transno;
+		AggStatePerGroup pergroupstate = &pergroup[transno];
+
+      finalize_aggregate(aggstate, peragg, pergroupstate,
+                         &aggvalues[aggno], &aggnulls[aggno]);
+	}
+}
+
+static void
+process_ordered_aggregate_single(AggState *aggstate,
+								 AggStatePerTrans pertrans,
+								 AggStatePerGroup pergroupstate)
+{
+   /* Выполняем сортировку */
+	tuplesort_performsort(pertrans->sortstates[aggstate->current_set]);
+
+	Datum newVal = &fcinfo->args[1].value;
+	bool isNull = &fcinfo->args[1].isnull;
+
+   /* Вызов функции перехода с уже отсортированным входом */
+	while (tuplesort_getdatum(pertrans->sortstates[aggstate->current_set],
+							        true, false, newVal, isNull, &newAbbrevVal))
+	{
+      advance_transition_function(aggstate, pertrans, pergroupstate);
+	}
+
+	tuplesort_end(pertrans->sortstates[aggstate->current_set]);
+	pertrans->sortstates[aggstate->current_set] = NULL;
+}
+```
+
+</spoiler>
+
+Но это еще не все. Из названия секции вы поняли, что речь будет идти также и о `DISTINCT`. Он позволяет передавать функции перехода только уникальные значения. Например, `COUNT(DISTINCT a)` возвращает количество уникальных значений атрибута `a`. Получение уникальных значений и группировка - это одно и то же, а мы уже умеем группировать с помощью сортировки.
+
+Поэтому, чтобы не писать огромное количество разного кода, `DISTINCT` и `ORDRED SET` объединяются и реализуются одним и тем же функционалом - если используется хотя бы что-то из них, то применяется сортировка.
+
+```c++
+static void
+process_ordered_aggregate_single(AggState *aggstate,
+								 AggStatePerTrans pertrans,
+								 AggStatePerGroup pergroupstate)
+{
+	Datum		oldVal = (Datum) 0;
+	bool		oldIsNull = true;
+	bool		haveOldVal = false;
+	bool		isDistinct = (pertrans->numDistinctCols > 0);
+	Datum		newAbbrevVal = (Datum) 0;
+	Datum		oldAbbrevVal = (Datum) 0;
+	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	Datum	   *newVal;
+	bool	   *isNull;
+
+	tuplesort_performsort(pertrans->sortstates[aggstate->current_set]);
+
+	newVal = &fcinfo->args[1].value;
+	isNull = &fcinfo->args[1].isnull;
+
+	while (tuplesort_getdatum(pertrans->sortstates[aggstate->current_set],
+							        true, false, newVal, isNull, &newAbbrevVal))
+	{
+		if (isDistinct &&
+			haveOldVal &&
+			((oldIsNull && *isNull) ||
+			 (!oldIsNull && !*isNull &&
+			  oldAbbrevVal == newAbbrevVal &&
+			  DatumGetBool(FunctionCall2Coll(&pertrans->equalfnOne,
+											 pertrans->aggCollation,
+											 oldVal, *newVal)))))
+		{
+         /* Надено одинаковое значение - пропускаем */
+			MemoryContextSwitchTo(oldContext);
+			continue;
+		}
+		else
+		{
+			advance_transition_function(aggstate, pertrans, pergroupstate);
+         
+         /* Сохраняем состояние для проверки дубликата на следующей итерации */
+			oldVal = *newVal;
+			oldAbbrevVal = newAbbrevVal;
+			oldIsNull = *isNull;
+			haveOldVal = true;
+		}
+	}
+
+	tuplesort_end(pertrans->sortstates[aggstate->current_set]);
+	pertrans->sortstates[aggstate->current_set] = NULL;
+}
+```
+
+И теперь вишенка на торте - оптимизация объединения состояний для OS агрегатов также работает.
+
+В Postgres есть несколько встроенных ordered set агрегатов и интересно вот что - у всех них одинаковые начальное состояние и функция перехода:
 
 ```sql
 select aggfnoid, aggtransfn, agginitval from pg_aggregate where aggkind = 'o';
@@ -2517,15 +2705,7 @@ FROM tbl GROUP BY b;
 
 ...то увидим, что состояние хранится только 1 (numtrans), хотя агрегатов 3 (numaggs).
 
-TODO: скриншот отладчика
-
-Но это еще не все. Из названия секции вы поняли, что речь будет идти также и о `DISTINCT`. Он позволяет передавать функции перехода только уникальные значения. Например, `COUNT(DISTINCT a)` возвращает количество уникальных значений атрибута `a`. Получение уникальных значений и группировка - это одно и то же, а мы уже умеем группировать с помощью сортировки.
-
-Поэтому, чтобы не писать огромное количество разного кода, принято решение объединить функционал `DISTINCT` и `ORDRED SET` агрегатов - если используется хотя бы один, то применяется сортировка.
-
-TODO: проверка, что есть DISTINCT столбцы nodeAgg.c:978
-
-> Если вы заглянете в `ordered_set_transition`, то увидите, что там также используется сортировка, то есть происходит *двойная* сортировка - вначале мы во время работы самой группировки, а затем сама прикладная логика
+![numtrans только 1, а numaggs 3](./assets/orderedset-singletransstate.png)
 
 ## Index Aggregate
 
