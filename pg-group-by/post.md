@@ -2332,20 +2332,121 @@ Finalize HashAggregate
 
 В случае использования частичных агрегатов в плане появляются узлы группировки с префиксами `Partial` и `Finalize`. Их идея в следующем - `Partial` узлы *не* финализируют агрегат и передают выше само состояние, а `Finalize` узел уже получает само состояние и вызывает функцию объединения (вместо перехода) и сам финализатор.
 
-Но вся эта магия творится *только на этапе инициализации*, во время выполнения узлов никаких таких особенных проверок нет. Почему?
+Самое удвительное, что вся эта магия творится *только на этапе инициализации*. Во время выполнения узлов никаких таких особенных проверок нет. Почему?
 
-Если мы посмотрим на сам код, то заметим, что код группировки ничего не знает о типах или сигнатурах функций. Он работает так - читает (загружает) атрибут из кортежа и передает функции, а у этой функции сигнатура выглядит примерно так: `AggStatePerGroup FUNCTION(AggStatePerGroup, Datum args...)`.
+Если мы посмотрим на сам код, то заметим, что код группировки ничего не знает о типах или сигнатурах функций. Он работает так - читает (загружает) атрибут из кортежа и передает функции с сигнатурой `AggStatePerGroup FUNCTION(AggStatePerGroup, Datum args...)`.
 
-`Datum` - это само значение и его можно рассматривать как `void *`. То есть для всего кода он прозрачен и только целевой код знает как его интерпретировать. В таком случае, нам в реальности без разницы что читать из кортежа - конкретное значение или другое состояние агрегата - просто загружаем какой-то атрибут из кортежа. То есть если мы просто подменим вызываемую функцию, то для нас (группировки) ничего не изменится - действия останутся теми же самыми.
+`Datum` - это само значение и его можно рассматривать как `void *`. То есть для всего кода он непрозрачен и только целевой код знает как его интерпретировать. В таком случае, нам в реальности без разницы что читать из кортежа - конкретное значение или другое состояние агрегата - просто загружаем какой-то атрибут из кортежа. То есть если мы просто подменим вызываемую функцию, то для нас (группировки) ничего не изменится - действия останутся теми же самыми.Инициализация узла происходит в функции `ExecInitAgg` и что делать в каждом случае мы обговорили.
 
-Инициализация узла происходит в функции `ExecInitAgg`. При инициализации `Finalize` узла мы подменяем функцию перехода на объединения. А для `Partial` узлов нам не нужно вызывать финализатор, поэтому просто удаляем его - если он необходим, то `Finalize` это сделает.
+Для `Finalize` мы подменяем функцию перехода на объединения.
 
-TODO: 3806 `if (DO_AGGSPLIT_SKIP_FINAL)` + `finalize_aggregate` else ветка
-TODO: 3948 `transfn_oid = agg_form->aggcombinefn`
+```c++
+/* https://github.com/postgres/postgres/blob/REL_18_3/src/backend/executor/nodeAgg.c#L3948 */
+AggState *
+ExecInitAgg(Agg *node, EState *estate, int eflags)
+{
+   ListCell *lc;
+   
+   foreach(l, aggstate->aggs)
+   {
+      Oid transfn_oid;
+
+      /*
+       * If this aggregation is performing state combines, then instead
+       * of using the transition function, we'll use the combine
+       * function.
+       */
+      if (DO_AGGSPLIT_COMBINE(aggstate->aggsplit))
+      {
+         transfn_oid = aggform->aggcombinefn;
+
+         /* If not set then the planner messed up */
+         if (!OidIsValid(transfn_oid))
+            elog(ERROR, "combinefn not set for aggregate function");
+      }
+      else
+         transfn_oid = aggform->aggtransfn;
+
+      /* ... */
+
+      /* aggcombinefn always has two arguments of aggtranstype */
+      build_pertrans_for_aggref(pertrans, aggstate, estate,
+                                aggref, transfn_oid, aggtranstype,
+                                serialfn_oid, deserialfn_oid,
+                                initValue, initValueIsNull,
+                                combineFnInputTypes, 2);
+   }
+}
+```
+
+Для `Partial` нам не нужно вызывать финализатор, поэтому просто удаляем его.
+
+```c++
+/* https://github.com/postgres/postgres/blob/REL_18_3/src/backend/executor/nodeAgg.c#L3806 */
+AggState *
+ExecInitAgg(Agg *node, EState *estate, int eflags)
+{
+   ListCell *lc;
+   
+   foreach(l, aggstate->aggs)
+   {
+      AggStatePerAgg peragg;
+
+		/* Final function only required if we're finalizing the aggregates */
+		if (DO_AGGSPLIT_SKIPFINAL(aggstate->aggsplit))
+			peragg->finalfn_oid = finalfn_oid = InvalidOid;
+		else
+			peragg->finalfn_oid = finalfn_oid = aggform->aggfinalfn;
+
+      /* Компилируем, только если есть финализатор */
+		if (OidIsValid(finalfn_oid))
+		{
+			build_aggregate_finalfn_expr(aggTransFnInputTypes,
+                                      peragg->numFinalArgs,
+                                      aggtranstype,
+                                      aggref->aggtype,
+                                      aggref->inputcollid,
+                                      finalfn_oid,
+                                      &finalfnexpr);
+			fmgr_info(finalfn_oid, &peragg->finalfn);
+			fmgr_info_set_expr((Node *) finalfnexpr, &peragg->finalfn);
+		}
+   }
+}
+```
 
 <spoiler title="Как различают Partial, Finalize и обычные узлы в коде">
 
-TODO: AGGSPLIT_SKIP_FINAL и т.д. пояснение
+Как уже могли заметить, чтобы различать тип узла используется поле `aggstate->aggsplit`. Это перечисление с битовыми полями:
+
+```c++
+/* Primitive options supported by nodeAgg.c: */
+#define AGGSPLITOP_COMBINE		0x01	/* substitute combinefn for transfn */
+#define AGGSPLITOP_SKIPFINAL	0x02	/* skip finalfn, return state as-is */
+#define AGGSPLITOP_SERIALIZE	0x04	/* apply serialfn to output */
+#define AGGSPLITOP_DESERIALIZE	0x08	/* apply deserialfn to input */
+
+/* Supported operating modes (i.e., useful combinations of these options): */
+typedef enum AggSplit
+{
+	/* Basic, non-split aggregation: */
+	AGGSPLIT_SIMPLE = 0,
+	/* Initial phase of partial aggregation, with serialization: */
+	AGGSPLIT_INITIAL_SERIAL = AGGSPLITOP_SKIPFINAL | AGGSPLITOP_SERIALIZE,
+	/* Final phase of partial aggregation, with deserialization: */
+	AGGSPLIT_FINAL_DESERIAL = AGGSPLITOP_COMBINE | AGGSPLITOP_DESERIALIZE,
+} AggSplit;
+
+/* Test whether an AggSplit value selects each primitive option: */
+#define DO_AGGSPLIT_COMBINE(as)		(((as) & AGGSPLITOP_COMBINE) != 0)
+#define DO_AGGSPLIT_SKIPFINAL(as)	(((as) & AGGSPLITOP_SKIPFINAL) != 0)
+#define DO_AGGSPLIT_SERIALIZE(as)	(((as) & AGGSPLITOP_SERIALIZE) != 0)
+#define DO_AGGSPLIT_DESERIALIZE(as) (((as) & AGGSPLITOP_DESERIALIZE) != 0)
+```
+
+В этом поле хранится перечисление `AggSplit`, но каждое значение - это битовая маска макросов выше. Из них 2 мы уже рассмотрели - COMBINE и SKIPFINAL, но осталось еще 2. Они отвечают за необходимость выполнения сериализации/десериализации значений. Это нужно для того, чтобы мы могли передавать состояние между разными процессами (при параллельном выполнении).
+
+Таким образом, комбинируя эти 4 флага мы и получаем 3 разных типа узла, которые описываются этими перечислениями: `SIMPLE` - обычный узел, `INITIAL_SERIAL` - Partial, `FINAL_DESERIAL` - Finalize.
 
 </spoiler>
 
