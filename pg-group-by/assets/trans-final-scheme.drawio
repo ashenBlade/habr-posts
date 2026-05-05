@@ -1,0 +1,52 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/28.2.5 Chrome/138.0.7204.251 Electron/37.6.1 Safari/537.36" version="28.2.5">
+  <diagram name="Page-1" id="YI5Y8T_uYwyX8d6oA-oq">
+    <mxGraphModel dx="1226" dy="1203" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="3QXqVfnlKw6YXndMDNEo-1" value="" style="rounded=0;whiteSpace=wrap;html=1;strokeColor=none;" vertex="1" parent="1">
+          <mxGeometry x="20" y="180" width="972.97" height="350" as="geometry" />
+        </mxCell>
+        <mxCell id="V2qXoAd9RwPvT4qEmo7b-4" value="&lt;div style=&quot;font-family: &amp;quot;JetBrains Mono NL Medium&amp;quot;, &amp;quot;monospace&amp;quot;, monospace, &amp;quot;Droid Sans Mono&amp;quot;, monospace; line-height: 24px; white-space: pre;&quot;&gt;&lt;div style=&quot;&quot;&gt;&lt;span style=&quot;font-weight: normal; color: rgb(0, 0, 0);&quot;&gt;state = &lt;/span&gt;&lt;b&gt;&lt;font style=&quot;color: rgb(255, 3, 3);&quot;&gt;(&lt;/font&gt;&lt;font style=&quot;color: rgb(255, 3, 3);&quot;&gt;0, 0)&lt;/font&gt;&lt;/b&gt;&lt;/div&gt;&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;&lt;br&gt;&lt;/span&gt;&lt;div style=&quot;color: rgb(0, 0, 0); font-weight: normal;&quot;&gt;&lt;span style=&quot;color: #0000ff;&quot;&gt;for&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt; tuple &lt;/span&gt;&lt;span style=&quot;color: #0000ff;&quot;&gt;in&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt; input:&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span&gt;&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;  state = &lt;/span&gt;&lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;int4_agg_accum&lt;/font&gt;&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;(state, tuple)&lt;/span&gt;&lt;/span&gt;&lt;/div&gt;&lt;span style=&quot;color: rgb(0, 0, 0);&quot;&gt;&lt;br&gt;&lt;/span&gt;&lt;div style=&quot;&quot;&gt;&lt;span style=&quot;font-weight: normal; color: rgb(0, 0, 0);&quot;&gt;result = &lt;/span&gt;&lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;&lt;b&gt;int8_avg&lt;/b&gt;&lt;/font&gt;&lt;span style=&quot;font-weight: normal; color: rgb(0, 0, 0);&quot;&gt;(state)&lt;/span&gt;&lt;/div&gt;&lt;/div&gt;" style="text;whiteSpace=wrap;html=1;labelBackgroundColor=none;fontSize=23;" parent="1" vertex="1">
+          <mxGeometry x="470" y="270" width="550" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="V2qXoAd9RwPvT4qEmo7b-5" value="&lt;div style=&quot;color: rgb(59, 59, 59); font-family: &amp;quot;JetBrains Mono NL Medium&amp;quot;, &amp;quot;monospace&amp;quot;, monospace, &amp;quot;Droid Sans Mono&amp;quot;, monospace; font-weight: normal; line-height: 24px; white-space: pre;&quot;&gt;&lt;div&gt;&lt;span style=&quot;color: #0000ff;&quot;&gt;struct&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt; &lt;/span&gt;&lt;span style=&quot;color: #267f99;&quot;&gt;AggStatePerTrans&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #000000;&quot;&gt;{&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;background-color: transparent; color: rgb(0, 0, 0);&quot;&gt;   &lt;/span&gt;&lt;span style=&quot;background-color: transparent; color: rgb(38, 127, 153);&quot;&gt;Datum&lt;/span&gt;&lt;span style=&quot;background-color: transparent; color: rgb(0, 0, 0);&quot;&gt;    &lt;/span&gt;&lt;span style=&quot;background-color: transparent; color: rgb(0, 16, 128);&quot;&gt;initValue&lt;/span&gt;&lt;span style=&quot;background-color: transparent; color: rgb(0, 0, 0);&quot;&gt;;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;background-color: transparent; color: rgb(0, 0, 0);&quot;&gt;&lt;br&gt;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #000000;&quot;&gt;   &lt;/span&gt;&lt;span style=&quot;color: #267f99;&quot;&gt;Oid&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt;      &lt;/span&gt;&lt;span style=&quot;color: #001080;&quot;&gt;transfn_oid&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt;;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #000000;&quot;&gt;}&lt;/span&gt;&lt;/div&gt;&lt;/div&gt;" style="text;whiteSpace=wrap;html=1;labelBackgroundColor=none;fontSize=23;" parent="1" vertex="1">
+          <mxGeometry x="40" y="210" width="340" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="V2qXoAd9RwPvT4qEmo7b-6" value="&lt;div style=&quot;color: rgb(59, 59, 59); font-family: &amp;quot;JetBrains Mono NL Medium&amp;quot;, &amp;quot;monospace&amp;quot;, monospace, &amp;quot;Droid Sans Mono&amp;quot;, monospace; font-weight: normal; line-height: 24px; white-space: pre;&quot;&gt;&lt;div&gt;&lt;span style=&quot;color: #0000ff;&quot;&gt;struct&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt; &lt;/span&gt;&lt;span style=&quot;color: #267f99;&quot;&gt;AggStatePerAgg&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #000000;&quot;&gt;{&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #000000;&quot;&gt;   &lt;/span&gt;&lt;span style=&quot;color: #267f99;&quot;&gt;Oid&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt;      &lt;/span&gt;&lt;span style=&quot;color: #001080;&quot;&gt;finalfn_oid&lt;/span&gt;&lt;span style=&quot;color: #000000;&quot;&gt;;&lt;/span&gt;&lt;/div&gt;&lt;div&gt;&lt;span style=&quot;color: #000000;&quot;&gt;}&lt;/span&gt;&lt;/div&gt;&lt;/div&gt;" style="text;whiteSpace=wrap;html=1;labelBackgroundColor=none;fontSize=23;" parent="1" vertex="1">
+          <mxGeometry x="40" y="400" width="350" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="V2qXoAd9RwPvT4qEmo7b-12" value="" style="curved=1;endArrow=classic;html=1;rounded=0;fontSize=13;endSize=2;startSize=13;strokeWidth=3;endFill=1;" parent="1" edge="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="300" y="260" as="sourcePoint" />
+            <mxPoint x="593.9130434782612" y="270" as="targetPoint" />
+            <Array as="points">
+              <mxPoint x="340" y="240" />
+              <mxPoint x="530" y="240" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="V2qXoAd9RwPvT4qEmo7b-13" value="" style="curved=1;endArrow=classic;html=1;rounded=0;fontSize=13;endSize=2;startSize=13;strokeWidth=3;endFill=1;" parent="1" edge="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="306" y="339" as="sourcePoint" />
+            <mxPoint x="646" y="379" as="targetPoint" />
+            <Array as="points">
+              <mxPoint x="386" y="379" />
+              <mxPoint x="576" y="389" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="V2qXoAd9RwPvT4qEmo7b-14" value="" style="curved=1;endArrow=classic;html=1;rounded=0;fontSize=13;endSize=2;startSize=13;strokeWidth=3;endFill=1;" parent="1" edge="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="315" y="482" as="sourcePoint" />
+            <mxPoint x="615" y="424" as="targetPoint" />
+            <Array as="points">
+              <mxPoint x="415" y="504" />
+              <mxPoint x="555" y="484" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
